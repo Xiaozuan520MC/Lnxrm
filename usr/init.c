@@ -30,20 +30,23 @@ int main(int argc, char **argv)
         xputs("init: no /README.md\n");
     }
 
-    /* hand the console to a userspace terminal, forever (like Linux:init) */
-    for (;;) {
-        long pid = kfork();
-        if (pid == 0) {
-            char *sh_argv[] = {"/bin/sh", 0};
-            char *envp[] = {0};
-            if (kexecve("/bin/sh", sh_argv, envp) < 0) {
-                xputs("init: exec /bin/sh failed\n");
-                kexit(1);
-            }
+    /* Hand the console to a userspace terminal exactly once.  If the
+     * terminal dies (e.g. `kill <pid>`), it stays dead: respawning it
+     * would make the terminal unkillable.  init itself keeps running so
+     * pid 1 still exists to reparent orphans. */
+    long pid = kfork();
+    if (pid == 0) {
+        char *sh_argv[] = {"/bin/sh", 0};
+        char *envp[] = {0};
+        if (kexecve("/bin/sh", sh_argv, envp) < 0) {
+            xputs("init: exec /bin/sh failed\n");
+            kexit(1);
         }
-        int st = 0;
-        kwaitpid(pid, &st, 0);
-        xputs("\ninit: terminal exited, restarting\n");
     }
+    int st = 0;
+    kwaitpid(pid, &st, 0);
+    xputs("\ninit: terminal exited\n");
+
+    for (;;) ksleep_ms(3600000, 0);
     return 0;
 }

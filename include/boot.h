@@ -19,10 +19,7 @@ struct boot_params {
     struct e820_entry e820_map[128];
 } __attribute__((packed));
 
-#define E820_RAM      1
-#define E820_RESERVED 2
-#define E820_ACPI     3
-#define E820_NVS      4
+#define E820_RAM 1
 
 /* VBE mode descriptor that arch/setup.asm leaves at physical 0x8C00.
  * Layout MUST match the VBE_* equates in arch/setup.asm. */
@@ -46,7 +43,6 @@ struct vbe_lfb_info {
 /* boot_params.screen_info subset: the LFB the boot loader programmed.
  * GRUB fills this in for the `linux` command when gfxpayload selects a
  * graphics mode (setup.asm never runs on that path).  Offsets are ABI. */
-#define VIDEO_TYPE_VLFB 0x23 /* VESA VGA in graphic mode */
 
 struct screen_lfb {
     u8 _pad0[0x0f];

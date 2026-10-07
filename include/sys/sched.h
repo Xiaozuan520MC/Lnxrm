@@ -2,6 +2,7 @@
 #pragma once
 #include <types.h>
 #include <sys/spinlock.h>
+#include <sys/cred.h>
 
 /* Forward declarations for percpu.h (breaks circular dependency) */
 struct cpu_info;
@@ -10,58 +11,14 @@ struct cpu_info;
 extern "C" {
 #endif
 
-/* ---- signals (kernel/signal.c) ---- */
-typedef void (*sighandler_t)(int);
+/* ---- signals (kernel/signal.c) ----
+ * Signal numbers and the user-facing `struct lnxrm_sigaction` live in
+ * <abi/lnxrm_abi.h> so that kernel and user space cannot drift apart.
+ * types.h (included below) pulls that header in. */
+#define _NSIG LNXRM_NR_SIGNALS
 
-#define SIG_DFL ((sighandler_t)0)
-#define SIG_IGN ((sighandler_t)1)
-
-#define SIGHUP    1
-#define SIGINT    2
-#define SIGQUIT   3
-#define SIGILL    4
-#define SIGTRAP   5
-#define SIGABRT   6
-#define SIGBUS    7
-#define SIGFPE    8
-#define SIGKILL   9
-#define SIGUSR1   10
-#define SIGSEGV   11
-#define SIGUSR2   12
-#define SIGPIPE   13
-#define SIGALRM   14
-#define SIGTERM   15
-#define SIGSTKFLT 16
-#define SIGCHLD   17
-#define SIGCONT   18
-#define SIGSTOP   19
-#define SIGTSTP   20
-#define SIGTTIN   21
-#define SIGTTOU   22
-#define SIGURG    23
-#define SIGXCPU   24
-#define SIGXFSZ   25
-#define SIGVTALRM 26
-#define SIGPROF   27
-#define SIGWINCH  28
-
-#define _NSIG 32
-
-/* sigprocmask how */
-#define SIG_BLOCK   0
-#define SIG_UNBLOCK 1
-#define SIG_SETMASK 2
-
-/* sa_flags */
-#define SA_RESTART 0x10000000
-
-struct sigaction {
-    sighandler_t sa_handler;
-    u64 sa_mask;
-    int sa_flags;
-};
-
-#define SIG_TRAMPOLINE_VA 0x7fffff800000UL
+LNXRM_STATIC_ASSERT(SIGKILL == 9 && SIGSTOP == 19 && SIGCONT == 18,
+                    "signal numbering must match the ABI header");
 
 /* ---- interrupt frame & task context ---- */
 /* Interrupt frame pushed by the stubs in entry64.S (ascending addresses). */
@@ -98,6 +55,7 @@ struct task {
     u32 cpu_id; /* CPU running this task (-1 if none) */
     enum task_state state;
     char name[TASK_NAME_LEN];
+    struct cred cred; /* T-030: privilege tier + uid (fork copies it) */
 
     struct intr_frame *tf; /* points into kstack while in kernel */
     struct cpu_ctx ctx;
@@ -108,6 +66,18 @@ struct task {
     void *brk_base; /* user heap start (= end of segments) */
     void *brk_cur;
 
+    /* T-032: what this task's user space costs, in 4 KiB pages.
+     * mem_pages is refreshed from the page tables themselves (at exec,
+     * fork and every brk) instead of being bumped wherever a page happens
+     * to be mapped, so it cannot drift out of step with the truth; it dies
+     * with the address space.  mem_peak is the high-water mark of it --
+     * ps shows both, which is how "who owns the RAM" and "who ballooned"
+     * are answered.  The ceiling that limits growth is not stored here:
+     * cred_mem_quota(&cred) derives it from the tier, so setuid() and the
+     * quota can never disagree (one fact, one answer -- C24). */
+    u64 mem_pages;
+    u64 mem_peak;
+
     struct file *fds[NR_FDS];
 
     int exit_code;
@@ -115,14 +85,18 @@ struct task {
     int quantum;
 
     struct task *parent;
-    struct task *next;    /* all-tasks list */
     struct task *rq_next; /* runqueue link */
     int rq_cpu;           /* CPU whose runqueue holds this task; -1 = not queued */
 
     /* signal support */
-    u64 signal_pending;              /* bitmask of pending signals */
-    u64 signal_mask;                 /* bitmask of blocked signals */
-    struct sigaction sa[NR_SIGNALS]; /* per-signal handlers */
+    u64 signal_pending; /* bitmask of pending signals */
+    u64 sig_blocked;    /* bitmask of blocked signals */
+    u64 sig_saved_blocked; /* sig_blocked to restore on sigreturn */
+    void *sig_handlers[_NSIG]; /* NULL = default, (void*)1 = ignore */
+    u64 sig_masks[_NSIG];      /* sa_mask active while that handler runs */
+    bool sig_in_handler;       /* a user handler frame is currently live */
+    struct intr_frame saved_tf; /* interrupted frame to restore via sigreturn */
+    u64 sig_fault_rip;         /* RIP already given a fault handler once */
 };
 
 /* current task macro: SMP mode reads from per-CPU data via GS. */
@@ -140,14 +114,25 @@ int sys_fork(void);
 long sys_execve(const char *path, char *const argv[], char *const envp[]);
 void sys_exit(int code) __attribute__((noreturn));
 int sys_waitpid(int pid, int *status, int opts);
+long sys_nanosleep(u64 ns, struct lnxrm_timespec *urem);
+long sys_ps(struct lnxrm_ps_entry *ubuf, int max);
+long sys_sigaction(int sig, const struct lnxrm_sigaction *uact,
+                   struct lnxrm_sigaction *uold);
+long sys_sigprocmask(int how, const u64 *uset, u64 *uold);
+long sys_sigreturn(void);
+long sys_uname(struct lnxrm_utsname *u);
 u32 next_pid(void);
 struct task *find_task(u32 pid);
-const char *task_state_name(enum task_state s);
 
 int copy_from_user(void *kdst, const void *usrc, size_t n);
 int copy_to_user(void *udst, const void *ksrc, size_t n);
 /* True iff [p, p+n) lies in user space and every page is mapped. */
 bool user_ptr_ok(u64 p, u64 n);
+/* Same, plus: every page is mapped writable.  This is what a kernel STORE
+ * through a user address needs -- with CR0.WP on, writing a read-only user
+ * page (text/.rodata) from ring 0 would raise #PF, and this kernel has no
+ * #PF fixup table, so callers check first and report LNXRM_EFAULT. */
+bool user_ptr_writable(u64 p, u64 n);
 /* Copy a NUL-terminated string from user space (byte-wise validated).
  * Always NUL-terminates kdst. Returns 0 on success, -1 if any byte of the
  * source is outside the user range or not mapped. */
@@ -158,15 +143,20 @@ void sched_init(void);
 void schedule(void);
 void sched_tick(void); /* PIT hook: quantum expiry */
 void sched_maybe_preempt(struct intr_frame *f);
-int sys_nanosleep(u64 ms);
 struct task *task_iter(int *i);
 
 /* signal helpers (kernel/signal.c) */
 void send_signal(struct task *t, int sig);
 void do_signal_check(struct task *t);
-void signal_init_trampoline(u64 pml4);
-long sys_sigreturn(void);
+/* Map the execute-only sigreturn restorer page into a fresh address space
+ * (every other user page is NX, so the handler cannot ret into its stack). */
+int signal_map_restorer(u64 pml4); /* 0, or LNXRM_ENOMEM */
+/* True when `sig` would currently do nothing to `t` (SIG_IGN, or the
+ * default ignore disposition).  SIGKILL / SIGSTOP are never ignored. */
+bool signal_ignored(struct task *t, int sig);
 void runqueue_add(struct task *t);void runqueue_remove(struct task *t);
+/* Requeue the outgoing current on THIS CPU's queue (see sched.c). */
+void runqueue_add_local(struct task *t);
 void idle_loop(void) __attribute__((noreturn));
 struct task *task_alloc_slot(void);
 void task_free_slot(struct task *t);

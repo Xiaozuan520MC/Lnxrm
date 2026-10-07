@@ -47,8 +47,6 @@ struct trampoline_data {
 };
 
 /* Located at a fixed physical address for trampoline access. */
-#define TRAMPOLINE_DATA_PHYS 0x9000UL
-#define TRAMPOLINE_DATA_VA   ((struct trampoline_data *)TRAMPOLINE_DATA_PHYS)
 #define TRAMPOLINE_CODE_PHYS 0x8000UL
 
 /* AP GDT placed right after trampoline code (physical, below 1 MiB).
@@ -61,7 +59,6 @@ struct trampoline_data {
  */
 #define AP_GDT_PHYS  0x8800UL
 #define AP_GDT_LIMIT 0x27U /* 5 entries × 8 bytes − 1 */
-#define AP_GDT_SIZE  40
 
 /* Called by BSP during boot to enumerate and start all APs. */
 void smp_init(void);

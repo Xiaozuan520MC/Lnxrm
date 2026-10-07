@@ -20,11 +20,8 @@ struct cpu_info {
     struct task *idle;     /* this CPU's idle task (never on a runqueue) */
     struct task runq_head; /* per-CPU run queue sentinel */
 
-    u64 kstack_top;          /* kernel stack top for this CPU */
-    struct cpu_ctx idle_ctx; /* idle task context */
-    u64 idle_stack[512];     /* 4 KiB idle stack */
-
-    spinlock_t task_lock; /* protects runq + task state */
+    /* Note: idle context/stack live in the idle TASK (task_table), not
+     * here; per-CPU run queues are guarded by sched.c's runq_lock. */
 
     volatile bool need_resched; /* per-CPU reschedule flag */
 };
@@ -36,10 +33,6 @@ struct cpu_info {
 struct cpu_info *this_cpu_data(void);
 void cpu_set_gs_base(u64 base);
 void cpu_init_percpu(u32 cpu_id, u32 apic_id);
-
-/* Convenience macros for per-CPU access. */
-#define this_cpu    (this_cpu_data()->_current)
-#define this_cpu_id (this_cpu_data()->id)
 
 /* All CPU info (indexed by logical id). */
 extern struct cpu_info cpu_table[MAX_CPUS];

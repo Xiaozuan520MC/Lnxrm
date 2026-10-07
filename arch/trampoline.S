@@ -64,15 +64,18 @@ pm32:
     or eax, (1 << 5) | (1 << 7)
     mov cr4, eax
 
-    ; enable long mode (EFER.LME)
+    ; enable long mode (EFER.LME) + NX pages (EFER.NXE): EFER is a
+    ; per-CPU MSR, so every AP has to enable NXE for itself
     mov ecx, 0xC0000080
     rdmsr
-    or eax, (1 << 8)
+    or eax, 0x900                   ; (1 << 8) LME | (1 << 11) NXE
     wrmsr
 
-    ; enable paging + protected mode
+    ; enable paging + protected mode + write protect (CR0.WP): every AP
+    ; must honor the page R/W bit for its own stores from the moment it
+    ; turns paging on, matching the BSP (setup.asm / entry64.S).
     mov eax, cr0
-    or eax, (1 << 31) | (1 << 0)
+    or eax, (1 << 31) | (1 << 16) | (1 << 0)
     mov cr0, eax
 
     ; far jump to 64-bit kernel code segment (selector 0x18)

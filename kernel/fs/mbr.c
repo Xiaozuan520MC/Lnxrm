@@ -15,14 +15,14 @@ static int part_read(struct blkdev *dev, u64 lba, u32 count, void *buf)
 {
     struct part_dev *pd = dev->drv;
     if (lba + count > pd->size_sectors) return LNXRM_EFAIL;
-    return pd->parent->read(pd->parent, pd->start_lba + lba, count, buf);
+    return blk_io_read(pd->parent, pd->start_lba + lba, count, buf);
 }
 
 static int part_write(struct blkdev *dev, u64 lba, u32 count, const void *buf)
 {
     struct part_dev *pd = dev->drv;
     if (lba + count > pd->size_sectors) return LNXRM_EFAIL;
-    return pd->parent->write(pd->parent, pd->start_lba + lba, count, buf);
+    return blk_io_write(pd->parent, pd->start_lba + lba, count, buf);
 }
 
 int mbr_parse(struct blkdev *dev, struct mbr_info *out)
@@ -39,7 +39,7 @@ int mbr_parse(struct blkdev *dev, struct mbr_info *out)
             dev->num_sectors / 2048);
 
     /* Read sector 0 (MBR) */
-    if (dev->read(dev, 0, 1, sector)) {
+    if (blk_io_read(dev, 0, 1, sector)) {
         kprintf("[mbr] failed to read sector 0\n");
         return LNXRM_EFAIL;
     }

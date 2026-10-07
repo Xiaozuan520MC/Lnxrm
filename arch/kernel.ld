@@ -15,7 +15,11 @@ SECTIONS
     .image : AT(KERNEL_LMA)
     {
         __kernel_start = .;
-        */entry64.o(.text.prologue)
+        /* --gc-sections must never drop the boot entry: ENTRY(_start64)
+         * roots this section, but KEEP makes that explicit -- _start32
+         * lives here too and scripts/patch_setup_jmp.py needs BOTH symbols
+         * to compute the setup.bin long-mode jump target. */
+        KEEP(*entry64.o(.text.prologue))
         *(.text .text.*)
 
         *(.rodata .rodata.*)
@@ -26,6 +30,15 @@ SECTIONS
         __init_array_end = .;
 
         *(.data .data.*)
+
+        /* Boot self-test cases (include/sys/ktest.h).  KEEP is mandatory:
+         * nothing outside this section references the cases, so
+         * --gc-sections would otherwise delete every test in the image and
+         * the kernel would "pass" a suite it no longer contains. */
+        . = ALIGN(8);
+        __ktest_start = .;
+        KEEP(*(.ktest))
+        __ktest_end = .;
 
         . = ALIGN(16);
     }

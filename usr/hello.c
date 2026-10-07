@@ -8,7 +8,7 @@ int main(int argc, char **argv)
     long pid = kfork();
     if (pid == 0) {
         xprintf("  child here (pid=%u)\n", (long)kgetpid());
-        ksleep_ms(200); /* exercise sys_nanosleep + schedule/idle path */
+        ksleep_ms(200, NULL); /* exercise sys_nanosleep + schedule/idle path */
         kexit(7);
     }
     int st = 0;

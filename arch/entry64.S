@@ -116,15 +116,20 @@ _start32:
     mov  eax, 0x60000
     mov  cr3, eax
 
-    ; --- EFER.LME --------------------------------------------------------
+    ; --- EFER.LME + NXE --------------------------------------------------
+    ; NXE (bit 11) makes bit 63 of a PTE mean "no execute"; user pages
+    ; are mapped with it, so it must be on before any of them exists.
     mov  ecx, 0xC0000080
     rdmsr
-    or   eax, 0x100
+    or   eax, 0x900
     wrmsr
 
-    ; --- CR0.PG ----------------------------------------------------------
+    ; --- CR0.PG + CR0.WP --------------------------------------------------
+    ; WP (bit 16) makes every ring-0 store honor the page R/W bit: a kernel
+    ; write to a read-only page (#PF) can no longer corrupt it.  Every page
+    ; mapped so far is P|W, so switching it on here cannot fault.
     mov  eax, cr0
-    or   eax, 0x80000000
+    or   eax, 0x80010000
     mov  cr0, eax
 
     ; --- jump to _start64's physical alias -------------------------------
@@ -501,27 +506,8 @@ glue_first:
     add rsp, 16
     iretq
 
-; void tf_exit(struct intr_frame *f): restore GP regs and iretq.
-; Used by sched paths that resume a task through its stored frame.
-global tf_exit
-tf_exit:
-    mov rsp, rdi
-    POPALL
-    add rsp, 16
-    iretq
-
-; uint64_t read_cr3(void) / void load_cr3(uint64_t)
-global read_cr3
-read_cr3:
-    mov rax, cr3
-    ret
-
+; void load_cr3(uint64_t)
 global load_cr3
 load_cr3:
     mov cr3, rdi
-    ret
-
-global invlpg
-invlpg:                                 ; rdi = vaddr
-    invlpg [rdi]
     ret

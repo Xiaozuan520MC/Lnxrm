@@ -1,3 +1,25 @@
+/* System call numbering (X-macro).
+ *
+ * Rules:
+ *  - Numbers are compact and contiguous: entry i is exactly i, with no
+ *    holes.  Anything the table does not name -- i.e. every number above
+ *    LNXRM_SYSCALL_LAST -- falls into the dispatcher's `default` arm and
+ *    answers LNXRM_ENOSYS (-38).
+ *  - New calls take the next number: append at the end and bump
+ *    LNXRM_SYSCALL_LAST in lnxrm_abi.h (the header rejects numbers past
+ *    it at compile time).
+ *  - Never renumber an existing entry from here on: user binaries are
+ *    built from this table and must keep calling the same slot for the
+ *    lifetime of the ABI.
+ *
+ * History: the table used to leave three holes for retired calls
+ * (21 getcpu, 31 getkey, 33 move).  The 0..30 renumbering compacted them
+ * away, so those old numbers now name the calls listed below -- only
+ * pre-rebuild binaries from that era would notice.  32 and up are free;
+ * setuid took 31 in the T-031 round (the first number appended since the
+ * renumbering -- appended, never renumbered, exactly as the rule above
+ * says).
+ */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
 LNXRM_SYS(open, 2)
@@ -19,16 +41,14 @@ LNXRM_SYS(sigprocmask, 17)
 LNXRM_SYS(getppid, 18)
 LNXRM_SYS(ps, 19)
 LNXRM_SYS(sigreturn, 20)
-LNXRM_SYS(getcpu, 21)
-LNXRM_SYS(diskinfo, 22)
-LNXRM_SYS(mkdir, 23)
-LNXRM_SYS(fb_info, 24)
-LNXRM_SYS(fb_clear, 25)
-LNXRM_SYS(fb_fill, 26)
-LNXRM_SYS(fb_char, 27)
-LNXRM_SYS(fb_puts, 28)
-LNXRM_SYS(unlink, 29)
-LNXRM_SYS(rmdir, 30)
-LNXRM_SYS(getkey, 31)
-LNXRM_SYS(rename, 32)
-LNXRM_SYS(move, 33)
+LNXRM_SYS(diskinfo, 21)
+LNXRM_SYS(mkdir, 22)
+LNXRM_SYS(fb_info, 23)
+LNXRM_SYS(fb_clear, 24)
+LNXRM_SYS(fb_fill, 25)
+LNXRM_SYS(fb_char, 26)
+LNXRM_SYS(fb_puts, 27)
+LNXRM_SYS(unlink, 28)
+LNXRM_SYS(rmdir, 29)
+LNXRM_SYS(rename, 30)
+LNXRM_SYS(setuid, 31)

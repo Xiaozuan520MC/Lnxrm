@@ -62,6 +62,11 @@ VBE_LIST   equ 0x8B00          ; dd  cursor while walking the BIOS mode list
 VBE_MODE   equ 0x8B04          ; dw  mode number being probed
 VBE_MINBPP equ 0x8B06          ; db  depth floor for the current pass
 VBE_IDX    equ 0x8B07          ; db  index into the classic-mode list
+VBE_REQ_W  equ 0x8B08          ; dw  required X resolution (0 = any)
+VBE_REQ_H  equ 0x8B0A          ; dw  required Y resolution (0 = any)
+VBE_TOTMEM equ 0x8B0C          ; dw  VRAM in 64 KiB units (0 = unknown)
+VBE_BEST   equ 0x8B0E          ; dd  pixel count of the best mode seen so far
+VBE_BESTMD equ 0x8B12          ; dw  mode number that produced it
 VBE_LFB    equ 0x8C00          ; dd  PhysBasePtr
 VBE_PITCH  equ 0x8C04          ; dd  BytesPerScanLine
 VBE_XRES   equ 0x8C08          ; dw  XResolution
@@ -138,11 +143,16 @@ real_start:
 
     ; ---- VBE: pick a linear-framebuffer graphics mode --------------------
     ; Real mode with DS = ES = 0 => flat physical addressing (VBE_* equates).
+    ;   pass 0  preferred resolutions, deepest colour first:
+    ;           1280x720  (720p)  at 32, 24, then any true colour
+    ;           1920x1080 (1080p) at 32, 24, then any true colour
+    ;   pass 1  largest true-colour mode that fits the VRAM (adaptive)
     ;   pass A  classic VESA 8bpp LFB modes 0x101 / 0x103 / 0x105
-    ;   pass B  first BIOS mode with >= 15 bpp (many real GPUs ship no 8bpp)
-    ;   pass C  first BIOS mode with any supported depth
+    ;   pass B  first BIOS mode with any supported depth
     ; A candidate must survive 4F01 validation AND a real 4F02 mode set, so
     ; a BIOS that advertises a mode it cannot program is not trusted.
+    ; Every mode must also fit VRAM (4F00 TotalMemory) and the 16 MiB LFB
+    ; window the kernel maps, so the choice never outgrows the framebuffer.
     ; The mode that wins is described at 0x8C00 (struct vbe_lfb_info).
     DBG 'V'
     push ds
@@ -151,6 +161,56 @@ real_start:
     mov es, ax                      ; ES = 0 (INT 0x10 VBE uses ES:DI)
     mov byte [VBE_OK], 0
     mov byte [VBE_IDX], 0
+    mov byte [VBE_MINBPP], 0
+    mov word [VBE_REQ_W], 0
+    mov word [VBE_REQ_H], 0
+    mov word [VBE_TOTMEM], 0
+
+    ; controller info once: how much VRAM the BIOS reports (64 KiB units),
+    ; used by vbe_probe to reject modes whose scan buffer would not fit.
+    mov ax, 0x4F00                  ; VBE: Get Controller Information
+    mov di, 0x8400                  ; buffer at physical 0x8400
+    int 0x10
+    cmp ax, 0x004F
+    jne .no_ctl
+    cmp byte [0x8400], 'V'          ; 'VESA'
+    jne .no_ctl
+    cmp byte [0x8401], 'E'
+    jne .no_ctl
+    mov ax, [0x8412]                ; TotalMemory
+    mov [VBE_TOTMEM], ax
+.no_ctl:
+
+    ; ---- preferred resolutions, deepest colour first ---------------------
+    ; VBE_TRY_MODE w, h: accept this exact mode at 32, then 24, then any
+    ; true colour depth the machine can offer.  720p is the default and
+    ; wins whenever the BIOS offers it; 1080p only takes over on machines
+    ; that have no 720p mode at all, and neither ever falls back silently
+    ; to a bigger mode.
+%macro VBE_TRY_MODE 2
+    mov word [VBE_REQ_W], %1
+    mov word [VBE_REQ_H], %2
+    mov byte [VBE_MINBPP], 32       ; 32 bpp (xRGB8888) first ...
+    call vbe_enum
+    jnc vbe_end
+    mov byte [VBE_MINBPP], 24       ; ... 24 bpp (RGB888) ...
+    call vbe_enum
+    jnc vbe_end
+    mov byte [VBE_MINBPP], 15       ; ... then any true-colour depth
+    call vbe_enum
+    jnc vbe_end
+%endmacro
+
+    VBE_TRY_MODE 1280, 720          ; 720p  (default)
+    VBE_TRY_MODE 1920, 1080         ; 1080p (fallback)
+    mov word [VBE_REQ_W], 0         ; no exact size anymore: adaptive pass
+    mov word [VBE_REQ_H], 0
+
+    ; ---- adaptive fallback: the biggest true-colour mode we can use ------
+    mov byte [VBE_MINBPP], 15
+    call vbe_enum_best
+    jnc vbe_end
+
     mov byte [VBE_MINBPP], 0
 
 vbe_pass_a:
@@ -169,10 +229,7 @@ vbe_pass_a:
     jmp vbe_end
 
 vbe_pass_b:
-    mov byte [VBE_MINBPP], 15       ; true colour first ...
-    call vbe_enum
-    jnc vbe_end
-    mov byte [VBE_MINBPP], 0        ; ... then anything we can draw with
+    mov byte [VBE_MINBPP], 0        ; anything we can draw with
     call vbe_enum
     jnc vbe_end
     mov byte [VBE_OK], 0            ; no usable mode: stay in VGA text mode
@@ -180,6 +237,9 @@ vbe_pass_b:
 
     align 2
     ; ---- vbe_probe: 4F01 [VBE_MODE] -> info at 0x8000, CF=0 when usable ---
+    ; Also enforces the current selection criteria: VBE_MINBPP is the depth
+    ; floor, VBE_REQ_W/VBE_REQ_H an exact resolution (0 = accept any size),
+    ; and the mode's scan buffer must fit in the VRAM reported by 4F00.
 vbe_probe:
     mov cx, [VBE_MODE]
     mov ax, 0x4F01                  ; VBE: Get Mode Information
@@ -195,11 +255,23 @@ vbe_probe:
     test al, 0x10                   ; graphics mode, not text
     jz .bad
     movzx eax, word [0x8012]        ; XResolution
+    mov dx, [VBE_REQ_W]
+    test dx, dx
+    jz .w_any
+    cmp ax, dx
+    jne .bad
+.w_any:
     cmp eax, 320
     jb .bad
     cmp eax, 4096
     ja .bad
     movzx eax, word [0x8014]        ; YResolution
+    mov dx, [VBE_REQ_H]
+    test dx, dx
+    jz .h_any
+    cmp ax, dx
+    jne .bad
+.h_any:
     cmp eax, 200
     jb .bad
     cmp eax, 4096
@@ -223,9 +295,26 @@ vbe_probe:
 .depth_ok:
     mov al, [0x801B]                ; MemoryModel
     cmp al, 4                       ; packed pixel
-    je .good
+    je .mem_ok
     cmp al, 6                       ; direct colour
     jne .bad
+.mem_ok:
+    ; the scan buffer must fit in the VRAM behind it (64 KiB units, VBE 2.0)
+    movzx eax, word [0x8010]        ; BytesPerScanLine
+    movzx edx, word [0x8014]        ; YResolution
+    mul edx                         ; EDX:EAX = pitch * height
+    test edx, edx
+    jnz .bad                        ; > 4 GiB: bogus mode info
+    mov ecx, eax                    ; ECX = frame bytes
+    cmp ecx, 0x1000000              ; <= 16 MiB: the kernel's LFB window
+    ja .bad                         ; (FB_MAX_BYTES in include/framebuffer.h)
+    movzx eax, word [VBE_TOTMEM]    ; VRAM in 64 KiB units (0 = unknown)
+    test eax, eax
+    jz .good
+    shl eax, 16                     ; -> bytes
+    jc .good                        ; >= 4 GiB of VRAM: certainly fits
+    cmp ecx, eax
+    ja .bad
 .good:
     clc
     ret
@@ -307,6 +396,62 @@ vbe_enum:
     jc .next
     call vbe_setmode
     jc .next
+    call vbe_save
+    clc
+    ret
+.none:
+    stc
+    ret
+
+    ; ---- vbe_enum_best: the LARGEST mode matching the current criteria ----
+    ; vbe_enum takes the first mode the BIOS lists (usually the smallest one).
+    ; When neither 1080p nor 720p is offered, picking the biggest true-colour
+    ; mode keeps the console as usable as the hardware allows.
+vbe_enum_best:
+    mov dword [VBE_BEST], 0         ; pixel count of the best mode so far
+    mov word [VBE_BESTMD], 0
+    mov ax, 0x4F00                  ; VBE: Get Controller Information
+    mov di, 0x8400                  ; buffer at physical 0x8400 (512 bytes)
+    int 0x10
+    cmp ax, 0x004F
+    jne .none
+    cmp byte [0x8400], 'V'          ; 'VESA' signature
+    jne .none
+    cmp byte [0x8401], 'E'
+    jne .none
+    movzx esi, word [0x8410]        ; mode list segment:offset at 0x10 / 0x0E
+    shl esi, 4
+    movzx eax, word [0x840E]
+    add esi, eax
+    mov [VBE_LIST], esi
+.next:
+    mov esi, [VBE_LIST]
+    movzx ecx, word [esi]
+    add esi, 2
+    mov [VBE_LIST], esi
+    cmp cx, 0xFFFF                  ; end-of-list?
+    je .apply
+    mov [VBE_MODE], cx
+    call vbe_probe                  ; applies size / depth / VRAM criteria
+    jc .next
+    movzx eax, word [0x8012]        ; XResolution
+    movzx edx, word [0x8014]        ; YResolution
+    mul edx                         ; EDX:EAX = pixels (both <= 4096)
+    cmp eax, [VBE_BEST]
+    jbe .next                       ; not bigger than what we already have
+    mov [VBE_BEST], eax
+    mov ax, [VBE_MODE]
+    mov [VBE_BESTMD], ax
+    jmp .next
+.apply:
+    cmp word [VBE_BESTMD], 0
+    je .none
+    mov ax, [VBE_BESTMD]
+    mov [VBE_MODE], ax
+    call vbe_probe                  ; reload that mode's info block at 0x8000
+    jc .none
+    call vbe_setmode
+    jc .none
     call vbe_save
     clc
     ret
@@ -402,10 +547,10 @@ pm_entry:
     mov cr3, edx
     mov ecx, 0xC0000080             ; EFER
     rdmsr
-    or  eax, 0x100                  ; EFER.LME
+    or  eax, 0x900                  ; EFER.LME (8) | EFER.NXE (11)
     wrmsr
     mov eax, cr0
-    or  eax, 0x80000000             ; CR0.PG
+    or  eax, 0x80010000             ; CR0.PG | CR0.WP
     mov cr0, eax
 
     mov DWORD [0x6F00], 0

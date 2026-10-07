@@ -20,6 +20,9 @@ struct vnode {
 struct dirent_out {
     char name[56];
     u8 type;
+    /* Stable object id within the filesystem (0 only if the fs cannot
+     * produce one).  Forwarded verbatim into lnxrm_dirent.d_ino. */
+    u64 ino;
 };
 
 /* Filesystem-specific operations. All paths are relative to mount root. */
@@ -39,28 +42,25 @@ struct fs_ops {
 struct file_ops {
     long (*read)(struct file *, void *buf, size_t n);
     long (*write)(struct file *, const void *buf, size_t n);
-    long (*lseek)(struct file *, long off, int whence);
     long (*getdent)(struct file *, void *ubuf, size_t n);
     int (*close)(struct file *);
 };
 
 #define O_RDONLY  0
-#define O_WRONLY  1
-#define O_RDWR    2
 #define O_CREAT   0100
 #define O_TRUNC   01000
-#define O_APPEND  02000
 #define O_CLOEXEC 010000
-
-#define SEEK_SET 0
-#define SEEK_CUR 1
-#define SEEK_END 2
 
 struct dir_iter {
     void *node;
     struct fs_ops *ops;
     u64 cookie;
     void *mnt_data;
+    /* T-005: a scan that died with an I/O error stays dead.  The cookie no
+     * longer means "resume here" once a transfer failed, so the error is
+     * remembered and re-reported instead of the next getdent claiming the
+     * directory simply ended. */
+    int err;
 };
 
 struct file {
@@ -79,8 +79,13 @@ void syscall_entry(struct intr_frame *f);
 long sys_open(const char *path, int flags);
 
 void vfs_init(void);
-int vfs_mount_root(void);     /* no-op: root comes from vfs_try_mount_disk */
 int vfs_try_mount_disk(void); /* FAT32 from first block dev -> / */
+bool vfs_root_ready(void);    /* a filesystem answers at "/" (boot self-test) */
+/* prefix a relative path with '/', returning `path` itself when it is
+ * already absolute; NULL when the normalised path would not fit `buf` --
+ * the caller answers LNXRM_ENAMETOOLONG instead of using a truncated
+ * path.  Published for the boot self-test (C46, fixed). */
+const char *vfs_abs_path(const char *path, char *buf, size_t bufsz);
 long vfs_open_file(const char *path, int flags, struct file **out);
 size_t vfs_file_size(struct file *f);
 long vfs_read_file(struct file *f, void *buf, size_t n);
@@ -97,7 +102,30 @@ long sys_mkdir(const char *upath);
 long sys_unlink(const char *upath);
 long sys_rmdir(const char *upath);
 long sys_rename(const char *uold, const char *unew);
-long sys_move(const char *usrc, const char *udestdir);
+
+/* Capacity from an ATA IDENTIFY DEVICE data block, in 512-byte sectors.
+ *
+ * words 60-61 are the 28-bit field, and ATA-6/7 gives FFFFFFFFh in them a
+ * second meaning: "48-bit is supported, read words 100-103 instead".  It is
+ * also what that field saturates to on a disk >= 2 TiB.  Taking it verbatim
+ * makes num_sectors = 0xFFFFFFFF, which `num_sectors / 2048` then prints as
+ * 2097151 -- a number that looks measured but is just 32 ones truncated by
+ * integer division, one megabyte short of 2 TiB.
+ *
+ * words 100-103 are 0 when a device does not implement them, so a non-zero
+ * value there is authoritative (the usual case, and how Linux's
+ * ata_id_n_sectors() reads it without needing word 83 either).  When neither
+ * field yields a size the answer is 0 == "unknown": the caller must decline
+ * to register the device rather than publish a fabricated capacity. */
+static inline u64 ata_total_sectors(const u16 *id)
+{
+    u32 l28 = (u32)id[60] | ((u32)id[61] << 16);
+    u64 l48 = (u64)id[100] | ((u64)id[101] << 16) | ((u64)id[102] << 32) |
+              ((u64)id[103] << 48);
+    if (l48) return l48;
+    if (l28 == 0xFFFFFFFFu) return 0; /* sentinel: unknown, never 2 TiB */
+    return l28;
+}
 
 /* block devices (drivers/ide.c + drivers/ahci.cpp register; fs/fat32.c consumes) */
 struct blkdev {

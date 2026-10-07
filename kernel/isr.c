@@ -33,9 +33,8 @@ static bool shift_pressed = false;
 static bool capslock_on = false;
 
 #define KBD_DATA 0x60
-#define KBD_STAT 0x64
 
-static bool kbd_ext; /* file-scope so kbd_poll can share it */
+static bool kbd_ext; /* file-scope: the E0 prefix belongs to the next code */
 
 static void kbd_process_sc(u8 sc)
 {
@@ -70,10 +69,6 @@ static void kbd_process_sc(u8 sc)
             c = c - 'A' + 'a';
         input_push(c);
     }
-    /* Every press also lands in the raw key queue consumed by SYS_getkey,
-     * so key events without an ASCII mapping (arrows, F-keys, ...) stay
-     * visible to user space as scancode + extended flag. */
-    keyq_push(((u32)ext << 16) | ((u32)code << 8) | (u8)c);
 }
 
 void kbd_irq_handler(struct intr_frame *f)
@@ -130,48 +125,6 @@ int input_pop(void)
     return c;
 }
 
-/* ---- ring buffer for raw key events (SYS_getkey) ----
- * Unlike inbuf this one carries the scancode and the E0-extended flag as
- * well as the ASCII translation, and it is drained by getkey() only, so a
- * raw-mode reader never steals characters from console_read(). */
-#define KEYQ_SZ 64
-static volatile u32 keyq[KEYQ_SZ];
-static volatile u32 keyq_r, keyq_w;
-
-/* The single task blocked in sys_getkey(); keyq_push() wakes it. */
-static struct task *volatile key_waiter;
-
-void key_waiter_arm(struct task *t)
-{ key_waiter = t; }
-
-void key_waiter_disarm(struct task *t)
-{
-    if (key_waiter == t) key_waiter = NULL;
-}
-
-void keyq_push(u32 ev)
-{
-    if ((keyq_w + 1) % KEYQ_SZ == keyq_r) return; /* drop when full */
-    keyq[keyq_w] = ev;
-    __atomic_store_n(&keyq_w, (keyq_w + 1) % KEYQ_SZ, __ATOMIC_SEQ_CST);
-
-    struct task *w = key_waiter;
-    if (w && w->state == T_SLEEPING) {
-        key_waiter = NULL;
-        w->state = T_RUNNABLE;
-        runqueue_add(w);
-    }
-}
-
-int keyq_pop(void)
-{
-    u32 r = __atomic_load_n(&keyq_r, __ATOMIC_SEQ_CST);
-    if (r == keyq_w) return -1;
-    int ev = (int)keyq[r];
-    __atomic_store_n(&keyq_r, (r + 1) % KEYQ_SZ, __ATOMIC_SEQ_CST);
-    return ev;
-}
-
 /* ---- central dispatch ---- */
 static const char *exc_names[32] = {
     "#DE", "#DB", "NMI", "#BP", "#OF", "#BR", "#UD", "#NM", "#DF", "?9",  "#TS",
@@ -183,6 +136,14 @@ extern void ipi_dispatch(u32 vector);
 
 void isr_common(struct intr_frame *f)
 {
+    /* Ring-0 entry: drop EFLAGS.AC unconditionally (when SMAP exists).
+     * Userspace owns AC and may have set it with POPF; entering the kernel
+     * with AC=1 would let the very next user-page access bypass SMAP.
+     * Hardware preserves AC across the iretq back (the frame carries the
+     * user's original flags), so userspace loses nothing.  CLAC #UDs while
+     * CR4.SMAP=0, hence the gate. */
+    if (g_smap) __asm__ volatile("clac" ::: "memory");
+
     /* ---- IPI vectors (0xF0..0xF2) ---- */
     if (f->intno >= 0xF0 && f->intno <= 0xF2) {
         ipi_dispatch((u32)f->intno);
@@ -199,6 +160,36 @@ void isr_common(struct intr_frame *f)
         if (f->intno == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
         kprintf("\n[exception] %s (%d) err=%#lx rip=%#lx rsp=%#lx cr2=%#lx\n",
                 exc_names[f->intno & 31], f->intno, f->err, f->rip, f->ussp, cr2);
+        if (f->intno == 14) {
+            /* Decode the #PF error code so a WP/SMAP regression is readable
+             * straight from the log: P=1+W=1+U=0 is a ring-0 store to a
+             * read-only page OR a SMAP violation -- identical error codes.
+             * Tell them apart: f->rflags is the hardware-pushed pre-clac
+             * value, so AC=1 means a STAC window was open (SMAP disarmed ->
+             * must be WP); AC=0 plus a user-space cr2 means the store/load
+             * had no window at all -> SMAP (or WP against a RO user page). */
+            kprintf("[exception] #PF %s%s%s%s%s\n",
+                    (f->err & 1) ? "protection" : "not-present",
+                    (f->err & 2) ? ", write" : ", read",
+                    (f->err & 4) ? ", user" : ", supervisor",
+                    (f->err & 8) ? ", reserved-bit" : "",
+                    (f->err & 16) ? ", instr-fetch" : "");
+            if ((f->err & 7) == 3) {
+                bool ac_at_entry = (f->rflags & (1UL << 18)) != 0;
+                bool user_va = cr2 >= USER_BASE && cr2 <= USER_MAX_VMA;
+                if (ac_at_entry)
+                    kprintf("[exception] ring-0 store to a read-only page (CR0.WP, "
+                            "AC=1 so SMAP was open)\n");
+                else if (user_va)
+                    kprintf("[exception] supervisor %s to a user page with AC=0: "
+                            "missing STAC window (SMAP) or store to a RO user page "
+                            "(CR0.WP)\n",
+                            (f->err & 2) ? "store" : "load");
+                else
+                    kprintf("[exception] ring-0 store to a read-only page "
+                            "(CR0.WP)\n");
+            }
+        }
         if (current)
             kprintf("[exception] task pid=%u name=%s cs=%#lx ss=%#lx\n", current->pid,
                     current->name, f->cs, f->usss);
@@ -213,7 +204,27 @@ void isr_common(struct intr_frame *f)
                 sig = SIGILL;
             else if (f->intno == 7 || f->intno == 17)
                 sig = SIGBUS;
-            kprintf("[exception] user fault -> kill pid=%u with sig %d\n", current->pid, sig);
+            kprintf("[exception] user fault -> sig %d pid=%u\n", sig, current->pid);
+
+            /* A handler installed with sigaction() must win over the
+             * default disposition, otherwise SIGSEGV/SIGILL/SIGFPE are
+             * uncatchable and sigaction() is a lie.  Redirect to the
+             * handler the same way any other deliverable signal does.
+             * sig_in_handler keeps a fault inside the handler from
+             * recursing forever: the second one kills the process. */
+            void *h = current->sig_handlers[sig];
+            if (h != SIG_DFL && h != SIG_IGN && !current->sig_in_handler &&
+                !(current->sig_blocked & (1ULL << sig))) {
+                /* sigreturn puts rip back on the faulting instruction. If
+                 * it faults again at the very same RIP the handler did not
+                 * fix the problem, so kill instead of looping forever. */
+                if (current->sig_fault_rip == f->rip) sys_exit(-sig);
+                current->sig_fault_rip = f->rip;
+                current->tf = f;
+                send_signal(current, sig);
+                do_signal_check(current); /* redirects f->rip/ussp */
+                return;                   /* -> POPALL; iretq into handler */
+            }
             sys_exit(-sig);
             /* not reached */
         }

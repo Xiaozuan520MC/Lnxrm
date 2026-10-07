@@ -153,9 +153,16 @@ void ipi_dispatch(u32 vector)
 
 volatile u64 jiffies;
 
+/* Every CPU now has its own LAPIC timer, so pit_handler runs on ALL
+ * CPUs — but jiffies is the single global time base and is advanced by
+ * the BSP only. Incrementing it everywhere would run the clock at
+ * NCPU × HZ (sleeps finish early, quanta shrink, deadlines drift).
+ * The other fields (quantum, sleepers) are intentionally per-CPU:
+ * sched_tick() on each CPU accounts locally, and waking a sleeper is
+ * idempotent (runqueue_add rejects an already-queued task). */
 static void pit_handler(struct intr_frame *f)
 {
-    jiffies++;
+    if (this_cpu_data()->bsp) jiffies++;
     sched_tick();
     sched_maybe_preempt(f);
 }
@@ -171,7 +178,11 @@ static u32 pit_count(void)
 void pit_init(u32 hz)
 {
     u32 div = PIT_HZ / hz;
-    outb(PIT_CMD, 0x36);
+    /* Mode 2 (rate generator), NOT mode 3: QEMU's mode-3 implementation
+     * reloads after div/2 PIT clocks, so a "10 ms" window would actually
+     * last 5 ms — halving every calibrated interval (jiffies ran at
+     * 2×HZ until this changed). Mode 2 counts the full divisor. */
+    outb(PIT_CMD, 0x34);
     outb(PIT_CH0, div & 0xff);
     outb(PIT_CH0, (div >> 8) & 0xff);
     /* vector 32 -> pit_handler via isr_common's irq path.
@@ -180,32 +191,79 @@ void pit_init(u32 hz)
     irq_install(0, pit_handler);
 }
 
-/* Calibrate the LAPIC timer against one full PIT period (1/hz seconds)
- * and start it in periodic mode on vector `vector`. */
-void lapic_timer_start(u32 vector, u32 hz)
+/* ---- shared LAPIC timer calibration + TSC rate ----
+ *
+ * One measurement window serves both consumers:
+ *   - s_lapic_period: LAPIC ticks per HZ period, loaded by EVERY CPU's
+ *     timer (calibrating per-AP would race the BSP for the PIT latch).
+ *   - s_tsc_per_ms:   TSC ticks per millisecond, used by mdelay().
+ *     Measured across the same PIT window instead of assuming ~2 GHz.
+ *
+ * Must run on the BSP before smp_init() — see main.c. */
+static u32 s_lapic_period;
+static u64 s_tsc_per_ms;
+
+u32 lapic_timer_calibrate(void)
 {
-    u32 div = PIT_HZ / hz;
+    u32 div = PIT_HZ / HZ;
 
     apic_write(LAPIC_LVT_TIMER, 0x10000); /* masked while calibrating */
-    apic_write(LAPIC_TIMER_DCR, 0x3);     /* divide by 16 */
+    apic_write(LAPIC_TIMER_DCR, 0x3);     /* divide by 8 */
     apic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
 
     /* Align to a PIT reload edge (count: div -> 1 -> reload). */
     while (pit_count() > 1000);
     while (pit_count() < div - 1000);
     u32 lap0 = apic_read(LAPIC_TIMER_CCR);
+    u64 tsc0 = rdtsc();
 
     while (pit_count() > 1000);
     while (pit_count() < div - 1000);
     u32 lap1 = apic_read(LAPIC_TIMER_CCR);
+    u64 tsc1 = rdtsc();
 
     u32 period = lap0 - lap1;
     if (period < 1000) period = 100000; /* sanity fallback */
+    s_lapic_period = period;
 
+    /* The window is one full HZ period, i.e. 1000/HZ milliseconds. */
+    u64 window_ms = 1000 / HZ;
+    u64 tsc_delta = tsc1 - tsc0;
+    if (window_ms && tsc_delta > 1000000 && tsc_delta < (1ULL << 62))
+        s_tsc_per_ms = tsc_delta / window_ms;
+    if (!s_tsc_per_ms) s_tsc_per_ms = 2000000ULL; /* old ~2 GHz assumption */
+
+    return period;
+}
+
+/* Arm this CPU's LAPIC timer in periodic mode. Safe to call on any CPU
+ * once lapic_timer_calibrate() has run; falls back to calibrating here
+ * (only correct if no other CPU's timer is mid-calibration). */
+void lapic_timer_start(u32 vector, u32 hz)
+{
+    u32 period = s_lapic_period;
+    if (!period) period = lapic_timer_calibrate();
+
+    /* DCR is per-LAPIC: every CPU must set its own divide configuration. */
+    apic_write(LAPIC_LVT_TIMER, 0x10000); /* masked while arming */
+    apic_write(LAPIC_TIMER_DCR, 0x3);     /* divide by 8 */
     apic_write(LAPIC_LVT_TIMER, vector | LVT_TIMER_PERIODIC);
     apic_write(LAPIC_TIMER_ICR, period);
-    kprintf("[lapic] timer vec=%u hz=%u period=%u\n", vector, hz, period);
+    kprintf("[lapic] timer vec=%u hz=%u period=%u%s\n", vector, hz, period,
+            this_cpu_data()->bsp ? "" : " (AP)");
 }
+
+/* Busy-wait in milliseconds using the calibrated TSC rate. Interrupts
+ * are NOT touched — callers run in contexts that already manage IF. */
+void mdelay(u32 ms)
+{
+    if (!s_tsc_per_ms) lapic_timer_calibrate();
+    u64 start = rdtsc();
+    while (rdtsc() - start < (u64)ms * s_tsc_per_ms);
+}
+
+u64 tsc_per_ms(void)
+{ return s_tsc_per_ms; }
 
 /* ---- msr ---- */
 u64 rdmsr(u32 msr)
@@ -225,8 +283,97 @@ u64 rdtsc(void)
     return ((u64)d << 32) | a;
 }
 
+/* ---- CR0.WP / CR4.SMEP / CR4.SMAP ---- */
+bool cpu_has_smep(void)
+{
+    u32 r[4];
+
+    __asm__ volatile("cpuid"
+                     : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                     : "a"(0), "c"(0));
+    if (r[0] < 7) return false; /* leaf 7 not implemented */
+    __asm__ volatile("cpuid"
+                     : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                     : "a"(7), "c"(0));
+    return (r[1] >> 7) & 1; /* CPUID.(EAX=7,ECX=0):EBX[7] */
+}
+
+bool cpu_has_smap(void)
+{
+    u32 r[4];
+
+    __asm__ volatile("cpuid"
+                     : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                     : "a"(0), "c"(0));
+    if (r[0] < 7) return false; /* leaf 7 not implemented */
+    __asm__ volatile("cpuid"
+                     : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                     : "a"(7), "c"(0));
+    /* SMAP lives in EBX[20] (like Linux X86_FEATURE_SMAP = 7*32+20), NOT in
+     * ECX -- reading the wrong register made every CPU look SMAP-less. */
+    return (r[1] >> 20) & 1; /* CPUID.(EAX=7,ECX=0):EBX[20] */
+}
+
+/* Published by cpu_protect_init(): g_smap must be true exactly when
+ * CR4.SMAP is set on this CPU, because STAC/CLAC #UD while CR4.SMAP=0.
+ * cpu_protect_init runs with interrupts off, so the CR4 write and this
+ * store are one atomic-enough sequence (nobody can slip a uaccess between
+ * them).  False until then: a missed window would over-protect, never #UD. */
+bool g_smap = false;
+
+void cpu_protect_init(void)
+{
+    u64 cr0, cr4;
+
+    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    cr0 |= CR0_WP;
+    __asm__ volatile("mov %0,%%cr0" ::"r"(cr0) : "memory");
+
+    __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
+    if (cpu_has_smep()) cr4 |= CR4_SMEP; /* else CR4 keeps a reserved bit = #GP */
+    if (cpu_has_smap()) {
+        cr4 |= CR4_SMAP;
+        g_smap = true;
+    }
+    __asm__ volatile("mov %0,%%cr4" ::"r"(cr4) : "memory");
+}
+
 void cpu_init(void)
 {
+    /* Boot log detail: CPU vendor + brand string straight from CPUID. */
+    {
+        u32 r[4], brand32[13] = {0};
+        char vendor[13] = "???";
+        char *brand = (char *)brand32;
+
+        __asm__ volatile("cpuid"
+                         : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                         : "a"(0), "c"(0));
+        for (int i = 0; i < 4; i++) {
+            vendor[i] = (char)(r[1] >> (8 * i));
+            vendor[4 + i] = (char)(r[3] >> (8 * i));
+            vendor[8 + i] = (char)(r[2] >> (8 * i));
+        }
+        vendor[12] = 0;
+
+        __asm__ volatile("cpuid"
+                         : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                         : "a"(0x80000000), "c"(0));
+        if (r[0] >= 0x80000004) {
+            for (u32 leaf = 0x80000002; leaf <= 0x80000004; leaf++) {
+                __asm__ volatile("cpuid"
+                                 : "=a"(brand32[(leaf - 0x80000002) * 4]),
+                                   "=b"(brand32[(leaf - 0x80000002) * 4 + 1]),
+                                   "=c"(brand32[(leaf - 0x80000002) * 4 + 2]),
+                                   "=d"(brand32[(leaf - 0x80000002) * 4 + 3])
+                                 : "a"(leaf), "c"(0));
+            }
+            brand[48] = 0;
+            while (*brand == ' ') brand++; /* brand strings are space-padded */
+        }
+        kprintf("[cpu] %s, vendor %s\n", brand[0] ? brand : "(no brand)", vendor);
+    }
+
     gdt_init();
     /* Re-set GS base after GDT reload — gdt_reload() does mov gs,ax
      * which in QEMU's TCG resets the hidden base from the GDT entry,
@@ -241,10 +388,25 @@ void cpu_init(void)
     /* enable SSE so any FP codegen does not #UD */
     u64 cr0, cr4;
     __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
-    cr0 &= ~((1UL << 2) | (1UL << 3)); /* EM=0 TS=0 */
-    cr0 |= (1UL << 1) | (1UL << 5);    /* MP=1 NE=1 */
+    cr0 &= ~(CR0_EM | CR0_TS); /* EM=0 TS=0 */
+    cr0 |= CR0_MP | CR0_NE;    /* MP=1 NE=1 */
     __asm__ volatile("mov %0,%%cr0" ::"r"(cr0));
     __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
-    cr4 |= (1UL << 9) | (1UL << 10); /* OSFXSR OSXMMEXCPT */
+    cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
     __asm__ volatile("mov %0,%%cr4" ::"r"(cr4));
+
+    /* Write-protect the kernel's own stores (CR0.WP) and refuse to run user
+     * code at CPL=0 (CR4.SMEP, CPUID-gated).  The boot asm already set WP
+     * with PG; calling it again here makes the invariant explicit before any
+     * user page exists, and is where SMEP lands (it needs the CPUID check). */
+    cpu_protect_init();
+    {
+        u64 c0, c4;
+        __asm__ volatile("mov %%cr0,%0" : "=r"(c0));
+        __asm__ volatile("mov %%cr4,%0" : "=r"(c4));
+        kprintf("[cpu] CR0.WP=%d CR4.SMEP=%d CR4.SMAP=%d (SMEP/SMAP cpuid=%d/%d)\n",
+                (int)((c0 & CR0_WP) != 0), (int)((c4 & CR4_SMEP) != 0),
+                (int)((c4 & CR4_SMAP) != 0), (int)cpu_has_smep(),
+                (int)cpu_has_smap());
+    }
 }

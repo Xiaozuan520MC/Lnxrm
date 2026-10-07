@@ -1,0 +1,87 @@
+lnxrm
+=====
+
+lnxrm 是一个 x86-64 单体内核，用 ASM + C + C++ + Rust 从零写成。
+它管理硬件、内存、进程、文件系统，并向用户态提供 32 个系统调用编号（0–31 连续无空洞），全部已实现。
+
+约 16,029 行内核代码（含 ktest/ 自测）+ 1,768 行用户态程序（16 个）。产出符合 Linux x86 boot
+protocol 2.08 的 bzImage，在 QEMU 下挂载 FAT32 并运行自带 shell。
+
+快速开始
+--------
+
+    make                      # 构建内核（约 2 秒）
+    make usr build/disk.img   # 构建用户态程序和 FAT32 磁盘镜像
+    make run                  # 在 QEMU 中启动
+    make imageiso             # 生成 GRUB 引导的可启动 ISO → build/lnxrm.iso
+
+注意 make 不生成磁盘镜像；make clean 之后需要重新执行上面第二行。
+ISO 也不含根文件系统，光盘启动仍要另挂 build/disk.img（见 docs/BUILD.md §8.2）。
+
+文档（4 篇）
+-------------
+
+* docs/BUILD.md          构建指南：工具链、构建链、运行方式、四种调试手段
+* docs/CODEBASE.md       代码导览 + 功能总览
+    * 第一部分 代码导览 —— 每个文件是什么、如何组织、建议阅读顺序
+    * 第二部分 功能总览 —— 能力清单，逐项给出代码/实测出处
+* docs/GAP_ANALYSIS.md   差距 · 评审 · 行动计划
+    * 第一部分 差距分析 —— 距离"真正的内核"还差什么（66 条编号缺陷）
+    * 第二部分 评审记录 —— 实测结论、与好内核的差距、安全审查正/负面清单
+    * 第三部分 行动计划 —— 55 个任务卡，按依赖关系排序
+
+你是谁？
+========
+
+* 想读懂代码       → CODEBASE.md 第一部分
+* 想知道能干什么   → CODEBASE.md 第二部分
+* 想构建和调试     → BUILD.md
+* 想参与开发       → GAP_ANALYSIS.md 第三部分（行动计划）
+* 评估健壮性或安全 → GAP_ANALYSIS.md 第一部分（66 条缺陷编目）与第二部分（评审与安全审查）
+
+给特定读者的说明
+================
+
+想读懂这个内核
+--------------
+
+代码库的组织方式是非显然的，建议按这个顺序：
+
+1. include/abi/lnxrm_syscalls.def —— 32 个编号（0–31，连续无空洞），这是内核对外的全部接口
+2. include/sys/sched.h —— struct task 和 struct intr_frame，最核心的头文件
+3. kernel/main.c —— 整个 bring-up 顺序，一目了然
+4. kernel/mm/vmm.c 文件头 —— 三槽 PML4 地址空间模型的说明
+
+docs/CODEBASE.md 第一部分第 17 节给出了完整的七遍阅读顺序，以及建议一开始
+不要读的文件（fat32_meta.c、framebuffer.c、setup.asm）。
+
+想构建和运行
+------------
+
+需要 gcc、binutils、nasm、rustc、python3，以及 mtools 和 dosfstools
+（后两个用来在宿主机构造 FAT32 镜像）。
+
+安装与工具链版本见 docs/BUILD.md 第 1 节。构建并行安全；设
+SOURCE_DATE_EPOCH 后可逐字节复现（唯一的默认变量是 uname
+里嵌的构建时间戳，见 docs/BUILD.md §14.3）。
+
+调试有四种手段，其中最有用的是 debugcon —— arch/entry64.S 在启动的
+七个阶段向端口 0xE9 打单字符标记，串口日志要等 console_init() 之后
+才有，而这条通道从第一条指令就可用。分诊表见 docs/BUILD.md 第 9.2 节。
+
+GDB 断在 start_kernel 的实测输出见 docs/BUILD.md 第 9.3 节：
+源码级符号完整，可直接 break start_kernel。
+
+想参与开发
+----------
+
+当前最缺的不是功能，是可验证性：全树零测试、零 CI、零可观测性。
+唯一的验证回路是"启动，看串口日志"。这意味着所有正确性都只能靠人工
+阅读保证，而已知的 66 条缺陷全部是读出来的，没有一条是跑出来的。
+
+因此第一个任务不是修缺陷，而是 docs/GAP_ANALYSIS.md 第三部分的 Step 0
+（半天）：加一个启动冒烟测试。之后每一步改动才有门控。
+
+在没有测试之前，建议只做 Step 0 到 Step 3。特别注意不要在没有测试的
+情况下改动并发路径或 MMU —— 这类缺陷无法定位。
+

@@ -35,9 +35,6 @@ static inline u32 inl(u16 port)
     return v;
 }
 
-static inline void io_wait(void)
-{ outb(0x80, 0); }
-
 #ifdef __cplusplus
 }
 #endif

@@ -8,14 +8,9 @@ extern "C" {
 
 /* Local APIC register offsets (MMIO, 16-byte aligned) */
 #define LAPIC_ID          0x020
-#define LAPIC_VER         0x030
 #define LAPIC_TPR         0x080
 #define LAPIC_EOI         0x0B0
-#define LAPIC_LDR         0x0D0
-#define LAPIC_DFR         0x0E0
 #define LAPIC_SPURIOUS    0x0F0
-#define LAPIC_ISR_BASE    0x100
-#define LAPIC_IRR_BASE    0x200
 #define LAPIC_ICR_LOW     0x300
 #define LAPIC_ICR_HIGH    0x310
 #define LAPIC_LVT_TIMER   0x320
@@ -31,18 +26,10 @@ extern "C" {
 /* MSR addresses */
 #define MSR_IA32_APIC_BASE 0x1B
 
-/* IPI delivery modes */
-#define IPI_INIT          0x00500 /* INIT, assert */
-#define IPI_SIPI          0x00600 /* SIPI */
-#define IPI_INIT_DEASSERT 0x00500 /* INIT, deassert */
-
 /* LVT timer modes */
 #define LVT_TIMER_PERIODIC 0x20000
-#define LVT_LINT0_EXTINT   0x00700 /* ExtINT */
-#define LVT_LINT1_NMI      0x00400 /* NMI */
 
 /* APIC ID */
-#define APIC_ID_BSP 0 /* BSP always ID 0 */
 #define MAX_CPUS    8
 
 void apic_init(void); /* init LAPIC on BSP */
@@ -59,7 +46,6 @@ void apic_send_sipi(u32 dest_apic_id, u32 vector);
 
 /* IOAPIC (minimal) */
 #define IOAPIC_BASE       0xFEC00000UL
-#define IOAPIC_ID         0x00
 #define IOAPIC_VER        0x01
 #define IOAPIC_REDIR_BASE 0x10
 

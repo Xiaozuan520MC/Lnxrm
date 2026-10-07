@@ -4,8 +4,16 @@
 #include <io.h>
 #include <sys/spinlock.h>
 
-/* Serialize all kprintf output across CPUs. */
+/* Serialize all console output (kprintf AND console_write) across CPUs.
+ * Exported via console_out_lock/unlock: console_write in vfs.c shares it,
+ * and both sides are irqsave because interrupt handlers print too (a
+ * guard taken with interrupts on deadlocks when the same CPU re-enters
+ * kprintf from an IRQ). IRQs are re-enabled only between console_write
+ * chunks so the irq-off window stays bounded. */
 static spinlock_t print_lock = SPINLOCK_INIT;
+
+void console_out_lock(u64 *flags) { spin_lock_irqsave(&print_lock, flags); }
+void console_out_unlock(u64 flags) { spin_unlock_irqrestore(&print_lock, flags); }
 
 /* VGA text console at the high alias; COM1 via the Rust UART driver. */
 extern void lnxrm_uart_init(void);
@@ -225,7 +233,8 @@ static void emit(char **buf, size_t *left, char c)
     }
 }
 
-static void putnum(char **b, size_t *l, u64 v, unsigned base, bool sgn, int width, char pad)
+static void putnum(char **b, size_t *l, u64 v, unsigned base, bool sgn, int width, char pad,
+                   bool upper)
 {
     char tmp[32];
     int i = 0;
@@ -235,7 +244,9 @@ static void putnum(char **b, size_t *l, u64 v, unsigned base, bool sgn, int widt
         v = -(i64)v;
     }
     do {
-        tmp[i++] = digits[v % base];
+        char c = digits[v % base];
+        if (upper && c >= 'a') c -= 'a' - 'A';
+        tmp[i++] = c;
         v /= base;
     } while (v);
     if (neg) tmp[i++] = '-';
@@ -283,22 +294,27 @@ size_t vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap)
         switch (*fmt) {
         case 'd':
             putnum(&p, &left, lng ? __builtin_va_arg(ap, long) : __builtin_va_arg(ap, int), 10,
-                   true, width, pad);
+                   true, width, pad, false);
             break;
         case 'u':
             putnum(&p, &left,
                    lng ? __builtin_va_arg(ap, unsigned long) : __builtin_va_arg(ap, unsigned), 10,
-                   false, width, pad);
+                   false, width, pad, false);
             break;
         case 'x':
             putnum(&p, &left,
                    lng ? __builtin_va_arg(ap, unsigned long) : __builtin_va_arg(ap, unsigned), 16,
-                   false, width, pad);
+                   false, width, pad, false);
+            break;
+        case 'X':
+            putnum(&p, &left,
+                   lng ? __builtin_va_arg(ap, unsigned long) : __builtin_va_arg(ap, unsigned), 16,
+                   false, width, pad, true);
             break;
         case 'p':
             emit(&p, &left, '0');
             emit(&p, &left, 'x');
-            putnum(&p, &left, __builtin_va_arg(ap, uptr), 16, false, 16, '0');
+            putnum(&p, &left, __builtin_va_arg(ap, uptr), 16, false, 16, '0', false);
             break;
         case 's': {
             const char *s = __builtin_va_arg(ap, const char *);
@@ -329,10 +345,11 @@ size_t vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap)
 void kvprintf(const char *fmt, __builtin_va_list ap)
 {
     static char kbuf[1024];
-    spin_lock(&print_lock);
+    u64 flags;
+    console_out_lock(&flags);
     vsnprintf(kbuf, sizeof(kbuf), fmt, ap);
     for (char *s = kbuf; *s; s++) console_putc(*s);
-    spin_unlock(&print_lock);
+    console_out_unlock(flags);
 }
 
 void kprintf(const char *fmt, ...)

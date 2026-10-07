@@ -1,19 +1,16 @@
 /* SMP management interface (C++ header).
- * Provides the SMP Manager class and IPI vector definitions. */
+ * Provides the SMP Manager class. IPI vectors and the C entry points
+ * (smp_init/ap_main) live in sys/smp.h, which includes this header. */
 #pragma once
 #ifdef __cplusplus
 
 #include <types.h>
 
-/* IPI vectors (above 48 to avoid IRQ range 32..47) */
-#define IPI_VECTOR_RESCHEDULE 0xF0
-#define IPI_VECTOR_STOP       0xF2
-
-/* Maximum SIPI attempts before giving up on an AP */
-#define AP_SIPI_MAX_RETRIES 3
-
 /* AP startup timeout in milliseconds */
-#define AP_STARTUP_TIMEOUT_MS 1000
+/* How long to wait for an AP to signal ready. QEMU APs respond within
+ * ~20 ms; a dead APIC ID probe burns this full budget twice (2-fail
+ * scan rule), so keep it tight — 100 ms is still 5x the observed time. */
+#define AP_STARTUP_TIMEOUT_MS 100
 
 namespace smp
 {
@@ -27,13 +24,4 @@ class Manager
 
 } // namespace smp
 
-/* C linkage for assembly and C callers */
-extern "C" {
-#endif
-
-void smp_init(void);
-void ap_main(unsigned int ap_id);
-
-#ifdef __cplusplus
-}
 #endif

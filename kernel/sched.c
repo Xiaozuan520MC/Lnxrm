@@ -46,24 +46,64 @@ static struct task *pick_next(void)
     return head;
 }
 
-/* Choose the CPU that should receive `t`: prefer a currently-idle AP so
- * newly-woken work spreads out; otherwise stay on this CPU.
- * Must be called with runq_lock held (reads of c->idle/_current are
- * only advisory — a stale "idle" still ends up safe once IPI preemption
- * is wired, and a stale "busy" just means we keep the task local). */
+/* Queue depth of one CPU's run queue (call with runq_lock held). */
+static u32 runq_len(struct cpu_info *c)
+{
+    u32 n = 0;
+    for (struct task *t = c->runq_head.rq_next; t != &c->runq_head; t = t->rq_next)
+        n++;
+    return n;
+}
+
+/* Choose the CPU that should receive `t`:
+ *   1. This CPU if it is idle — the caller is awake here already, so the
+ *      task runs with zero IPI/HLT-wakeup cost.
+ *   2. Else any idle AP — spreads work off the BSP and keeps the BSP's
+ *      queue empty for device IRQs (IOAPIC routes every IRQ to it).
+ *   3. Else all CPUs are busy: the shortest queue, so a CPU that keeps
+ *      forking cannot pile everything on itself while another drains.
+ * Reads of c->idle/_current are advisory (taken under runq_lock but
+ * written without it): a stale "idle" just costs one pointless IPI, and
+ * a stale "busy" falls through to the next candidate. */
 static struct cpu_info *preferred_cpu(void)
 {
     struct cpu_info *self = this_cpu_data();
+
+    if (self->started && self->idle && self->_current == self->idle) return self;
+
+    for (u32 i = 1; i < MAX_CPUS; i++) {
+        struct cpu_info *c = &cpu_table[i];
+        if (c != self && c->started && c->idle && c->_current == c->idle) return c;
+    }
+
+    struct cpu_info *best = self;
+    u32 best_len = runq_len(self);
     for (u32 i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *c = &cpu_table[i];
-        /* c->idle non-NULL guards against _current==idle==NULL before
-         * the AP finishes bringing its idle task up. */
-        if (c->started && c->idle && c->_current == c->idle) return c;
+        if (c == self || !c->started) continue;
+        u32 n = runq_len(c);
+        if (n < best_len) {
+            best = c;
+            best_len = n;
+        }
     }
-    return self;
+    return best;
 }
 
-/* Add task to a run queue (self or an idle AP). */
+/* Enqueue `t` at the HEAD of `cpu`'s queue. Caller holds runq_lock. */
+static void enqueue_on(struct cpu_info *cpu, struct task *t)
+{
+    t->rq_cpu = (int)cpu->id;
+    t->rq_next = cpu->runq_head.rq_next;
+    cpu->runq_head.rq_next = t;
+}
+
+/* Add task to a run queue using the placement policy (self / idle CPU /
+ * shortest queue). ONLY for tasks that are not executing anywhere
+ * (sleepers being woken, fresh work): a running task's context is only
+ * saved by its own swtch(), so parking it on a remote queue lets that
+ * CPU schedule() it before this CPU has switched away — double run.
+ * The outgoing current is requeued with runqueue_add_local() instead. */
 void runqueue_add(struct task *t)
 {
     u64 flags;
@@ -74,15 +114,33 @@ void runqueue_add(struct task *t)
         return;
     }
     struct cpu_info *cpu = preferred_cpu();
-    t->rq_cpu = (int)cpu->id;
-    t->rq_next = cpu->runq_head.rq_next;
-    cpu->runq_head.rq_next = t;
+    enqueue_on(cpu, t);
     spin_unlock_irqrestore(&runq_lock, flags);
 
-    /* Wake a remote idle out of HLT; reschedule_ipi_handler sets
-     * need_resched so the interrupted context preempts on return. */
-    if (cpu != this_cpu_data() && cpu->started)
+    if (cpu == this_cpu_data()) {
+        /* Local enqueue: flag it so a returning-to-user (or idle) context
+         * reschedules immediately instead of waiting up to a full tick. */
+        this_cpu_data()->need_resched = true;
+    } else if (cpu->started) {
+        /* Wake a remote idle out of HLT; reschedule_ipi_handler sets
+         * need_resched so the interrupted context preempts on return. */
         apic_send_ipi(cpu->apic_id, IPI_VECTOR_RESCHEDULE, 0, 1);
+    }
+}
+
+/* Requeue the outgoing current on THIS CPU's queue. Staying local is
+ * both safe (we finish switch_to before anyone else can pick it up)
+ * and cheap (no IPI); cross-CPU balancing happens on wakeups instead. */
+void runqueue_add_local(struct task *t)
+{
+    u64 flags;
+    spin_lock_irqsave(&runq_lock, &flags);
+    if (t->rq_cpu != -1) {
+        spin_unlock_irqrestore(&runq_lock, flags);
+        return;
+    }
+    enqueue_on(this_cpu_data(), t);
+    spin_unlock_irqrestore(&runq_lock, flags);
 }
 
 /* Remove task from whichever run queue owns it (task->rq_cpu).
@@ -105,7 +163,6 @@ void runqueue_remove(struct task *t)
 }
 
 extern void swtch(u64 *old_slot, u64 *new_slot);
-extern void tf_exit(struct intr_frame *f);
 void tss_set_rsp0(u64 rsp);
 
 void sched_init(void)
@@ -137,6 +194,10 @@ void sched_init(void)
      * vmm_switch_to(next->pml4) whenever prev->pml4 differs, and a
      * zero CR3 would triple-fault the moment we park on idle. */
     idle->pml4 = master_pml4_phys();
+    /* T-030: idle guards kernel integrity -- highest tier, and it never
+     * makes a syscall (syscall_entry BUG_ONs on kxld). */
+    idle->cred.kind = CRED_KXLD;
+    idle->cred.uid = CRED_UID_PRIV;
 
     /* BSP current = idle; expose it to preferred_cpu()/AP bring-up. */
     bsp->idle = idle;
@@ -144,6 +205,8 @@ void sched_init(void)
 
     /* set GS base for BSP */
     cpu_set_gs_base((u64)bsp);
+
+    kprintf("[sched] task table %d slots, BSP idle ready\n", NR_TASKS);
 }
 
 /* Create a fresh idle task for the given CPU. Never enqueued. */
@@ -183,6 +246,9 @@ struct task *sched_create_idle(int cpu_id)
     /* Same justification as BSP idle: switch_to may load this as CR3. */
     t->pml4 = master_pml4_phys();
     t->ctx.sp = 0; /* filled by first swtch() away from this idle */
+    /* T-030: every per-CPU idle is kxld, the kernel-protecting tier. */
+    t->cred.kind = CRED_KXLD;
+    t->cred.uid = CRED_UID_PRIV;
     return t;
 }
 
@@ -266,10 +332,13 @@ void schedule(void)
 
     /* Requeue current only if it is a non-idle task that can still run.
      * Idle is never enqueued; SLEEPING/STOPPED/ZOMBIE stay off-queue so
-     * a later wake (send_signal / sched_tick) can runqueue_add them. */
+     * a later wake (send_signal / sched_tick) can runqueue_add them.
+     * Local requeue is mandatory here: current's context only becomes
+     * valid for another CPU after this function's switch_to — parking it
+     * on a remote queue would let that CPU pick it too early (double run). */
     if (current->state == T_RUNNING && current->pid != 0) {
         current->state = T_RUNNABLE;
-        runqueue_add(current);
+        runqueue_add_local(current);
     }
     runqueue_remove(next); /* idle is rq_cpu==-1 → no-op */
     switch_to(next);
@@ -303,15 +372,48 @@ static void switch_to(struct task *next)
     swtch((u64 *)&prev->ctx, &next->ctx.sp);
 }
 
-int sys_nanosleep(u64 ms)
+long sys_nanosleep(u64 ns, struct lnxrm_timespec *urem)
 {
-    u64 until = jiffies + ms * HZ / 1000 + 1;
+    u64 ms = ns / 1000000;
+    if (!ms) ms = 1; /* the tick is the finest granularity we have */
+    u64 start = jiffies;
+    u64 until = start + ms * HZ / 1000 + 1;
+    bool interrupted = false;
+
     while ((i64)(jiffies - until) < 0) {
+        /* Abort only for a signal that would actually do something: a
+         * pending-but-ignored SIGCHLD must not cut the sleep short. */
+        u64 ready = current->signal_pending & ~current->sig_blocked;
+        interrupted = false;
+        for (int s = 1; ready && s < _NSIG; s++) {
+            if ((ready & (1ULL << s)) && !signal_ignored(current, s)) {
+                interrupted = true;
+                break;
+            }
+        }
+        if (interrupted) break;
+
         current->sleep_until = until;
         current->state = T_SLEEPING;
         runqueue_remove(current);
         schedule();
     }
+
+    if (urem) {
+        /* Report what is left of the caller's own request, not of the
+         * tick-rounded deadline, so the value is in the same units the
+         * caller passed in. */
+        i64 elapsed_ns = (i64)(jiffies - start) * (1000000000LL / HZ);
+        i64 left_ns = (i64)ns - elapsed_ns;
+        struct lnxrm_timespec rem;
+
+        if (left_ns < 0) left_ns = 0;
+        rem.tv_sec = left_ns / 1000000000LL;
+        rem.tv_nsec = left_ns % 1000000000LL;
+        if (copy_to_user(urem, &rem, sizeof(rem)) < 0) return LNXRM_EFAULT;
+    }
+
+    if (interrupted) return LNXRM_EINTR;
     return 0;
 }
 
@@ -326,9 +428,33 @@ struct task *task_alloc_slot(void)
             /* Claim immediately so a concurrent alloc cannot hand out
              * the same slot. Caller may overwrite state to T_EMBRYO. */
             task_table[i].state = T_EMBRYO;
+            task_table[i].pid = 0; /* drop the old pid NOW: until the
+              * caller assigns a fresh one, find_task(old_pid) must not
+              * match this half-built task. Every caller assigns its own
+              * pid right after alloc (fork/spawn/idle). */
             task_table[i].rq_cpu = -1;
             task_table[i].rq_next = NULL;
             task_table[i].cpu_id = -1;
+            /* Slots are reused without being cleared, so a recycled task
+             * must not inherit the previous occupant's signal state. */
+            task_table[i].signal_pending = 0;
+            task_table[i].sig_blocked = 0;
+            task_table[i].sig_saved_blocked = 0;
+            task_table[i].sig_in_handler = false;
+            memset(task_table[i].sig_handlers, 0, sizeof(task_table[i].sig_handlers));
+            memset(task_table[i].sig_masks, 0, sizeof(task_table[i].sig_masks));
+            memset(&task_table[i].saved_tf, 0, sizeof(task_table[i].saved_tf));
+            task_table[i].sig_fault_rip = 0;
+            /* T-030: recycled slots start unprivileged.  Callers that
+             * know better overwrite this at once (fork inherits, spawn
+             * is root, idle is kxld) -- but a slot must never hand a
+             * fresh task the previous occupant's tier. */
+            task_table[i].cred.kind = CRED_USER;
+            task_table[i].cred.uid = CRED_UID_USER;
+            /* T-032: same rule for the memory account -- a slot must
+             * never report the 64 MiB the previous occupant died holding. */
+            task_table[i].mem_pages = 0;
+            task_table[i].mem_peak = 0;
             t = &task_table[i];
             break;
         }
@@ -352,35 +478,32 @@ void task_free_slot(struct task *t)
     t->cpu_id = -1;
     t->rq_cpu = -1;
     t->rq_next = NULL;
+    /* T-032: hand the account back with the frames.  The caller (reap)
+     * destroyed the address space a line ago, so anything left in these
+     * two numbers is a claim on memory nobody owns. */
+    t->mem_pages = 0;
+    t->mem_peak = 0;
     spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
 struct task *find_task(u32 pid)
 {
-    for (int i = 0; i < NR_TASKS; i++)
-        if (task_table[i].state != T_UNUSED && task_table[i].pid == pid) return &task_table[i];
-    return NULL;
-}
-
-const char *task_state_name(enum task_state s)
-{
-    switch (s) {
-    case T_UNUSED:
-        return "UNUSED";
-    case T_EMBRYO:
-        return "EMBRYO";
-    case T_RUNNABLE:
-        return "RUNNABLE";
-    case T_RUNNING:
-        return "RUNNING";
-    case T_SLEEPING:
-        return "SLEEPING";
-    case T_ZOMBIE:
-        return "ZOMBIE";
-    case T_STOPPED:
-        return "STOPPED";
+    u64 flags;
+    struct task *t = NULL;
+    /* Scan under the table lock: without it a concurrent
+     * task_free_slot/task_alloc_slot can swap the slot mid-read (we
+     * would observe pid from one occupant and state from the next).
+     * The returned pointer is still racy afterwards — callers go
+     * through send_signal's state recheck (kernel/signal.c). */
+    spin_lock_irqsave(&task_table_lock, &flags);
+    for (int i = 0; i < NR_TASKS; i++) {
+        if (task_table[i].state != T_UNUSED && task_table[i].pid == pid) {
+            t = &task_table[i];
+            break;
+        }
     }
-    return "?";
+    spin_unlock_irqrestore(&task_table_lock, flags);
+    return t;
 }
 
 struct task *task_iter(int *i)

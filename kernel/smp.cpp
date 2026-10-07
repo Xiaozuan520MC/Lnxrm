@@ -34,13 +34,7 @@ void trampoline_clear(void);
 }
 
 /* ---- Helpers ---- */
-
-static void mdelay(u32 ms)
-{
-    u64 start = rdtsc();
-    u64 ticks = (u64)ms * 2000000ULL; /* rough: ~2 GHz TSC */
-    while (rdtsc() - start < ticks);
-}
+/* mdelay() lives in arch/cpu.c (TSC-calibrated — see lapic_timer_calibrate). */
 
 /* Build the AP GDT at physical 0x8800 (for trampoline transition only). */
 static void setup_ap_gdt(void)
@@ -197,23 +191,49 @@ extern "C" void ap_main(u32 ap_id)
 
     u64 cr0, cr4;
     __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
-    cr0 &= ~((1UL << 2) | (1UL << 3)); /* EM=0, TS=0 (TS must be clear or
-                                        * any SSE/x87 insn #XM's) */
-    cr0 |= (1UL << 1) | (1UL << 5);    /* MP=1 NE=1 */
+    cr0 &= ~(CR0_EM | CR0_TS); /* EM=0, TS=0 (TS must be clear or
+                                * any SSE/x87 insn #XM's) */
+    cr0 |= CR0_MP | CR0_NE;    /* MP=1 NE=1 */
     __asm__ volatile("mov %0,%%cr0" ::"r"(cr0));
     __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
-    cr4 |= (1UL << 9) | (1UL << 10); /* OSFXSR OSXMMEXCPT */
+    cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
     __asm__ volatile("mov %0,%%cr4" ::"r"(cr4));
+
+    /* CR0.WP (trampoline.S already set it with paging; make it explicit)
+     * + CPUID-gated CR4.SMEP.  Must happen BEFORE started=true: an AP may
+     * only ever schedule user tasks once it refuses to execute them at
+     * CPL=0 and honors read-only mappings for its own stores. */
+    cpu_protect_init();
+
+    /* Receipt for the AP half of the mitigation: without this line only the
+     * BSP's cpu_init() prints its CR0/CR4, and a silently-skipped
+     * cpu_protect_init() on the AP path would be invisible in the boot log
+     * (SMEP is a set-and-enforce bit: user space can never observe it).
+     * kprintf is print_lock-guarded, so the two APs cannot interleave. */
+    {
+        u64 c0, c4;
+        __asm__ volatile("mov %%cr0,%0" : "=r"(c0));
+        __asm__ volatile("mov %%cr4,%0" : "=r"(c4));
+        kprintf("[cpu] AP%u CR0.WP=%d CR4.SMEP=%d CR4.SMAP=%d (SMEP/SMAP cpuid=%d/%d)\n",
+                ap_id, (int)((c0 & CR0_WP) != 0), (int)((c4 & CR4_SMEP) != 0),
+                (int)((c4 & CR4_SMAP) != 0), (int)cpu_has_smep(),
+                (int)cpu_has_smap());
+    }
 
     c->runq_head.pid = 0;
     c->runq_head.state = T_UNUSED;
     c->runq_head.rq_next = &c->runq_head;
     c->runq_head.rq_cpu = -1;
     c->need_resched = false;
-    spin_init(&c->task_lock);
 
     apic_enable();
     apic_write(LAPIC_TPR, 0);
+
+    /* Local periodic tick: without it an AP would never quantum-preempt
+     * its current task and every preempt decision would depend on the
+     * BSP (GAP_ANALYSIS 4.6). Uses the period calibrated by the BSP in
+     * main.c — no PIT access here. jiffies stays BSP-owned (cpu.c). */
+    lapic_timer_start(32, HZ);
 
     outb(0x21, 0xFF);
     outb(0xA1, 0xFF);

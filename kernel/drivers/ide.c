@@ -7,7 +7,6 @@
 #include <sys/spinlock.h>
 
 #define IDE_DATA     0x1F0
-#define IDE_ERROR    0x1F1
 #define IDE_SECCOUNT 0x1F2
 #define IDE_LBA_LO   0x1F3
 #define IDE_LBA_MID  0x1F4
@@ -46,6 +45,11 @@ static int ide_wait_drq(void)
 
 static int ide_read_sector(u64 lba, void *buf)
 {
+    /* LBA28 tops out at 128 GiB (2^28 sectors).  Without this line the
+     * (lba >> 24) & 0x0F below drops the top bits and answers from a
+     * *different* sector instead of failing: wrong data, no error, nothing
+     * in the log to trace it by (C53). */
+    if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
     if (ide_wait_ready(IDE_SR_DRDY, 100000)) return LNXRM_EFAIL;
 
     outb(IDE_SECCOUNT, 1);
@@ -64,6 +68,8 @@ static int ide_read_sector(u64 lba, void *buf)
 
 static int ide_write_sector(u64 lba, const void *buf)
 {
+    /* Same ceiling as the read path: see ide_read_sector(). */
+    if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
     if (ide_wait_ready(IDE_SR_DRDY, 100000)) return LNXRM_EFAIL;
 
     outb(IDE_SECCOUNT, 1);
@@ -128,11 +134,17 @@ void ide_init(void)
 {
     /* probe: send IDENTIFY to primary channel */
     outb(IDE_DRIVE, 0xA0);
-    outb(IDE_CMD, IDE_CMD_IDENTIFY);
+    /* ATA-2 §9.3: allow 400 ns after drive select before the command register
+     * is written.  Four status reads are a conservative stand-in for that
+     * delay.  QEMU answers instantly, so skipping this only ever hurt real
+     * hardware (C54). */
+    for (int i = 0; i < 4; i++) (void)inb(IDE_STATUS);
 
     u8 s = inb(IDE_STATUS);
-    if (s == 0) {
-        kprintf("[ide] no device on primary channel\n");
+    /* A port nothing answers on reads back 0xFF (open bus), not 0x00: the old
+     * `s == 0` test only caught a controller that stayed silent. */
+    if (s == 0x00 || s == 0xFF) {
+        kprintf("[ide] no device on primary channel (status=%02x)\n", s);
         return;
     }
 
@@ -141,19 +153,37 @@ void ide_init(void)
         return;
     }
 
+    outb(IDE_CMD, IDE_CMD_IDENTIFY);
+
+    /* Wait for DRQ *and* fail on ERR.  ide_wait_drq() is the only place in
+     * this file that looks at IDE_SR_ERR, and the IDENTIFY path never called
+     * it: an aborted command (ATAPI device, port with nothing on it) left the
+     * 256-word read running against an idle data port, which answers 0xFFFF.
+     * ident[60..61] then read as FFFFFFFFh, blk_register() published it, and
+     * the console showed 2097151 -- that is where the number came from (C54). */
+    if (ide_wait_drq()) {
+        kprintf("[ide] IDENTIFY rejected (status=%02x)\n", inb(IDE_STATUS));
+        return;
+    }
+
     u16 ident[256];
     for (int i = 0; i < 256; i++) ident[i] = inw(IDE_DATA);
 
-    /* total addressable sectors (LBA28); memcpy avoids type punning */
-    u32 lba28;
-    memcpy(&lba28, &ident[60], sizeof(lba28));
-    u64 sectors = lba28;
+    /* capacity: words 60-61, with the 48-bit words 100-103 taking precedence */
+    u64 sectors = ata_total_sectors(ident);
     char model[41];
     for (int i = 0; i < 20; i++) {
         model[i * 2] = (char)(ident[27 + i] >> 8);
         model[i * 2 + 1] = (char)(ident[27 + i] & 0xFF);
     }
     model[40] = 0;
+
+    if (!sectors) {
+        /* Registering a device whose size we could not read would hand every
+         * downstream bounds check a lie, so decline instead. */
+        kprintf("[ide] hda: %.40s, capacity unknown -- not registered\n", model);
+        return;
+    }
 
     ide_bd.read = ide_blk_read;
     ide_bd.write = ide_blk_write;

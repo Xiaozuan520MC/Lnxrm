@@ -12,11 +12,11 @@
 #include <mm/mm.h>
 #include <boot.h>
 #include <console.h>
+#include <framebuffer.h>
+#include <sys/cpu.h>
 
 #define PD_HI  0x54000UL /* keep in sync with entry64.S */
-#define PT_FIX 0x57000UL
 
-#define ALIAS_BASE 0xffffffff80000000UL /* KERNEL_VMA - KERNEL_LMA */
 #define USER_SLOT  255
 
 static u64 pml4_phys = 0x50000UL;
@@ -47,13 +47,13 @@ static u64 ensure_table(u64 *parent, u64 idx, u64 extra_flags)
 {
     if (parent[idx] & PG_P) return parent[idx] & ~0xfffUL;
     u64 t = pmm_alloc();
-    if (!t) panic("vmm: out of frames");
+    if (!t) return 0; /* T-004: out of frames is the caller's problem, not fatal */
     memset(ptable_ptr(t), 0, PAGE_SIZE);
     parent[idx] = t | PG_P | PG_W | extra_flags;
     return t;
 }
 
-int vmm_map_user(u64 root, u64 va, u64 pa, bool writable, bool user)
+int vmm_map_user(u64 root, u64 va, u64 pa, bool writable, bool user, bool exec)
 {
     if (va < USER_BASE || va >= USER_MAX_VMA || (va & 0xfff)) return LNXRM_EFAIL;
     u64 i4 = (va >> 39) & 511, i3 = (va >> 30) & 511;
@@ -62,13 +62,25 @@ int vmm_map_user(u64 root, u64 va, u64 pa, bool writable, bool user)
 
     u64 *pml4 = ptable_ptr(root);
     u64 pdpt_pa = ensure_table(pml4, i4, PG_U);
+    if (!pdpt_pa) return LNXRM_ENOMEM;
     u64 *pdpt = ptable_ptr(pdpt_pa);
     u64 pd_pa = ensure_table(pdpt, i3, PG_U);
+    if (!pd_pa) return LNXRM_ENOMEM;
     u64 *pd = ptable_ptr(pd_pa);
     u64 pt_pa = ensure_table(pd, i2, PG_U);
+    if (!pt_pa) return LNXRM_ENOMEM;
     u64 *pt = ptable_ptr(pt_pa);
 
-    pt[i1] = pa | PG_P | (writable ? PG_W : 0) | uf;
+    if (pt[i1] & PG_P) {
+        /* Already mapped: two ELF segments may share a page (text in front
+         * of rodata of the next one).  Widen -- and only widen -- the
+         * existing PTE instead of overwriting it; `pa` is ignored here. */
+        if (writable) pt[i1] |= PG_W;
+        if (exec) pt[i1] &= ~PG_NX;
+    } else {
+        if (!pa) return LNXRM_EFAIL;
+        pt[i1] = pa | PG_P | (writable ? PG_W : 0) | uf | (exec ? 0 : PG_NX);
+    }
     __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
     return 0;
 }
@@ -94,14 +106,30 @@ static int walk(u64 root, u64 va, u64 **pte_out, u64 *big_buf)
 
 u64 vmm_translate_in(u64 root, u64 va)
 {
-    if (va >= ALIAS_BASE && va < ALIAS_BASE + 0x100000000UL) return va - ALIAS_BASE;
+    /* No "inside the high window, so phys = va - ALIAS_BASE" shortcut: that
+     * window is not a 1:1 image of physical memory.  KHEAP_VMA maps the heap
+     * (phys heap_phys, not 512 MiB), VGA_VMA/DEV_VMA/FB_VMA map page tables
+     * of their own, and the old `ALIAS_BASE + 0x100000000UL` bound had
+     * wrapped u64 down to 0x80000000, so the shortcut never fired and every
+     * caller had always been served by the real walk below.  Walking the PTE
+     * is correct for every window and answers 0 for unmapped addresses. */
     u64 *pte;
     u64 big_buf;
     int r = walk(root, va, &pte, &big_buf);
     if (r < 0 || !(*pte & PG_P)) return 0;
-    if (r == 1) /* 2 MiB leaf */
-        return (*pte & ~0x1fffffUL) | (va & 0x1fffff);
-    return (*pte & ~0xfffUL) | (va & 0xfff);
+    /* strip the flag bits (PG_NX lives in bit 63, far above the frame) */
+    if (r == 1) /* 2 MiB large page */
+        return (*pte & PTE_PA_MASK) | (va & 0x1fffff);
+    return (*pte & PTE_PA_MASK) | (va & 0xfff);
+}
+
+bool vmm_writable_in(u64 root, u64 va)
+{
+    u64 *pte;
+    u64 big_buf;
+    int r = walk(root, va, &pte, &big_buf);
+    if (r < 0) return false;
+    return (*pte & (PG_P | PG_W)) == (PG_P | PG_W);
 }
 
 u64 vmm_unmap_user(u64 root, u64 va)
@@ -116,10 +144,10 @@ u64 vmm_unmap_user(u64 root, u64 va)
         u64 i4 = (va >> 39) & 511, i3 = (va >> 30) & 511;
         u64 i2 = (va >> 21) & 511;
         u64 *pd = ptable_ptr(ptable_ptr(ptable_ptr(root)[i4] & ~0xfff)[i3] & ~0xfff);
-        pa = pd[i2] & ~0x1fffffUL;
+        pa = pd[i2] & PTE_PA_MASK;
         pd[i2] = 0;
     } else {
-        pa = *pte & ~0xfffUL;
+        pa = *pte & PTE_PA_MASK;
         *pte = 0;
     }
     __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
@@ -135,7 +163,7 @@ void vmm_switch_to(u64 root)
 u64 vmm_new_user_aspace(void)
 {
     u64 root = pmm_alloc();
-    if (!root) panic("vmm: no frame for aspace");
+    if (!root) return 0; /* T-004: fork/exec must fail, not stop the machine */
     memset(ptable_ptr(root), 0, PAGE_SIZE);
     for (int i = 0; i < 512; i++)
         if (i != USER_SLOT) ptable_ptr(root)[i] = ptable_ptr(pml4_phys)[i];
@@ -154,12 +182,12 @@ void vmm_destroy_user_aspace(u64 root)
             for (int i2 = 0; i2 < 512; i2++) {
                 if (!(pd[i2] & PG_P)) continue;
                 if (pd[i2] & PG_PS) {
-                    pmm_free_order(pd[i2] & ~0x1fffff, 9);
+                    pmm_free_order(pd[i2] & PTE_PA_MASK, 9);
                     continue;
                 }
                 u64 *pt = ptable_ptr(pd[i2] & ~0xfff);
                 for (int i1 = 0; i1 < 512; i1++)
-                    if (pt[i1] & PG_P) pmm_free(pt[i1] & ~0xfff);
+                    if (pt[i1] & PG_P) pmm_free(pt[i1] & PTE_PA_MASK);
                 pmm_free(pd[i2] & ~0xfff);
             }
             pmm_free(pdpt[i3] & ~0xfff);
@@ -192,10 +220,29 @@ void vmm_init(void)
         fb_hi = fb_lo + (u64)bootinfo.fb.pitch * bootinfo.fb.height;
     }
 
-    for (u64 pa = lo; pa < hi && pa < 0xC0000000UL; pa += 0x200000UL) {
+    /* ... and the PD slots the framebuffer window occupies must stay free so
+     * fb_init() can install its own page tables there (a 1080p LFB spans
+     * several 2 MiB slots).  start_kernel() keeps their physical pages out
+     * of the buddy: they have no alias left. */
+    u64 fb_slots = 0;
+    if (fb_hi > fb_lo) {
+        fb_slots = ((fb_hi - fb_lo) + 0x1FFFFFUL) >> 21;
+        if (fb_slots > FB_PD_SLOTS) fb_slots = FB_PD_SLOTS;
+    }
+
+    /* PMM_WINDOW_TOP, not 3 GiB: past 1 GiB (pa >> 21) & 511 wraps back to
+     * slot 0 and this loop would point the kernel's own alias at foreign
+     * physical memory -- load_cr3() below would then fetch from it. */
+    for (u64 pa = lo; pa < hi && pa < PMM_WINDOW_TOP; pa += 0x200000UL) {
         u64 idx = (pa >> 21) & 511;
-        if (idx == 96 || idx == 97 || idx == 104 || idx == 112 || idx == 128)
-            continue; /* VGA / FB / fixmap / device windows */
+        /* Only slots with a window installed by entry64.S (VGA=96,
+         * devices=128) must not double as frame aliases.  Slots 97 and
+         * 112 used to belong to the fixmap window -- that concept is gone
+         * (FIXMAP_VA removed, zero users), so every managed frame gets
+         * its alias again, as this loop's contract demands. */
+        if (idx == 96 || idx == 128)
+            continue; /* VGA / device MMIO windows */
+        if (idx >= FB_PD_BASE && idx < FB_PD_BASE + fb_slots) continue; /* LFB window */
         if (fb_hi && pa < fb_hi && pa + 0x200000UL > fb_lo)
             continue; /* LFB page range */
         pdhi[idx] = pa | PG_P | PG_W | PG_PS;
@@ -205,9 +252,19 @@ void vmm_init(void)
     for (int i = 0; i < 16; i++) pdhi[256 + i] = (heap_phys + i * 0x200000UL) | PG_P | PG_W | PG_PS;
 
     load_cr3(pml4_phys);
+    kprintf("[vmm] CR3=0x%lx, RAM aliased up to 0x%lx\n", pml4_phys, hi);
+
+    /* EFER.NXE is what gives PG_NX (PTE bit 63) its meaning.  The early asm
+     * paths set it on the BSP and on every AP, but if one were missed the
+     * whole user-page NX policy would silently stop working (a PTE with XD
+     * set is simply executable then), so make sure it is on here. */
+    u64 efer = rdmsr(MSR_IA32_EFER);
+    if (!(efer & EFER_NXE)) wrmsr(MSR_IA32_EFER, efer | EFER_NXE);
+    kprintf("[vmm] EFER.NXE=%d, user pages NX\n",
+            (int)((rdmsr(MSR_IA32_EFER) & EFER_NXE) != 0));
 }
 
-/* Map a single physical page into the kernel's DEV_VMA window (slot 98).
+/* Map a single physical page into the kernel's DEV_VMA window (PD slot 128).
  * va must be in [DEV_VMA, DEV_VMA + 2 MiB).  flags: PG_PCD etc. */
 void vmm_map_kernel_page(u64 va, u64 pa, u64 flags)
 {
@@ -245,12 +302,12 @@ static void dup_cleanup(u64 dst)
         for (int i2 = 0; i2 < 512; i2++) {
             if (!(dpd[i2] & PG_P)) continue;
             if (dpd[i2] & PG_PS) {
-                pmm_free_order(dpd[i2] & ~0x1fffff, 9);
+                pmm_free_order(dpd[i2] & PTE_PA_MASK, 9);
                 continue;
             }
             u64 *dpt = ptable_ptr(dpd[i2] & ~0xfff);
             for (int i1 = 0; i1 < 512; i1++)
-                if (dpt[i1] & PG_P) pmm_free(dpt[i1] & ~0xfff);
+                if (dpt[i1] & PG_P) pmm_free(dpt[i1] & PTE_PA_MASK);
             pmm_free(dpd[i2] & ~0xfff);
         }
         pmm_free(ddpt[i3] & ~0xfff);
@@ -293,11 +350,20 @@ int dup_user_aspace(u64 src, u64 dst)
                 if (!(spt[i1] & PG_P)) continue;
                 u64 va = slot | ((u64)i3 << 30) | ((u64)i2 << 21) | ((u64)i1 << 12);
                 /* defensive: only copy pages that truly resolve */
-                if (!vmm_translate_in(src, va)) continue;
+                u64 spa = vmm_translate_in(src, va);
+                if (!spa) continue;
                 u64 npa = pmm_alloc();
                 if (!npa) goto fail;
-                memcpy((void *)PHYS_TO_VIRT(npa), (void *)va, PAGE_SIZE);
-                dpt[i1] = npa | (spt[i1] & 0xFFFUL);
+                /* Read the source through the high-half alias of the frame
+                 * the SRC page table names -- never through `va`.  `va`
+                 * would resolve against the live CR3 (wrong address space
+                 * if it is not `src`) and, when it does resolve to a user
+                 * page, SMAP faults a ring-0 load with no STAC window.  The
+                 * alias is a kernel page: neither hazard applies. */
+                memcpy((void *)PHYS_TO_VIRT(npa), (void *)PHYS_TO_VIRT(spa), PAGE_SIZE);
+                /* copy the flags, PG_NX included: fork must not turn an
+                 * executable page into a data page (or vice versa) */
+                dpt[i1] = npa | (spt[i1] & (0xFFFUL | PG_NX));
             }
         }
     }
@@ -306,4 +372,37 @@ int dup_user_aspace(u64 src, u64 dst)
 fail:
     dup_cleanup(dst);
     return LNXRM_EFAIL;
+}
+
+/* T-032: count the user pages really mapped under `root`.
+ *
+ * This is the number the memory account is refreshed from (exec, fork,
+ * brk) and therefore the number ps prints.  Counting leaf entries instead
+ * of adding up what each mapping site claims means a page can never be
+ * forgotten: a shared image page mapped twice still counts once, because
+ * there is one leaf entry for one VA, and a mapping site that nobody
+ * remembered to instrument still shows up on the next refresh.
+ *
+ * User space hangs off one PML4 slot (USER_SLOT), and every leaf in it is
+ * a 4 KiB page -- vmm_map_user never builds a huge page -- so a present
+ * entry at PD level is a table to descend, not 512 pages to count. */
+u64 vmm_count_user_pages(u64 root)
+{
+    if (!root) return 0;
+    u64 *d4 = ptable_ptr(root);
+    if (!(d4[USER_SLOT] & PG_P)) return 0; /* no user space at all */
+    u64 *d3 = ptable_ptr(d4[USER_SLOT] & ~0xfffUL);
+    u64 n = 0;
+
+    for (int i3 = 0; i3 < 512; i3++) {
+        if (!(d3[i3] & PG_P)) continue;
+        u64 *d2 = ptable_ptr(d3[i3] & ~0xfffUL);
+        for (int i2 = 0; i2 < 512; i2++) {
+            if (!(d2[i2] & PG_P)) continue;
+            u64 *d1 = ptable_ptr(d2[i2] & ~0xfffUL);
+            for (int i1 = 0; i1 < 512; i1++)
+                if (d1[i1] & PG_P) n++;
+        }
+    }
+    return n;
 }

@@ -22,13 +22,22 @@ static u64 order_bit_size[MAX_ORDER]; /* actual bytes per order bitmap */
 /* safe zone: 0x10000 (64 KiB) -- above trampoline/GDT/E820, below EBDA */
 #define BITS_BASE 0x10000UL
 
+/* PMM_WINDOW_TOP (include/mm/mm.h) caps the managed window at the size of
+ * the identity map / high-half alias.  See the comment there: the old 4 GiB
+ * clamp sent the seeding loop straight into unmapped VA 0x40000000 on any
+ * real machine with >= ~1.1 GiB of RAM, and with no IDT yet installed that
+ * was a triple fault, not a panic. */
+
 static u64 base_addr, top_addr;      /* managed window */
 static u64 reserved_lo, reserved_hi; /* [lo,hi) excluded (kernel image etc.) */
 static u64 total_pg, free_pg;
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
-/* MMIO ranges (the LFB) that must never be handed out as frames */
-#define RESV_MAX 4
+/* MMIO ranges (the LFB) that must never be handed out as frames.
+ * 8, not 4: beyond the LFB and its PD window, start_kernel() has to reserve
+ * the two frame ranges whose high-half alias slots are consumed by a fixed
+ * window (VGA slot 96, devices slot 128, kheap slots 256..271). */
+#define RESV_MAX 8
 static struct {
     u64 lo, hi;
 } resv[RESV_MAX];
@@ -93,6 +102,8 @@ void pmm_init(void)
         if (lo >= hi || lo > 0x100000000UL) /* stay under 4 GiB for DMA ease */
             continue;
         hi = MIN(hi, 0x100000000UL);
+        hi = MIN(hi, PMM_WINDOW_TOP); /* ... and inside the mapped window */
+        if (lo >= hi) continue;       /* region lives entirely above 1 GiB */
         if (hi - lo > best_end - best) {
             best = lo;
             best_end = hi;
@@ -102,6 +113,15 @@ void pmm_init(void)
      * stack): __bss_end is a VMA symbol */
     extern u8 __bss_end[];
     u64 kern_end = ALIGN_UP(VIRT_TO_PHYS((uptr)__bss_end), PAGE_SIZE);
+
+    /* Not enough low RAM for the kernel image + the 16 MiB heap: say so and
+     * stop.  Falling through used to underflow kheap_place()'s subtraction,
+     * wrap top_addr to ~2^64, and then memset() the bitmap below with a
+     * wrapped-around length -- wiping the live page tables at 0x50000 and
+     * triple-faulting one line after the e820 dump. */
+    if (best_end < kern_end + (18UL << 20))
+        panic("pmm: no usable e820 RAM for kernel+heap (map_len=%d best_end=%#lx)", bootinfo.map_len,
+              best_end);
 
     /* carve the kernel heap out of the top before the buddy sees it */
     extern void kheap_place(u64 * region_top, u64 size);
@@ -148,10 +168,27 @@ void pmm_init(void)
             (top_addr - base_addr) >> 10);
 }
 
+/* T-004 fault injection, used only by the boot self-test: while armed, the
+ * next `n` frame allocations fail exactly as an empty buddy would, so every
+ * OOM branch (kmalloc's two, the page-table refill, the aspace root) can be
+ * driven to its error return on a machine that has plenty of memory.
+ * Exhausting RAM for real would take the whole boot down with it. */
+static int oom_inject;
+
+void pmm_inject_oom(int n)
+{
+    oom_inject = n;
+}
+
 u64 pmm_alloc_order(int order)
 {
     u64 flags;
     spin_lock_irqsave(&pmm_lock, &flags);
+
+    if (oom_inject > 0) { /* injected failure: behave like a dry buddy */
+        oom_inject--;
+        goto fail;
+    }
 
     int o = order;
     if (o >= MAX_ORDER) goto fail;
@@ -211,3 +248,6 @@ void pmm_free_order(u64 pa, int order)
     spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
+
+u64 pmm_free_bytes(void)
+{ return free_pg << MIN_ORDER_BITS; }

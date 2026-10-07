@@ -25,6 +25,19 @@ static void *match_ctx;
 
 static void probe_bus(u8 bus);
 
+/* PCI-to-PCI bridges are followed recursively (probe_fn below) with neither
+ * a visited set nor a depth limit.  A root port whose secondary bus number
+ * the firmware never assigned reads back 0, points straight at bus 0, and
+ * the walk restarts forever -- every level silently, this whole path prints
+ * nothing.  The boot stack is 16 KiB (arch/kernel.ld) with no guard page and
+ * no IST, so it runs down through cpu_gdt_tab and idt in .bss and into the
+ * kernel image itself; the next exception then lands on a trashed IDT and
+ * the machine resets.  QEMU/VMware's flat i440FX topology never exercises
+ * it, which is why it only shows up on real hardware. */
+static u8 bus_seen[256 / 8];
+#define PROBE_MAX_DEPTH 16
+static int probe_depth;
+
 static void probe_fn(u8 bus, u8 dev, u8 fn)
 {
     u32 id = pci_read(bus, dev, fn, 0x00);
@@ -50,12 +63,19 @@ static void probe_dev(u8 bus, u8 dev)
 
 static void probe_bus(u8 bus)
 {
+    if (bus_seen[bus >> 3] & (1u << (bus & 7))) return; /* already walked */
+    bus_seen[bus >> 3] |= 1u << (bus & 7);
+    if (probe_depth >= PROBE_MAX_DEPTH) return;
+    probe_depth++;
     for (u8 d = 0; d < 32; d++) probe_dev(bus, d);
+    probe_depth--;
 }
 
 void pci_scan(pci_match_fn fn, void *ctx)
 {
     matcher = fn;
     match_ctx = ctx;
+    memset(bus_seen, 0, sizeof(bus_seen)); /* per scan, not per boot */
+    probe_depth = 0;
     probe_bus(0);
 }

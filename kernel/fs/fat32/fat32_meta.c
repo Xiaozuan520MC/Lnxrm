@@ -31,54 +31,73 @@ static int parent_dir_init(struct fat_mount *m, const char *path, struct parent_
         pd->cluster = m->root_cluster;
     } else {
         struct resolve rr;
-        if (!fat_resolve_path(m, parent, &rr) || !rr.found || !(rr.de.attr & ATTR_DIR))
-            return LNXRM_EFAIL;
+        int rc = fat_resolve_path(m, parent, &rr);
+        if (rc < 0) return rc; /* T-005: unreadable parent, not "missing" */
+        if (!rr.found || !(rr.de.attr & ATTR_DIR)) return LNXRM_EFAIL;
         pd->cluster = ((u32)rr.de.fstclushi << 16) | rr.de.fstcluslo;
     }
     if (!pd->name[0]) return LNXRM_EFAIL;
 
     /* refuse duplicates */
     struct find_ctx fc = {.want = pd->name};
-    if (fat_scan_dir(m, pd->cluster, fat_scan_find_cb, &fc)) return LNXRM_EEXIST;
+    int seen = fat_scan_dir(m, pd->cluster, fat_scan_find_cb, &fc);
+    if (seen < 0) return seen; /* ENOMEM from a dry heap, not "duplicate" */
+    if (seen) return LNXRM_EEXIST;
     return 0;
 }
 
 /* Claim a free dirent slot in the parent chain and fill it in.
- * Begins and commits (or aborts) a journal transaction.
- * Returns 0 or LNXRM_EFAIL. */
+ * Returns 0, LNXRM_EFAIL when the directory is full, or LNXRM_EIO when a
+ * sector could not be read or written (T-005): the buffer handed to the
+ * writer must always be a sector that was really read, or the entry written
+ * is whatever happened to be on this stack. */
 static int parent_entry_add(struct fat_mount *m, u32 pdir, const char *name, u8 attr,
                             u32 first_clus)
 {
     u8 pbuf[512];
 
-    fat32_journal_begin();
-    for (u32 cc = pdir; !cluster_is_eoc(cc) && cc >= 2; cc = fat_next_cluster(m, cc)) {
+    struct fat_chain ch;
+    for (fat_chain_start(&ch, m, pdir); fat_chain_more(&ch); fat_chain_advance(&ch)) {
+        u32 cc = ch.clus;
         for (u32 s = 0; s < m->sectors_per_cluster; s++) {
             u64 lba = cluster_lba(m, cc) + s;
-            fat_read_sector(m, lba, pbuf);
+            int rc = fat_read_sector(m, lba, pbuf);
+            if (rc) {
+                fat_warn_io(m, "read dir", lba);
+                return rc;
+            }
             for (u32 doff = 0; doff <= m->bytes_per_sector - DIRENT_SIZE; doff += DIRENT_SIZE) {
                 struct fat_dirent *e = (struct fat_dirent *)(pbuf + doff);
                 if (e->name[0] != ENT_END && e->name[0] != ENT_FREE && e->name[0] != ENT_E5)
                     continue;
                 memset(e, 0, DIRENT_SIZE);
                 name_to_short(name, e->name);
+                /* Case for the alias we just wrote: without it a file created
+                 * as "st_f" would come back as "ST_F" now that the reader
+                 * honours the bits instead of lowercasing everything. */
+                e->ntres = fat_short_ntres(name);
                 e->attr = attr;
                 e->crttime = 0x6000;
-                e->crtdate = 0x5A00;
+                /* FAT date 0x5A21 = 2025-01-01: the old 0x5A00 encoded the
+                 * month and day as 0 (invalid), which mtools shows as
+                 * "2025-00-00" on every file this kernel creates.  Time stays
+                 * 12:00:00 (0x6000). */
+                e->crtdate = 0x5A21;
                 e->wrttime = 0x6000;
-                e->wrtdate = 0x5A00;
+                e->wrtdate = 0x5A21;
                 e->fstcluslo = first_clus & 0xFFFF;
                 e->fstclushi = first_clus >> 16;
                 e->filesize = 0;
 
-                fat32_journal_add(lba, pbuf);
-                fat_write_sector(m, lba, pbuf);
-                fat32_journal_commit();
+                rc = fat_write_sector(m, lba, pbuf);
+                if (rc) {
+                    fat_warn_io(m, "write dir", lba);
+                    return rc;
+                }
                 return 0;
             }
         }
     }
-    fat32_journal_abort();
     return LNXRM_EFAIL;
 }
 
@@ -100,48 +119,79 @@ struct dirent_loc {
     struct dirent_pos lfn[LFN_ENTRIES_MAX];
 };
 
-/* Read-modify-write a single 32-byte directory record. */
-static void dirent_write(struct fat_mount *m, struct dirent_pos p, const struct fat_dirent *de)
+/* Read-modify-write a single 32-byte directory record.
+ * T-005: every step is checked and reported as LNXRM_EIO -- this is the
+ * exact shape of the C15 defect (ignore the read, then commit the buffer),
+ * so a failure here must stop the caller rather than publish the sector's
+ * uninitialised twin. */
+static int dirent_write(struct fat_mount *m, struct dirent_pos p, const struct fat_dirent *de)
 {
     u8 buf[512];
-    fat_read_sector(m, p.lba, buf);
+    int rc = fat_read_sector(m, p.lba, buf);
+    if (rc) {
+        fat_warn_io(m, "read dir", p.lba);
+        return rc;
+    }
     memcpy(buf + p.off, de, DIRENT_SIZE);
-    fat32_journal_add(p.lba, buf);
-    fat_write_sector(m, p.lba, buf);
+    rc = fat_write_sector(m, p.lba, buf);
+    if (rc) fat_warn_io(m, "write dir", p.lba);
+    return rc;
 }
 
-static void dirent_free(struct fat_mount *m, struct dirent_pos p)
+static int dirent_free(struct fat_mount *m, struct dirent_pos p)
 {
     u8 buf[512];
-    fat_read_sector(m, p.lba, buf);
+    int rc = fat_read_sector(m, p.lba, buf);
+    if (rc) {
+        fat_warn_io(m, "read dir", p.lba);
+        return rc;
+    }
     buf[p.off] = ENT_E5;
-    fat32_journal_add(p.lba, buf);
-    fat_write_sector(m, p.lba, buf);
+    rc = fat_write_sector(m, p.lba, buf);
+    if (rc) fat_warn_io(m, "write dir", p.lba);
+    return rc;
 }
 
 /* Drop a name together with the long-name records in front of it; leaving
- * those behind would make the *next* entry of the directory inherit them. */
-static void free_dirent_record(struct fat_mount *m, const struct dirent_loc *loc)
+ * those behind would make the *next* entry of the directory inherit them.
+ * Stops at the first failure: writing E5 over the records after a failed
+ * one would strand a half-deleted name on disk, and the caller is told so
+ * it can leave the cluster chain alone (an entry that still exists with a
+ * stale chain is recoverable; a freed chain behind a live entry is not). */
+static int free_dirent_record(struct fat_mount *m, const struct dirent_loc *loc)
 {
-    for (int i = 0; i < loc->n_lfn; i++) dirent_free(m, loc->lfn[i]);
-    dirent_free(m, loc->pos);
+    int rc = 0;
+    for (int i = 0; i < loc->n_lfn && !rc; i++) rc = dirent_free(m, loc->lfn[i]);
+    if (!rc) rc = dirent_free(m, loc->pos);
+    return rc;
 }
 
 /* Find the 8.3 record `sn` in `dirclus` and remember the LFN records in
- * front of it.  Returns false when the directory does not contain it. */
-static bool dirent_locate(struct fat_mount *m, u32 dirclus, const u8 sn[11],
-                          struct dirent_loc *out)
+ * front of it.  Returns 1 when found, 0 when the directory does not contain
+ * it, or a negative LNXRM error.  T-005: an unreadable cluster must not be
+ * reported as "no such name" -- every caller turns that answer into a
+ * destructive action (unlink/rmdir/rename) or into ENOENT for a file that
+ * is still there. */
+static int dirent_locate(struct fat_mount *m, u32 dirclus, const u8 sn[11],
+                         struct dirent_loc *out)
 {
     u8 *buf = cluster_buf_alloc(m);
-    if (!buf) return false;
+    if (!buf) return LNXRM_ENOMEM;
     struct dirent_pos run[LFN_ENTRIES_MAX];
     int nrun = 0;
     bool found = false;
+    int rc = 0;
 
     memset(out, 0, sizeof(*out));
-    for (u32 c = dirclus; !found && !cluster_is_eoc(c) && c >= 2; c = fat_next_cluster(m, c)) {
+    struct fat_chain ch;
+    for (fat_chain_start(&ch, m, dirclus); !found && fat_chain_more(&ch); fat_chain_advance(&ch)) {
+        u32 c = ch.clus;
         u64 clba = cluster_lba(m, c);
-        m->dev->read(m->dev, clba, m->sectors_per_cluster, buf);
+        rc = fat_read_cluster(m, clba, buf);
+        if (rc) {
+            fat_warn_io(m, "read dir", clba);
+            goto out;
+        }
         for (u32 off = 0; off < m->cluster_size; off += DIRENT_SIZE) {
             struct fat_dirent *e = (struct fat_dirent *)(buf + off);
             if (e->name[0] == ENT_FREE) goto out;
@@ -169,7 +219,8 @@ static bool dirent_locate(struct fat_mount *m, u32 dirclus, const u8 sn[11],
     }
 out:
     kfree(buf);
-    return found;
+    if (rc) return rc;
+    return found ? 1 : 0;
 }
 
 /* Claim `need` consecutive free records inside `dirclus`.  Reused 0xE5
@@ -184,9 +235,18 @@ static int dir_claim_run(struct fat_mount *m, u32 dirclus, int need, struct dire
 
     int nrun = 0;
     bool in_tail = false;
-    for (u32 c = dirclus; nrun < need && !cluster_is_eoc(c) && c >= 2; c = fat_next_cluster(m, c)) {
+    struct fat_chain ch;
+    for (fat_chain_start(&ch, m, dirclus);
+         nrun < need && fat_chain_more(&ch);
+         fat_chain_advance(&ch)) {
+        u32 c = ch.clus;
         u64 clba = cluster_lba(m, c);
-        m->dev->read(m->dev, clba, m->sectors_per_cluster, buf);
+        int rc = fat_read_cluster(m, clba, buf);
+        if (rc) { /* T-005: never claim slots out of an unread cluster */
+            fat_warn_io(m, "read dir", clba);
+            kfree(buf);
+            return rc;
+        }
         for (u32 off = 0; off < m->cluster_size && nrun < need; off += DIRENT_SIZE) {
             struct fat_dirent *e = (struct fat_dirent *)(buf + off);
             if (in_tail) {
@@ -219,11 +279,26 @@ int fat_create_impl(void *mnt, const char *path)
 
     rc = parent_entry_add(m, pd.cluster, pd.name, ATTR_ARCHIVE, 0);
     if (rc) {
-        kprintf("[fat32] no free dirent slot for '%s'\n", pd.name);
-        return LNXRM_EFAIL;
+        /* said out loud which of the two it was: "no slot" is the caller's
+         * fault, an I/O error is the disk's, and hiding the difference is
+         * what made this return success over a write that never happened */
+        kprintf("[fat32] create '%s': %s\n", pd.name,
+                rc == LNXRM_EIO ? "I/O error, no entry written" : "no free dirent slot");
+        return rc;
     }
     return 0;
 }
+/* Value a ".." record stores for `parent`: the root is recorded as cluster
+ * 0, not as the root's real cluster.  mtools' mmd writes 0 and fsck.fat
+ * demands it -- storing the root cluster (2) instead gets every mkdir'ed
+ * directory flagged with "Invalid '..' entry in the second slot".  Readers
+ * are unaffected: dir_dotdot()/dir_contains() already treat 0 as "top of
+ * the chain". */
+static u32 dotdot_store(struct fat_mount *m, u32 parent)
+{
+    return parent == m->root_cluster ? 0 : parent;
+}
+
 int fat_mkdir_impl(void *mnt, const char *path)
 {
     struct fat_mount *m = fat_priv;
@@ -233,8 +308,9 @@ int fat_mkdir_impl(void *mnt, const char *path)
 
     /* allocate a cluster for the new directory content */
     u32 new_clus = fat_find_free_cluster(m);
-    if (!new_clus) return LNXRM_ENOSPC;     /* ENOSPC */
-    fat_set_entry(m, new_clus, 0x0FFFFFFF); /* mark end of chain */
+    if (!new_clus) return LNXRM_ENOSPC; /* ENOSPC */
+    if (fat_set_entry(m, new_clus, 0x0FFFFFFF)) /* mark end of chain */
+        return LNXRM_EIO;
 
     /* write "." and ".." entries to the new cluster */
     u8 dir_buf[512];
@@ -253,33 +329,51 @@ int fat_mkdir_impl(void *mnt, const char *path)
     dotdot->name[1] = '.';
     memset(dotdot->name + 2, ' ', 9);
     dotdot->attr = ATTR_DIR;
-    dotdot->fstcluslo = pd.cluster & 0xFFFF;
-    dotdot->fstclushi = pd.cluster >> 16;
+    u32 dd = dotdot_store(m, pd.cluster);
+    dotdot->fstcluslo = dd & 0xFFFF;
+    dotdot->fstclushi = dd >> 16;
     dotdot->filesize = 0;
 
     /* write the first sector of the new directory cluster */
     u64 new_lba = cluster_lba(m, new_clus);
-    fat_write_sector(m, new_lba, dir_buf);
+    if (fat_write_sector(m, new_lba, dir_buf)) {
+        fat_warn_io(m, "write dir", new_lba);
+        goto free_cluster;
+    }
 
     /* zero remaining sectors of the cluster */
     memset(dir_buf, 0, sizeof(dir_buf));
-    for (u32 s = 1; s < m->sectors_per_cluster; s++) fat_write_sector(m, new_lba + s, dir_buf);
+    for (u32 s = 1; s < m->sectors_per_cluster; s++) {
+        if (fat_write_sector(m, new_lba + s, dir_buf)) {
+            fat_warn_io(m, "write dir", new_lba + s);
+            goto free_cluster;
+        }
+    }
 
     /* create directory entry in parent */
     rc = parent_entry_add(m, pd.cluster, pd.name, ATTR_DIR | ATTR_ARCHIVE, new_clus);
     if (rc) {
-        /* no free slot -- free the cluster we allocated */
-        fat_set_entry(m, new_clus, 0);
-        return LNXRM_EFAIL;
+        /* no free slot, or the parent could not be written -- free the
+         * cluster we allocated, or it is leaked as "used but unreachable" */
+        kprintf("[fat32] mkdir '%s': %s\n", pd.name,
+                rc == LNXRM_EIO ? "I/O error, no entry written" : "no free dirent slot");
+        fat_set_entry(m, new_clus, 0); /* best effort: nothing points at it yet */
+        return rc;
     }
     return 0;
+
+free_cluster: /* the content of the new directory could not be written */
+    fat_set_entry(m, new_clus, 0);
+    return LNXRM_EIO;
 }
 
 int fat_rmdir_impl(void *mnt, const char *path)
 {
     struct fat_mount *m = fat_priv;
     struct resolve r;
-    if (!fat_resolve_path(m, path, &r) || !r.found) return LNXRM_ENOENT;
+    int rc = fat_resolve_path(m, path, &r);
+    if (rc < 0) return rc; /* T-005 */
+    if (!r.found) return LNXRM_ENOENT;
     if (!(r.de.attr & ATTR_DIR)) return LNXRM_ENOTDIR; /* ENOTDIR */
 
     u32 dir_clus = ((u32)r.de.fstclushi << 16) | r.de.fstcluslo;
@@ -288,10 +382,16 @@ int fat_rmdir_impl(void *mnt, const char *path)
     /* check directory is empty (only . and ..) */
     u8 dbuf[512];
     int entry_count = 0;
-    for (u32 cc = dir_clus; !cluster_is_eoc(cc) && cc >= 2; cc = fat_next_cluster(m, cc)) {
+    struct fat_chain ch;
+    for (fat_chain_start(&ch, m, dir_clus); fat_chain_more(&ch); fat_chain_advance(&ch)) {
+        u32 cc = ch.clus;
         for (u32 s = 0; s < m->sectors_per_cluster; s++) {
             u64 lba = cluster_lba(m, cc) + s;
-            fat_read_sector(m, lba, dbuf);
+            rc = fat_read_sector(m, lba, dbuf);
+            if (rc) { /* never call a directory empty because it would not read */
+                fat_warn_io(m, "read dir", lba);
+                return rc;
+            }
             for (u32 doff = 0; doff <= m->bytes_per_sector - DIRENT_SIZE; doff += DIRENT_SIZE) {
                 struct fat_dirent *e = (struct fat_dirent *)(dbuf + doff);
                 if (e->name[0] == ENT_END) goto done_check;
@@ -307,20 +407,25 @@ done_check:
     if (entry_count < 2) return LNXRM_EFAIL;
 
     struct dirent_loc loc;
-    if (!dirent_locate(m, r.dir_cluster, r.de.name, &loc)) return LNXRM_ENOENT;
+    rc = dirent_locate(m, r.dir_cluster, r.de.name, &loc);
+    if (rc < 0) return rc;
+    if (!rc) return LNXRM_ENOENT;
 
     /* Remove the parent directory entry FIRST, then free the chain --
-     * see fat_unlink() for the rationale (avoids cross-linked clusters). */
-    fat32_journal_begin();
-    free_dirent_record(m, &loc);
+     * see fat_unlink() for the rationale (avoids cross-linked clusters).
+     * A failure here stops before the chain is touched: an entry that still
+     * exists over a live chain is a normal filesystem, the reverse is not. */
+    rc = free_dirent_record(m, &loc);
+    if (rc) return rc;
 
-    u32 clus = dir_clus;
-    while (!cluster_is_eoc(clus) && clus >= 2) {
-        u32 nx = fat_next_cluster(m, clus);
-        fat_set_entry(m, clus, 0);
-        clus = nx;
+    struct fat_chain chf;
+    fat_chain_start(&chf, m, dir_clus);
+    while (fat_chain_more(&chf)) {
+        u32 clus = chf.clus;
+        fat_chain_advance(&chf); /* next cluster must be read before this one is freed */
+        if (fat_set_entry(m, clus, 0))
+            return LNXRM_EIO; /* already reported; clusters leak, none cross-link */
     }
-    fat32_journal_commit();
     return 0;
 }
 
@@ -328,36 +433,41 @@ int fat_unlink_impl(void *mnt, const char *path)
 {
     struct fat_mount *m = fat_priv;
     struct resolve r;
-    if (!fat_resolve_path(m, path, &r) || !r.found) return LNXRM_ENOENT;
+    int rc = fat_resolve_path(m, path, &r);
+    if (rc < 0) return rc; /* T-005: EIO, not "already gone" */
+    if (!r.found) return LNXRM_ENOENT;
     if (r.de.attr & ATTR_DIR) return LNXRM_EFAIL;
 
     struct dirent_loc loc;
-    if (!dirent_locate(m, r.dir_cluster, r.de.name, &loc)) return LNXRM_ENOENT;
+    rc = dirent_locate(m, r.dir_cluster, r.de.name, &loc);
+    if (rc < 0) return rc;
+    if (!rc) return LNXRM_ENOENT;
 
     /* Start a transaction for atomic updates */
-    fat32_journal_begin();
 
     /* Remove the directory entry FIRST, then free the cluster chain.
      * Reversing the order meant a failed dirent lookup left the chain
      * already freed while the dirent still pointed at it -> cross-linked
      * clusters shared by two files. */
-    free_dirent_record(m, &loc);
+    rc = free_dirent_record(m, &loc);
+    if (rc) return rc; /* entry (partly) there, chain untouched */
 
-    u32 clus = ((u32)r.de.fstclushi << 16) | r.de.fstcluslo;
-    while (!cluster_is_eoc(clus) && clus >= 2) {
-        u32 nx = fat_next_cluster(m, clus);
-        fat_set_entry(m, clus, 0);
-        clus = nx;
+    u32 first = ((u32)r.de.fstclushi << 16) | r.de.fstcluslo;
+    struct fat_chain chf;
+    fat_chain_start(&chf, m, first);
+    while (fat_chain_more(&chf)) {
+        u32 clus = chf.clus;
+        fat_chain_advance(&chf); /* next cluster must be read before this one is freed */
+        if (fat_set_entry(m, clus, 0))
+            return LNXRM_EIO; /* already reported; clusters leak, none cross-link */
     }
-    fat32_journal_commit();
     return 0;
 }
 
 /* ---------------- rename / move ---------------- */
 
-/* How many LFN records `name` needs.  0 when the 8.3 alias alone already
- * represents it (the volume renders short names lowercased), negative
- * when the name cannot be stored at all. */
+/* How many LFN records `name` needs.  0 when the 8.3 alias plus the NT case
+ * bits already render back as `name`, negative when it cannot be stored. */
 static int fat_lfn_count(const char *name)
 {
     size_t len = strlen(name);
@@ -365,8 +475,12 @@ static int fat_lfn_count(const char *name)
     u8 alias[11];
     char back[13];
     name_to_short(name, alias);
-    fat_short_to_name(alias, back);
-    if (!strcasecmp(back, name)) return 0;
+    fat_short_to_name(alias, fat_short_ntres(name), back);
+    /* Case-sensitive on purpose: 8.3 + bits can only spell a part that is
+     * uniform in case, so "Hello.txt" must lose the strcmp here and take an
+     * LFN record -- accepting it insensitively stored a name that read back
+     * as "HELLO.txt". */
+    if (!strcmp(back, name)) return 0;
     return (int)((len + 12) / 13);
 }
 
@@ -410,7 +524,8 @@ struct rename_ctx {
     bool hit;
 };
 
-static int rename_exists_cb(const char *name, const struct fat_dirent *e, void *ctx)
+static int rename_exists_cb(const char *name, const struct fat_dirent *e, u32 dirclus, u32 off,
+                            void *ctx)
 {
     struct rename_ctx *c = ctx;
     if (c->skip && !memcmp(e->name, c->skip, 11)) return 0;
@@ -421,60 +536,83 @@ static int rename_exists_cb(const char *name, const struct fat_dirent *e, void *
     return 0;
 }
 
-/* The ".." record of a directory cluster; 0 when the directory has none
- * (the FAT32 root created by mkfs has no dot entries). */
-static u32 dir_dotdot(struct fat_mount *m, u32 clus)
+/* The ".." record of a directory cluster.  *out gets the parent cluster,
+ * or 0 when the directory has none (the FAT32 root created by mkfs has no
+ * dot entries) or when the parent *is* the root, which a ".." record
+ * stores as cluster 0 (see dotdot_store).  Returns 0 or a negative LNXRM
+ * error: T-005 -- an unreadable sector is *not* "this directory has no
+ * parent", because the caller uses that answer to decide whether a move
+ * would put a directory inside its own subtree. */
+static int dir_dotdot(struct fat_mount *m, u32 clus, u32 *out)
 {
     u8 buf[512];
     u64 lba = cluster_lba(m, clus);
-    if (fat_read_sector(m, lba, buf)) return 0;
+    *out = 0;
+    int rc = fat_read_sector(m, lba, buf);
+    if (rc) {
+        fat_warn_io(m, "read dir", lba);
+        return rc;
+    }
     for (u32 off = 0; off <= m->bytes_per_sector - DIRENT_SIZE; off += DIRENT_SIZE) {
         struct fat_dirent *e = (struct fat_dirent *)(buf + off);
         if (e->name[0] == ENT_FREE) break;
         if (!entry_used(e) || (e->attr & ATTR_LFN) == ATTR_LFN) continue;
-        if (e->name[0] == '.' && e->name[1] == '.' && e->name[2] == ' ')
-            return ((u32)e->fstclushi << 16) | e->fstcluslo;
+        if (e->name[0] == '.' && e->name[1] == '.' && e->name[2] == ' ') {
+            *out = ((u32)e->fstclushi << 16) | e->fstcluslo;
+            return 0;
+        }
         if (e->name[0] == '.' && e->name[1] == ' ') continue;
         break; /* "." always comes first, so there is no parent link here */
     }
     return 0;
 }
 
-/* Point a directory's ".." record at its new parent (directories only). */
-static void dir_set_dotdot(struct fat_mount *m, u32 clus, u32 parent)
+/* Point a directory's ".." record at its new parent (directories only).
+ * Returns 0 (updated, or there is nothing to update) or LNXRM_EIO. */
+static int dir_set_dotdot(struct fat_mount *m, u32 clus, u32 parent)
 {
     u8 buf[512];
     u64 lba = cluster_lba(m, clus);
-    if (fat_read_sector(m, lba, buf)) return;
+    int rc = fat_read_sector(m, lba, buf);
+    if (rc) {
+        fat_warn_io(m, "read dir", lba);
+        return rc;
+    }
     for (u32 off = 0; off <= m->bytes_per_sector - DIRENT_SIZE; off += DIRENT_SIZE) {
         struct fat_dirent *e = (struct fat_dirent *)(buf + off);
-        if (e->name[0] == ENT_FREE) return;
+        if (e->name[0] == ENT_FREE) return 0;
         if (!entry_used(e) || (e->attr & ATTR_LFN) == ATTR_LFN) continue;
         if (e->name[0] == '.' && e->name[1] == '.' && e->name[2] == ' ') {
-            e->fstcluslo = parent & 0xFFFF;
-            e->fstclushi = parent >> 16;
-            fat32_journal_add(lba, buf);
-            fat_write_sector(m, lba, buf);
-            return;
+            u32 dd = dotdot_store(m, parent);
+            e->fstcluslo = dd & 0xFFFF;
+            e->fstclushi = dd >> 16;
+            rc = fat_write_sector(m, lba, buf);
+            if (rc) fat_warn_io(m, "write dir", lba);
+            return rc;
         }
         if (e->name[0] == '.' && e->name[1] == ' ') continue;
-        return; /* first record decides ("." / ".." come first) */
+        return 0; /* first record decides ("." / ".." come first) */
     }
+    return 0;
 }
 
 /* Is `node` the same directory as `dir` or nested inside it?  Walking the
  * ".." chain upward keeps a directory from being moved into its own
- * subtree, which would orphan everything below it. */
-static bool dir_contains(struct fat_mount *m, u32 dir, u32 node)
+ * subtree, which would orphan everything below it.
+ * Returns 1 yes / 0 no / negative when a ".." record could not be read --
+ * the answer must not be guessed when the walk broke off halfway. */
+static int dir_contains(struct fat_mount *m, u32 dir, u32 node)
 {
     u32 c = node;
     for (int i = 0; i < 64 && c >= 2 && c < m->max_cluster; i++) {
-        if (c == dir) return true;
-        u32 p = dir_dotdot(m, c);
-        if (p == c || p < 2 || p >= m->max_cluster) return false;
+        if (c == dir) return 1;
+        u32 p;
+        int rc = dir_dotdot(m, c, &p);
+        if (rc) return rc;
+        if (p == c || p < 2 || p >= m->max_cluster) return 0;
         c = p;
     }
-    return false;
+    return 0;
 }
 
 /* Rewrite a record where it already sits, shrinking/growing its LFN run
@@ -482,21 +620,23 @@ static bool dir_contains(struct fat_mount *m, u32 dir, u32 node)
 static int rename_in_place(struct fat_mount *m, const struct dirent_loc *loc, int n_lfn,
                            const char *nname, const u8 alias[11], u8 sum)
 {
-    fat32_journal_begin();
     /* records that are no longer part of the name are deleted ... */
-    for (int i = 0; i < loc->n_lfn - n_lfn; i++) dirent_free(m, loc->lfn[i]);
+    for (int i = 0; i < loc->n_lfn - n_lfn; i++) {
+        int rc = dirent_free(m, loc->lfn[i]);
+        if (rc) return rc;
+    }
     /* ... the survivors are the last n_lfn, carrying seq n_lfn .. 1 */
     for (int i = 0; i < n_lfn; i++) {
         struct fat_dirent e;
+        int rc;
         lfn_fill(&e, n_lfn - i, n_lfn, sum, nname);
-        dirent_write(m, loc->lfn[loc->n_lfn - n_lfn + i], &e);
+        rc = dirent_write(m, loc->lfn[loc->n_lfn - n_lfn + i], &e);
+        if (rc) return rc;
     }
     struct fat_dirent rec = loc->de;
     memcpy(rec.name, alias, 11);
-    rec.ntres = 0; /* stale case bits from the old name */
-    dirent_write(m, loc->pos, &rec);
-    fat32_journal_commit();
-    return 0;
+    rec.ntres = fat_short_ntres(nname); /* the old bits described the old name */
+    return dirent_write(m, loc->pos, &rec);
 }
 
 static void path_trim(char *p)
@@ -524,7 +664,9 @@ int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath)
     /* the source must exist (the volume root itself has no record) */
     struct resolve ro;
     memset(&ro, 0, sizeof(ro));
-    if (!fat_resolve_path(m, ob, &ro) || !ro.found) return LNXRM_ENOENT;
+    int res = fat_resolve_path(m, ob, &ro);
+    if (res < 0) return res; /* T-005: EIO, not "no such file" */
+    if (!ro.found) return LNXRM_ENOENT;
     u32 old_dir = ro.dir_cluster;
     u32 old_clus = ((u32)ro.de.fstclushi << 16) | ro.de.fstcluslo;
     bool is_dir = (ro.de.attr & ATTR_DIR) != 0;
@@ -552,7 +694,9 @@ int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath)
     if (pdir[0]) {
         struct resolve rp;
         memset(&rp, 0, sizeof(rp));
-        if (!fat_resolve_path(m, pdir, &rp) || !rp.found) return LNXRM_ENOENT;
+        res = fat_resolve_path(m, pdir, &rp);
+        if (res < 0) return res; /* T-005 */
+        if (!rp.found) return LNXRM_ENOENT;
         if (!(rp.de.attr & ATTR_DIR)) return LNXRM_ENOTDIR;
         new_dir = ((u32)rp.de.fstclushi << 16) | rp.de.fstcluslo;
     }
@@ -564,11 +708,16 @@ int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath)
      * about to move, which lives in the same directory for a plain rename) */
     struct rename_ctx rc = {.want = nname, .hit = false};
     if (old_dir == new_dir) rc.skip = ro.de.name;
-    fat_scan_dir(m, new_dir, rename_exists_cb, &rc);
+    int scan = fat_scan_dir(m, new_dir, rename_exists_cb, &rc);
+    if (scan < 0) return scan; /* T-005: "the name is free" needs the read */
     if (rc.hit) return LNXRM_EEXIST;
 
     /* a directory may not be moved into itself or its own subtree */
-    if (is_dir && dir_contains(m, old_clus, new_dir)) return LNXRM_EINVAL;
+    if (is_dir) {
+        int inside = dir_contains(m, old_clus, new_dir);
+        if (inside < 0) return inside; /* could not walk the ".." chain */
+        if (inside) return LNXRM_EINVAL;
+    }
 
     int n_lfn = fat_lfn_count(nname);
     if (n_lfn < 0) return LNXRM_EINVAL;
@@ -577,7 +726,9 @@ int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath)
     u8 sum = lfn_checksum(alias);
 
     struct dirent_loc loc;
-    if (!dirent_locate(m, old_dir, ro.de.name, &loc)) return LNXRM_ENOENT;
+    int found = dirent_locate(m, old_dir, ro.de.name, &loc);
+    if (found < 0) return found;
+    if (!found) return LNXRM_ENOENT;
 
     /* Same directory and the existing long-name run is already big enough:
      * rewrite the record in place, no directory reshuffling needed. */
@@ -590,19 +741,23 @@ int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath)
     int err = dir_claim_run(m, new_dir, n_lfn + 1, slots);
     if (err) return err;
 
-    fat32_journal_begin();
     for (int i = 0; i < n_lfn; i++) {
         struct fat_dirent e;
         lfn_fill(&e, n_lfn - i, n_lfn, sum, nname);
-        dirent_write(m, slots[i], &e);
+        err = dirent_write(m, slots[i], &e);
+        if (err) return err; /* the old record is still in place: no data lost */
     }
     struct fat_dirent rec = loc.de;
     memcpy(rec.name, alias, 11);
-    rec.ntres = 0;
-    dirent_write(m, slots[n_lfn], &rec);
+    rec.ntres = fat_short_ntres(nname);
+    err = dirent_write(m, slots[n_lfn], &rec);
+    if (err) return err;
 
-    free_dirent_record(m, &loc);
-    if (is_dir && old_dir != new_dir) dir_set_dotdot(m, old_clus, new_dir);
-    fat32_journal_commit();
+    err = free_dirent_record(m, &loc);
+    if (err) return err;
+    if (is_dir && old_dir != new_dir) {
+        err = dir_set_dotdot(m, old_clus, new_dir);
+        if (err) return err;
+    }
     return 0;
 }

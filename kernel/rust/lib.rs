@@ -1,14 +1,11 @@
 //! lnxrm Rust support crate.
 //!
 //! Freestanding (`no_std`), panic-abort, linked as a static library into the
-//! kernel. Provides the UART console driver, a Spinlock primitive, safe C
-//! allocator wrappers and SMP primitives.
+//! kernel. Provides the UART console driver and SMP primitives.
 
 #![no_std]
 
 pub mod uart;
-pub mod sync;
-pub mod kalloc;
 pub mod smp;
 
 use core::panic::PanicInfo;
@@ -57,13 +54,4 @@ fn format_into<'a>(buf: &'a mut [u8], file: &str, line: u64) -> &'a str {
         }
     }
     core::str::from_utf8(&buf[..i]).unwrap_or("?")
-}
-
-/// Called by kernel/main.c once the console is alive.
-#[no_mangle]
-pub extern "C" fn rust_hello(selftest: u64) {
-    uart::write_str("[rust] core online (uart driver owned by rust)\r\n");
-    if selftest == 42 {
-        uart::write_str("[rust] KBox/spinlock selftest passed\r\n");
-    }
 }

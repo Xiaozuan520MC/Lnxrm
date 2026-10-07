@@ -120,8 +120,18 @@ static int issueCmd(volatile u8 *px, int slot)
 
     /* Wait for command completion (CI bit clear) */
     for (int i = 0; i < 10000000; i++) {
-        if (!(pxRd(px, P_CI) & (1u << slot))) return (pxRd(px, P_IS) & IS_TFES) ? -1 : 0;
-        asm volatile("pause");
+        if (pxRd(px, P_CI) & (1u << slot)) {
+            asm volatile("pause");
+            continue;
+        }
+        /* C50: CI clear means the port finished, not that the drive succeeded.
+         * IS_TFES only fires on a task-file *fatal* error; an ATA command that
+         * was rejected sets PxTFD.ERR without it, and the caller then trusts
+         * whatever was already in its buffer (IDENTIFY is prefilled 0xCC, so a
+         * failure there used to be registered as a disk of 0xCCCCCCCC sectors). */
+        if (pxRd(px, P_IS) & IS_TFES) return -1;
+        if (pxRd(px, P_TFD) & 0x01) return -1; /* PxTFD.ERR */
+        return 0;
     }
     return -1;
 }
@@ -288,11 +298,24 @@ static int ahciProbe(void *, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid, u8 cl
 
         kprintf("[ahci] port %d: device present (SSTS=%08x)\n", p, ssts);
 
+        /* Allocate the port's DMA structures before the port object: an
+         * allocation failure must skip *this* port, not take the machine
+         * with it (T-004 -- and AHCI is optional, IDE still boots). */
+        CmdHdr *clb = (CmdHdr *)kmalloc(1024);
+        void *fis = kmalloc(256);
+        CmdTbl *ct = (CmdTbl *)kmalloc(4096);
+        if (!clb || !fis || !ct) {
+            kprintf("[ahci] port %d: out of memory, port skipped\n", p);
+            kfree(clb);
+            kfree(fis);
+            kfree(ct);
+            continue;
+        }
         auto *port = new AhciPort;
         port->mmio = px;
-        port->clb = (CmdHdr *)kmalloc(1024);
-        port->fis = kmalloc(256);
-        port->ct = (CmdTbl *)kmalloc(4096);
+        port->clb = clb;
+        port->fis = fis;
+        port->ct = ct;
         memset(port->clb, 0, 1024);
         memset(port->fis, 0, 256);
         memset(port->ct, 0, 4096);
@@ -331,10 +354,12 @@ static int ahciProbe(void *, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid, u8 cl
             continue;
         }
 
-        u32 lba28;
-        memcpy(&lba28, &ident[60], sizeof(lba28));
-        if (!lba28) memcpy(&lba28, &ident[100], sizeof(lba28));
-        u64 sectors = lba28;
+        /* Capacity comes from words 60-61 (28-bit), with words 100-103 as the
+         * 48-bit answer -- see ata_total_sectors().  The old code fell back to
+         * words 100-103 only when words 60-61 were *zero*, but ATA's marker for
+         * "use the 48-bit field" is FFFFFFFFh, so the one value that meant
+         * 2097151 on the console was exactly the one that never fell back. */
+        u64 sectors = ata_total_sectors(ident);
 
         char model[41];
         for (int i = 0; i < 20; i++) {
@@ -342,6 +367,14 @@ static int ahciProbe(void *, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid, u8 cl
             model[i * 2 + 1] = (char)(ident[27 + i] & 0xFF);
         }
         model[40] = 0;
+
+        if (!sectors) {
+            /* Do not register a device whose size we could not read: a made-up
+             * capacity is worse than no disk, because every bounds check
+             * downstream trusts it. */
+            kprintf("[ahci] port %d: %.40s, capacity unknown -- port skipped\n", p, model);
+            continue;
+        }
 
         auto *bd = new blkdev;
         bd->name = "sda";

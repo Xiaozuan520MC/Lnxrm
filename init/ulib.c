@@ -7,21 +7,6 @@ size_t xstrlen(const char *s)
     return n;
 }
 
-char *xstrcpy(char *d, const char *s)
-{
-    char *r = d;
-    while ((*d++ = *s++));
-    return r;
-}
-
-void *xmemcpy(void *d, const void *s, size_t n)
-{
-    char *dp = d;
-    const char *sp = s;
-    while (n--) *dp++ = *sp++;
-    return d;
-}
-
 void xputs(const char *s)
 { kwrite(1, s, xstrlen(s)); }
 

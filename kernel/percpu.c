@@ -31,14 +31,9 @@ void cpu_init_percpu(u32 cpu_id, u32 apic_id)
     /* NOTE: this must also be done after gdt_init() because mov gs,ax
      * in gdt_reload can reset the hidden base from the GDT entry. */
 
-    /* set up idle context: when no tasks are runnable, hlt in a loop */
-    c->idle_ctx.sp = 0;
-
     /* per-CPU run queue: circular singly linked list via rq_next */
     c->runq_head.pid = 0;
     c->runq_head.state = T_UNUSED;
     c->runq_head.rq_next = &c->runq_head;
-
-    spin_init(&c->task_lock);
 }
 
