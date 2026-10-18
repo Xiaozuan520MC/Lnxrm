@@ -32,6 +32,67 @@ static inline char ascii_toupper(char c)
 static inline char ascii_tolower(char c)
 { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 
+/* ---------------- crash-consistency journal (fat32_journal.c) ----------
+ * One record = the after-image of a single metadata sector plus the LBA it
+ * belongs at.  The journal buffers these in RAM while a transaction is open,
+ * writes them to the on-disk log before touching any home location, and
+ * replays them on mount after a crash that landed between commit and apply.
+ * Recording the *after*-image (not the before-image) is what makes replay an
+ * idempotent redo: applying a record twice leaves the same bytes as applying
+ * it once, so recovery never has to know how far the previous run got. */
+
+#define JRN_RECORDS_MAX 128 /* hard ceiling on one transaction's records */
+
+struct jrn_rec {
+    u64 lba;                    /* home LBA this after-image belongs at */
+    u8 data[CACHE_SECTOR_SIZE]; /* the sector contents to write there */
+};
+
+/* Journal on-disk superblock, kept in the first reserved sector of the log.
+ * state is the only field recovery trusts to decide whether a replay is
+ * owed; everything else is validated by magic + version + CRC so a corrupted
+ * or foreign sector can never be mistaken for a commit record. */
+#define JRN_MAGIC   0x4A524E31u /* "JRN1" */
+#define JRN_VERSION 1u
+
+#define JRN_STATE_CLEAN 0u /* no committed-but-unapplied transaction */
+#define JRN_STATE_COMMIT 1u /* records are durable; replay them on mount */
+
+struct jrn_super {
+    u32 magic;
+    u32 version;
+    u32 state;    /* JRN_STATE_CLEAN or JRN_STATE_COMMIT */
+    u32 nrec;     /* committed record count (valid when state == COMMIT) */
+    u64 head;     /* log slot the committed records start at (sector offset) */
+    u32 crc;      /* CRC over every field above */
+};
+
+/* Journal entry points (fat32_journal.c).  All are called with fat_fs_lock
+ * held, from the locked wrappers in fat32.c or from fat_mount(). */
+struct fat_mount;
+/* Format-or-find the journal in the reserved area and roll a committed but
+ * unapplied transaction forward.  Safe to call on a volume that has never
+ * been journalled: it lays the superblock down in place.  Leaves j_active
+ * false when the volume has no usable reserved area, in which case every
+ * operation below degrades to the pre-journal write path. */
+void fat_journal_mount(struct fat_mount *m);
+/* Open a transaction.  Always returns 0: a volume without a log, or one
+ * that could not allocate the record buffer, simply runs unjournaled
+ * instead of failing the operation. */
+int fat_journal_begin(struct fat_mount *m);
+/* Close the transaction durably: flush file data, write the records and the
+ * commit record to the log, apply them home, then clear the commit.  Also
+ * the entry point for an unjournaled volume, where it is just the old
+ * fat_sync() cache flush.  Returns 0 or LNXRM_EIO. */
+int fat_journal_commit(struct fat_mount *m);
+/* Buffer one metadata sector's after-image, or -- with no transaction open
+ * -- write it home the way the driver did before the journal existed.
+ * Returns 0 or LNXRM_EIO.  Called by fat_write_sector() and fat_set_entry(). */
+int fat_journal_add(struct fat_mount *m, u64 lba, const void *buf);
+/* Serve a read from the open transaction's buffer, if it holds `lba`.
+ * Returns true when it filled `buf`.  Called by fat_read_sector(). */
+bool fat_journal_read(const struct fat_mount *m, u64 lba, void *buf);
+
 struct fat_mount {
     struct blkdev *dev;
     u32 bytes_per_sector;
@@ -46,6 +107,26 @@ struct fat_mount {
     u8 *fat; /* cached FAT table */
     u64 fat_bytes;
     u32 fat_warns; /* corruption reports printed so far (rate limiter) */
+
+    /* --- crash-consistency journal (fat32_journal.c) -------------------
+     * A metadata-only redo log living in the reserved sectors mkfs leaves
+     * unused (sector 8 .. reserved_sectors-1).  It turns each mutating
+     * operation into one atomic transaction: the after-images of every
+     * metadata sector it touches are buffered in RAM, committed to the log
+     * *before* any of them reaches its home location, and replayed on the
+     * next mount if the machine died between commit and apply.  File data
+     * is deliberately not logged (ordered mode): a crash can leave stale
+     * bytes inside a file, but never a half-updated FAT or a dangling
+     * directory entry. */
+    u32 j_start;   /* first LBA of the journal (0 = no journal) */
+    u32 j_sectors; /* total journal sectors including the superblock */
+    bool j_active; /* journal present and usable on this volume */
+
+    /* open transaction state.  Guarded by fat_fs_lock like everything else. */
+    bool tx_open;
+    u32 tx_nrec;                 /* records buffered so far */
+    struct jrn_rec *tx_rec;      /* heap array of after-images, tx_cap slots */
+    u32 tx_cap;                  /* allocated slots in tx_rec */
 };
 
 #define DIRENT_SIZE 32
@@ -76,11 +157,32 @@ struct fat_dirent {
  * being mistaken for EOF, "not found" or success.  Every one of these
  * results must be checked: an unchecked read feeds uninitialised bytes to
  * the write below, and that is how kernel stack garbage ends up in a
- * directory entry. */
+ * directory entry.
+ *
+ * Reads consult the open journal transaction first so that a mutating
+ * operation sees its own metadata writes before they reach their home
+ * location (fat32_journal.c). */
 static inline int fat_read_sector(struct fat_mount *m, u64 lba, void *buf)
-{ return blk_cache_read(m->dev, lba, buf) ? LNXRM_EIO : 0; }
+{
+    if (fat_journal_read(m, lba, buf)) return 0;
+    return blk_cache_read(m->dev, lba, buf) ? LNXRM_EIO : 0;
+}
 
+/* Metadata write (directory entries, new-directory contents, FAT sectors).
+ * When a transaction is open this buffers the after-image in the journal
+ * instead of touching the home location -- the commit record must reach the
+ * log first, or a crash mid-operation would leave a half-applied change with
+ * no record to roll forward from.  With no transaction open (or no journal on
+ * this volume) it degrades to the plain write-back-cache write, which is
+ * exactly the pre-journal behaviour. */
 static inline int fat_write_sector(struct fat_mount *m, u64 lba, const void *buf)
+{ return fat_journal_add(m, lba, buf); }
+
+/* File *data* write: bypasses the journal entirely and goes straight to the
+ * write-back cache.  The journal is metadata-only (ordered mode) -- logging
+ * file contents would multiply every write by two for no consistency gain,
+ * since data bytes carry no cross-referential structure to keep coherent. */
+static inline int fat_write_sector_raw(struct fat_mount *m, u64 lba, const void *buf)
 { return blk_cache_write(m->dev, lba, buf) ? LNXRM_EIO : 0; }
 
 /* Read a whole cluster through the same write-back cache every write goes

@@ -124,38 +124,37 @@ int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
     u64 off = clus * 4;
     u64 lba = m->reserved_sectors + off / m->bytes_per_sector;
     void *sec = &m->fat[off & ~(u64)(m->bytes_per_sector - 1)];
-    if (blk_io_write(m->dev, lba, 1, sec)) {
+    /* Through the journal: with a transaction open the after-image is only
+     * buffered (the commit record has to reach the log first, or a crash
+     * here would leave the FAT updated with no record to finish from), and
+     * with none open it is written direct -- mirroring into FAT#2, since
+     * fsck.fat compares both tables and "FATs differ" alone makes it exit
+     * nonzero -- exactly as this function did before the log existed.  The
+     * in-memory entry stays updated either way: it is what stops the next
+     * allocation scan from handing this cluster out again in the meantime. */
+    int wrc = fat_journal_add(m, lba, sec);
+    if (wrc) {
         fat_warn_io(m, "write FAT", lba);
-        return LNXRM_EIO;
-    }
-    /* Mirror the same sector into FAT#2.  mkfs lays down two tables and
-     * fsck.fat compares them: writing only the first leaves them differing
-     * after any session that allocated or freed a cluster, and "FATs differ"
-     * *alone* makes fsck exit nonzero -- failing smoke's "fsck.vfat -n"
-     * gate on the next run.  m->fat is the single in-memory image (loaded
-     * from FAT#1 and byte-identical to FAT#2 on a mkfs image), so the same
-     * window goes to both copies from here on. */
-    if (m->num_fats > 1) {
-        u64 lba2 = lba + m->fatsz;
-        if (blk_io_write(m->dev, lba2, 1, sec)) {
-            fat_warn_io(m, "write FAT#2", lba2);
-            return LNXRM_EIO;
-        }
+        return wrc;
     }
     /* Track the FSInfo free-cluster summary across claim/release.  mkfs
      * seeds it and fsck.fat verifies it ("Free cluster summary wrong" is an
      * error), so never touching it turns any allocating session into a
      * failing smoke gate too.  0xFFFFFFFF means "unknown" per spec, and an
-     * FSInfo sector with bad signatures is not ours to patch. */
+     * FSInfo sector with bad signatures is not ours to patch.  The read
+     * consults the open transaction first: several fat_set_entry() calls in
+     * one operation each nudge the count, and until the commit lands none of
+     * their edits are on the disk this sector would otherwise be read from. */
     u32 oldv = old & 0x0FFFFFFF, newv = val & 0x0FFFFFFF;
     if ((oldv == 0) != (newv == 0) && m->reserved_sectors > 1) {
         u8 info[512];
-        if (!blk_io_read(m->dev, 1, 1, info) &&
-            *(u32 *)info == 0x41615252 && *(u32 *)&info[484] == 0x61417272) {
+        bool have = fat_journal_read(m, 1, info);
+        if (!have) have = blk_io_read(m->dev, 1, 1, info) == 0;
+        if (have && *(u32 *)info == 0x41615252 && *(u32 *)&info[484] == 0x61417272) {
             u32 *fc = (u32 *)&info[488];
             if (*fc != 0xFFFFFFFF) {
                 *fc = (oldv == 0) ? (*fc ? *fc - 1 : 0) : *fc + 1;
-                if (blk_io_write(m->dev, 1, 1, info))
+                if (fat_journal_add(m, 1, info))
                     fat_warn_io(m, "write FSInfo", 1);
             }
         }
@@ -204,75 +203,84 @@ static int fat_read(void *mnt, void *node, u64 off, void *ubuf, size_t n)
     return r;
 }
 
-/* --- mutation write-back ------------------------------------------------
- * Directory and data sectors go through the write-back cache
- * (fat_write_sector -> blk_cache_write), and *nothing* flushes it outside
- * mount time: there is no sync syscall and no shutdown path, and eviction
- * only helps if the LRU ever picks the slot -- a root-dir sector is re-hit
- * by every path lookup, so it essentially never is.  mkdir/touch/rm used to
- * die with QEMU and never reach disk.img, while fat_set_entry()'s FAT write
- * is direct (blk_io_write) and *did* land, leaving the half-updated image
- * fsck reports as "file contains a free cluster".  Flushing after every
- * mutating op, still under FAT_ENTER, commits the whole operation as one
- * unit before the next one can interleave. */
-static void fat_sync(void)
-{
-    struct fat_mount *m = fat_priv;
-    blk_cache_flush(m->dev);
-}
-
+/* --- mutation transactions ---------------------------------------------
+ * Directory and data sectors go through the write-back cache, and *nothing*
+ * used to flush it outside mount time: there is no sync syscall and no
+ * shutdown path, and eviction only helps if the LRU ever picks the slot -- a
+ * root-dir sector is re-hit by every path lookup, so it essentially never
+ * does.  mkdir/touch/rm died with QEMU and never reach disk.img, while
+ * fat_set_entry()'s FAT write is direct and *did* land, leaving the
+ * half-updated image fsck reports as "file contains a free cluster".
+ *
+ * The fix went further than the original flush: each mutating operation is
+ * now one journal transaction.  fat_journal_begin() opens it, the impl's
+ * metadata writes are buffered rather than applied, and fat_journal_commit()
+ * -- still under FAT_ENTER -- writes the records to the on-disk log, stamps
+ * the commit, applies everything home and flushes.  The whole operation
+ * lands as one unit, and if the machine dies anywhere inside that sequence
+ * the next mount finishes it from the log.  Commit runs on failure paths
+ * too: the impl may have claimed clusters or half-renamed a file before it
+ * gave up, and leaving those changes in RAM while the disk never sees them
+ * is exactly the divergence that hands the same cluster to two files. */
 static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
 {
     FAT_ENTER();
+    fat_journal_begin(fat_priv);
     int r = fat_write_impl(mnt, node, off, buf, n);
-    fat_sync();
+    int c = fat_journal_commit(fat_priv);
     FAT_LEAVE();
-    return r;
+    if (r < 0) return r;
+    return c < 0 ? c : r; /* a failed commit means the short count never landed */
 }
 
 static int fat_create(void *mnt, const char *path)
 {
     FAT_ENTER();
+    fat_journal_begin(fat_priv);
     int r = fat_create_impl(mnt, path);
-    fat_sync();
+    int c = fat_journal_commit(fat_priv);
     FAT_LEAVE();
-    return r;
+    return r ? r : c;
 }
 
 static int fat_mkdir(void *mnt, const char *path)
 {
     FAT_ENTER();
+    fat_journal_begin(fat_priv);
     int r = fat_mkdir_impl(mnt, path);
-    fat_sync();
+    int c = fat_journal_commit(fat_priv);
     FAT_LEAVE();
-    return r;
+    return r ? r : c;
 }
 
 static int fat_unlink(void *mnt, const char *path)
 {
     FAT_ENTER();
+    fat_journal_begin(fat_priv);
     int r = fat_unlink_impl(mnt, path);
-    fat_sync();
+    int c = fat_journal_commit(fat_priv);
     FAT_LEAVE();
-    return r;
+    return r ? r : c;
 }
 
 static int fat_rmdir(void *mnt, const char *path)
 {
     FAT_ENTER();
+    fat_journal_begin(fat_priv);
     int r = fat_rmdir_impl(mnt, path);
-    fat_sync();
+    int c = fat_journal_commit(fat_priv);
     FAT_LEAVE();
-    return r;
+    return r ? r : c;
 }
 
 static int fat_rename(void *mnt, const char *oldpath, const char *newpath)
 {
     FAT_ENTER();
+    fat_journal_begin(fat_priv);
     int r = fat_rename_impl(mnt, oldpath, newpath);
-    fat_sync();
+    int c = fat_journal_commit(fat_priv);
     FAT_LEAVE();
-    return r;
+    return r ? r : c;
 }
 
 static u64 fat_freespace(void *mnt)
@@ -362,12 +370,26 @@ void *fat_mount(struct blkdev *dev)
     }
 
     m->fat_bytes = (u64)m->fatsz * m->bytes_per_sector;
+    /* The whole FAT is loaded into RAM up front.  On the 64 MiB test image that
+     * is a couple of hundred kilobytes and invisible; on a real volume it can be
+     * hundreds of megabytes.  Say how much before starting, otherwise the log
+     * stops at "trying FAT32" and a machine that is merely busy looks wedged. */
+    kprintf("[fat32] %s: loading FAT, %llu sectors (%llu MiB)\n", dev->name, (u64)m->fatsz,
+            m->fat_bytes >> 20);
     m->fat = kmalloc(m->fat_bytes);
     if (!m->fat || blk_io_read(dev, fat_start, m->fatsz, m->fat)) {
         kfree(m->fat);
         kfree(m);
         return NULL;
     }
+
+    /* Lay out the journal in the unused reserved sectors and roll forward
+     * any transaction the last session committed but did not get to apply.
+     * It runs after the FAT load on purpose: replay rewrites FAT sectors,
+     * and m->fat is the image every chain walk and allocation scan below
+     * reads, so the two have to be brought to the same state here, before
+     * anything can look at either. */
+    fat_journal_mount(m);
 
     kprintf("[fat32] mounted %s: %u MiB, %u B/sector x %u/cluster, "
             "root=%u\n",

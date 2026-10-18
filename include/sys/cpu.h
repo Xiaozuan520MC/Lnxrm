@@ -51,6 +51,11 @@ bool cpu_has_smep(void);
 /* CPUID.7.0:EBX.SMAP (bit 20, same register as SMEP) -- same trap: writing
  * CR4.SMAP on a model without it is a reserved-bit #GP. */
 bool cpu_has_smap(void);
+/* CPUID.1:ECX.x2APIC (bit 21): the LAPIC is reachable through MSRs
+ * 0x800 + reg/16.  Required before setting IA32_APIC_BASE.EXTD -- doing
+ * that on a model without the bit is a #GP, which is exactly what QEMU's
+ * bare qemu64 would give us. */
+bool cpu_has_x2apic(void);
 /* Idempotent: set CR0.WP and (when the CPU advertises it) CR4.SMEP and
  * CR4.SMAP on the calling CPU.  The boot asm turns CR0.WP on together with
  * CR0.PG; this is the C-level backstop (BSP cpu_init, every AP ap_main) and

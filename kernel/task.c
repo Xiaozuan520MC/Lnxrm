@@ -73,7 +73,11 @@ int sys_fork(void)
     ch->kstack_top = ch->kstack + KSTACK_SIZE;
     ch->pid = next_pid();
     strcpy(ch->name, current->name);
-    ch->parent = current;
+    /* T-050: record which *incarnation* of the parent this child was born to,
+     * so the link resolves to that task and never to a later squatter that
+     * happens to reuse the slot. */
+    ch->parent_pid = current->pid;
+    ch->parent_gen = current->generation;
     ch->cred = current->cred; /* T-030: fork inherits the parent's tier */
     ch->state = T_EMBRYO;
     ch->pml4 = vmm_new_user_aspace();
@@ -97,6 +101,9 @@ int sys_fork(void)
         if (ch->fds[i]) __sync_fetch_and_add(&ch->fds[i]->refcnt, 1);
     ch->brk_base = current->brk_base;
     ch->brk_cur = current->brk_cur;
+    /* T-094: dup_user_aspace copied every stack page, so the child's stack
+     * occupies the same window -- inherit the low-watermark too. */
+    ch->ustack_lo = current->ustack_lo;
     /* T-032: dup_user_aspace gave the child a frame of its own for every
      * user page, so its account is what its own space measures -- a fresh
      * count, not a copy of a number, and from here on the two accounts
@@ -239,6 +246,11 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     vmm_destroy_user_aspace(old_pml4);
     current->brk_base = (void *)ALIGN_UP(brk_end, PAGE_SIZE);
     current->brk_cur = current->brk_base;
+    /* T-094: the new image's stack was mapped 16 KiB below USER_STACK_TOP
+     * above; record its low-watermark so a deep recursion can grow it.  Set
+     * here, after the point of no return, so a failed execve (which rolls
+     * back to the old aspace) never leaves a stale watermark. */
+    current->ustack_lo = USER_STACK_TOP - 0x4000;
 
     /* T-032: a new image starts a new account (and a new peak).  Counted
      * from the page tables, so it covers the stack loop, the sigreturn
@@ -348,17 +360,23 @@ void sys_exit(int code)
     struct task *init_t = find_task(1);
     int i = 0;
     for (struct task *t = task_iter(&i); t; t = task_iter(&i))
-        if (t != current && t->parent == current) t->parent = init_t;
+        if (t != current && t->parent_pid == current->pid &&
+            t->parent_gen == current->generation) {
+            t->parent_pid = init_t ? init_t->pid : 0;
+            t->parent_gen = init_t ? init_t->generation : 0;
+        }
 
-    /* send SIGCHLD to parent */
-    if (current->parent) send_signal(current->parent, SIGCHLD);
+    /* send SIGCHLD to parent.  Resolve it once so the signal and the wake
+     * below act on the same task even if the slot moves in between. */
+    struct task *pp = task_parent(current);
+    if (pp) send_signal(pp, SIGCHLD);
 
     current->exit_code = code;
     current->state = T_ZOMBIE;
     runqueue_remove(current);
-    if (current->parent && current->parent->state == T_SLEEPING && current->parent->pid != 0) {
-        current->parent->state = T_RUNNABLE;
-        runqueue_add(current->parent);
+    if (pp && pp->state == T_SLEEPING && pp->pid != 0) {
+        pp->state = T_RUNNABLE;
+        runqueue_add(pp);
     }
     schedule();
     for (;;) __asm__ volatile("hlt");
@@ -370,7 +388,10 @@ int sys_waitpid(int wpid, int *ustatus, int opts)
         bool have_kids = false;
         int i = 0;
         for (struct task *t = task_iter(&i); t; t = task_iter(&i)) {
-            if (t == current || t->parent != current) continue;
+            /* T-050: "is t my child" is an incarnation match, not a pointer
+             * compare -- a recycled slot must not look like my offspring. */
+            if (t == current || t->parent_pid != current->pid ||
+                t->parent_gen != current->generation) continue;
             have_kids = true;
             if (wpid > 0 && t->pid != (u32)wpid) continue;
             if (t->state == T_ZOMBIE) {
@@ -555,6 +576,8 @@ int kernel_spawn(const char *path)
     vmm_switch_to(master_pml4_phys());
     t->brk_base = (void *)ALIGN_UP((uptr)t->brk_base, PAGE_SIZE);
     t->brk_cur = t->brk_base;
+    /* T-094: init's stack is the same 16 KiB window; record its low-watermark. */
+    t->ustack_lo = USER_STACK_TOP - 0x4000;
     /* T-032: the spawn twin of sys_execve's refresh -- stack, restorer and
      * image, counted from the tables rather than added up by hand. */
     t->mem_pages = vmm_count_user_pages(t->pml4);
@@ -601,7 +624,7 @@ long sys_ps(struct lnxrm_ps_entry *ubuf, int max)
         if (t->state == T_UNUSED || t->state == T_EMBRYO) continue;
         memset(&e, 0, sizeof(e));
         e.pid = (int32_t)t->pid;
-        e.ppid = t->parent ? (int32_t)t->parent->pid : 0;
+        e.ppid = (int32_t)t->parent_pid; /* T-050: pid half of the link */
         e.cpu = (int32_t)t->cpu_id;
         e.state = (int32_t)t->state;
         e.kind = (int32_t)t->cred.kind; /* T-030 */

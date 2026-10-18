@@ -7,6 +7,7 @@
 #include <console.h>
 #include <boot.h>
 #include <mm/mm.h>
+#include <sys/cpu.h>
 #include <io.h>
 #include <font8x16.h>
 
@@ -269,12 +270,56 @@ static void fbc_esc_process(const char *buf, int len)
     }
 }
 
+/* Move the visible text area up by one text row.
+ *
+ * That is (fbc_rows-1) * pitch * FB_CELL_H bytes -- 8.1 MiB at 1920x1080x32
+ * -- moved on *every* line that reaches the bottom of the screen, i.e.
+ * thousands of times while a boot log runs.  Two things decide whether the
+ * user watches the screen slide or watches it repaint itself from the top
+ * down, and the copy order is not one of them:
+ *
+ *  - the unit of the copy.  lib/string.c's memcpy is a byte-at-a-time loop,
+ *    so this became 8.3 million separate loads against an aperture that
+ *    cannot be cached -- by far the bulk of the cost.  Linux's
+ *    cfb_copyarea() exists for exactly this reason and walks a framebuffer
+ *    32 bits at a time; this walks it 64 bits at a time.
+ *  - the cache type of the LFB: at UC each store is additionally its own
+ *    PCIe write (see fb_lfb_pte_flags()).
+ *
+ * One forward copy over the whole region is correct on the overlap: src =
+ * dst + row_bytes with dst < src, so the byte that would overwrite src[i]
+ * (at dst[i + row_bytes]) has not been reached when src[i] is read.  A
+ * backward copy would smear row content downward. */
+static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
+{
+    volatile u8 *d = dst;
+    const volatile u8 *s = src;
+
+    /* Wide moves only when both ends share an alignment; they normally do
+     * (src - dst is a multiple of 8 for any sane pitch), but a padded pitch
+     * could break it and a mismatched pair would be UB in C. */
+    if (((uptr)d & 7) == ((uptr)s & 7)) {
+        while (n && ((uptr)d & 7)) {
+            *d++ = *s++;
+            n--;
+        }
+        volatile u64 *d64 = (volatile u64 *)(void *)d;
+        const volatile u64 *s64 = (const volatile u64 *)(const void *)s;
+        while (n >= 8) {
+            *d64++ = *s64++;
+            n -= 8;
+        }
+    }
+    while (n--)
+        *d++ = *s++;
+}
+
 static void fbc_scroll(void)
 {
     u32 row_bytes = fb_pitch * FB_CELL_H;
-    for (int r = 0; r < fbc_rows - 1; r++)
-        memcpy((void *)fb_ptr + (u64)r * row_bytes, (void *)fb_ptr + (u64)(r + 1) * row_bytes,
-               row_bytes);
+    if (fbc_rows < 2) return;
+    fb_copy_fwd((volatile void *)fb_ptr, (volatile void *)((volatile u8 *)fb_ptr + row_bytes),
+                (size_t)row_bytes * (fbc_rows - 1));
     /* clear the last text row (pixel-aware: memset would only fit 8bpp) */
     fb_fill_rect(0, (u32)(fbc_rows - 1) * FB_CELL_H, fb_width, FB_CELL_H, fbc_bg);
 }
@@ -363,6 +408,97 @@ void fb_console_get(int *row, int *col, int *rows, int *cols)
     if (cols) *cols = fbc_cols;
 }
 
+/* ---- LFB cache type (see mm.h's cache-type note) ---- */
+
+#define MSR_IA32_PAT          0x00000277
+#define MSR_IA32_MTRR_CAP     0x000000FE
+#define MSR_IA32_MTRR_DEFTYPE 0x000002FF
+#define MSR_IA32_MTRR_BASE    0x00000200 /* +2i base (type in bits 2:0), +2i+1 mask */
+#define MTRR_PHYSMASK         0x000FFFFFFFFFF000ULL
+/* Memory-type encoding, SDM Table 11-10: UC=00h, WC=01h, WT=04h, WP=05h,
+ * WB=06h, UC-=07h (02h/03h reserved).  MTRRs never encode UC-, PAT does --
+ * the two share this table. */
+#define PAT_TYPE_WC 0x01
+
+static const char *const memtype_name[8] = {"UC", "WC", "rsvd", "rsvd", "WT", "WP", "WB", "UC-"};
+
+/* MTRR type of a variable range covering every byte of [pa, pa+len), or -1
+ * if none does.  Fixed ranges reach only below 1 MiB, so they cannot cover an
+ * aperture and are not consulted.  Read-only, deliberately: this kernel still
+ * programs no MTRRs, and retyping a range the firmware owns also retypes
+ * everything else inside it -- an aperture's neighbours are usually register
+ * blocks that must stay UC. */
+static int fb_mtrr_covering(u64 pa, u64 len)
+{
+    u64 cap = rdmsr(MSR_IA32_MTRR_CAP);
+    for (u32 i = 0; i < (u32)(cap & 0xFF); i++) {
+        u64 mask = rdmsr(MSR_IA32_MTRR_BASE + 2 * i + 1) & MTRR_PHYSMASK;
+        if (!mask) continue; /* disabled range */
+        u64 base = rdmsr(MSR_IA32_MTRR_BASE + 2 * i) & MTRR_PHYSMASK;
+        if ((pa & mask) != (base & mask)) continue;
+        if (((pa + len - 1) & mask) != (base & mask)) continue;
+        return (int)(rdmsr(MSR_IA32_MTRR_BASE + 2 * i) & 7);
+    }
+    return -1;
+}
+
+/* PTE cache bits for the LFB, plus a line saying what came of it.
+ *
+ * This used to be a flat UC (PG_PCD|PG_PWT = PAT[3]), justified by "WC would
+ * mean reprogramming IA32_PAT".  It does not have to: a PTE reaches all
+ * eight PAT slots (index = PG_PAT*4 + PG_PCD*2 + PG_PWT), and one of them
+ * normally already holds WC.  Which one is firmware's business, so the MSR is
+ * read rather than a slot number guessed -- IA32_PAT's reset layout is not
+ * the only one out there (QEMU's differs from Intel's).  UC is what a 1080p
+ * console pays for: fbc_scroll() rewrites 8 MiB of the aperture on every line
+ * that reaches the bottom, and at UC that is slow enough to watch happen from
+ * the top of the screen down.
+ *
+ * This only ever *reads* IA32_PAT.  Rewriting it is per logical processor,
+ * and the APs brought up later would still be on the old value -- one CPU
+ * storing to the screen as WC and another as WB is a way to lose pixels, not
+ * a way to be fast.  If no slot holds WC, that is exactly the point at which
+ * programming it becomes necessary, and it stays deliberately undone.
+ *
+ * The MTRR half of the combination is not ours to change either, so report
+ * it: a firmware UC over the aperture wins and the answer is UC again. */
+static u64 fb_lfb_pte_flags(u64 pa, u64 len)
+{
+    u64 pat = rdmsr(MSR_IA32_PAT);
+    int idx = -1;
+    for (int i = 0; i < 8; i++)
+        if (((pat >> (8 * i)) & 0xFF) == PAT_TYPE_WC) {
+            idx = i;
+            break;
+        }
+    if (idx < 0) {
+        kprintf("[fb] IA32_PAT=%016llx holds no WC slot\n", (unsigned long long)pat);
+        kprintf("[fb] LFB cache: -> UC (IA32_PAT would have to be rewritten)\n");
+        return PG_PCD | PG_PWT;
+    }
+
+    int type = -1; /* -1: MTRRs disabled, PAT decides alone */
+    u64 def = rdmsr(MSR_IA32_MTRR_DEFTYPE);
+    if (def & (1ULL << 11)) {
+        type = fb_mtrr_covering(pa, len);
+        if (type < 0) type = (int)(def & 0xFF); /* nothing covers: default type */
+        if (type > 7) type = 0;                 /* reserved encoding: assume UC */
+    }
+    /* PAT=WC against that type: UC and WP win, everything else stays WC.
+     * mm.h's table covers WB/WT/WC/UC; WP is not in it and UC is the safe
+     * reading. */
+    int uc = (type == 0 || type == 5);
+    kprintf("[fb] LFB cache: IA32_PAT[%d]=WC MTRR=%s -> %s\n", idx,
+            type < 0 ? "disabled" : memtype_name[type],
+            uc ? "UC (firmware MTRR, scrolling stays slow)" : "WC (write-combining)");
+
+    u64 flags = 0;
+    if (idx & 1) flags |= PG_PWT;
+    if (idx & 2) flags |= PG_PCD;
+    if (idx & 4) flags |= PG_PAT;
+    return flags;
+}
+
 void fb_init(void)
 {
     struct fb_info *fb = &bootinfo.fb;
@@ -427,11 +563,14 @@ void fb_init(void)
     }
     fb_pitch = fb->pitch;
 
-    /* Map the framebuffer into kernel VA using 4 KiB pages. */
+    /* Map the framebuffer into kernel VA using 4 KiB pages, as
+     * write-combining if the PAT and the firmware's MTRRs allow it (see
+     * fb_lfb_pte_flags() -- it prints what it settled on). */
     u64 pa = fb->phys_addr;
     u64 size = (u64)fb_pitch * fb_height;
+    u64 pte = fb_lfb_pte_flags(pa, size);
     for (u64 off = 0; off < size; off += PAGE_SIZE)
-        vmm_map_kernel_page(FB_VMA + off, pa + off, PG_PCD);
+        vmm_map_kernel_page(FB_VMA + off, pa + off, pte);
 
     fb_front = (volatile u8 *)FB_VMA;
     fb_ptr = fb_front;

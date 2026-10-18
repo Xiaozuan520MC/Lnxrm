@@ -16,6 +16,8 @@
 #include <sys/cpu.h>
 
 #define PD_HI  0x54000UL /* keep in sync with entry64.S */
+#define PD_HI2 0x58000UL /* high-half alias of 1..2 GiB (entry64.S PDPT_HI[511]) */
+#define ACPI_SCRATCH_PD 108 /* ACPI_SCRATCH_VA in sys/acpi.h — keep in sync */
 
 #define USER_SLOT  255
 
@@ -202,6 +204,7 @@ extern void load_cr3(u64);
 void vmm_init(void)
 {
     volatile u64 *pdhi = (volatile u64 *)PHYS_TO_VIRT(PD_HI);
+    volatile u64 *pdhi2 = (volatile u64 *)PHYS_TO_VIRT(PD_HI2);
 
     /* Map EVERY managed physical frame through the high alias. Slots 0..31
      * already hold the kernel image; fill the rest of the buddy/heap range
@@ -230,22 +233,32 @@ void vmm_init(void)
         if (fb_slots > FB_PD_SLOTS) fb_slots = FB_PD_SLOTS;
     }
 
-    /* PMM_WINDOW_TOP, not 3 GiB: past 1 GiB (pa >> 21) & 511 wraps back to
-     * slot 0 and this loop would point the kernel's own alias at foreign
-     * physical memory -- load_cr3() below would then fetch from it. */
+    /* Two page directories, one per GiB of the alias window: PD_HI covers
+     * physical [0,1 GiB) (kernel image + the VGA/device/heap windows carved
+     * out of it), PD_HI2 covers [1 GiB, 2 GiB) and is pure frame alias with
+     * no fixed windows in it.  PHYS_TO_VIRT() is linear, so pa < 1 GiB lands
+     * in PD_HI and pa in [1,2) GiB lands in PD_HI2; past 2 GiB it wraps into
+     * the low canonical half, which is why PMM_WINDOW_TOP stops there. */
     for (u64 pa = lo; pa < hi && pa < PMM_WINDOW_TOP; pa += 0x200000UL) {
         u64 idx = (pa >> 21) & 511;
-        /* Only slots with a window installed by entry64.S (VGA=96,
-         * devices=128) must not double as frame aliases.  Slots 97 and
-         * 112 used to belong to the fixmap window -- that concept is gone
-         * (FIXMAP_VA removed, zero users), so every managed frame gets
-         * its alias again, as this loop's contract demands. */
-        if (idx == 96 || idx == 128)
-            continue; /* VGA / device MMIO windows */
-        if (idx >= FB_PD_BASE && idx < FB_PD_BASE + fb_slots) continue; /* LFB window */
-        if (fb_hi && pa < fb_hi && pa + 0x200000UL > fb_lo)
-            continue; /* LFB page range */
-        pdhi[idx] = pa | PG_P | PG_W | PG_PS;
+        int lo_gib = (pa < 0x40000000UL);
+        volatile u64 *pd = lo_gib ? pdhi : pdhi2;
+        /* Only slots in the low GiB carry a window that must not double as
+         * a frame alias: VGA=96 and devices=128 (installed by entry64.S),
+         * the ACPI bounce page=108 (sys/acpi.h, claimed at runtime by
+         * acpi.c), plus the framebuffer window and its physical page
+         * range, which likewise live below 1 GiB.  PD_HI2 needs no such
+         * filtering: every one of its 512 slots is a plain alias of the
+         * corresponding [1,2) GiB frame. */
+        if (lo_gib) {
+            if (idx == 96 || idx == 128)
+                continue; /* VGA / device MMIO windows */
+            if (idx == ACPI_SCRATCH_PD) continue; /* ACPI table bounce window */
+            if (idx >= FB_PD_BASE && idx < FB_PD_BASE + fb_slots) continue; /* LFB window */
+            if (fb_hi && pa < fb_hi && pa + 0x200000UL > fb_lo)
+                continue; /* LFB page range */
+        }
+        pd[idx] = pa | PG_P | PG_W | PG_PS;
     }
 
     /* kernel heap window (KHEAP_VMA -> PD_HI[256..271], 2 MiB pages) */
@@ -277,9 +290,37 @@ void vmm_map_kernel_page(u64 va, u64 pa, u64 flags)
         if (!pt_pa) panic("vmm: no frame for MMIO pt");
         memset(ptable_ptr(pt_pa), 0, PAGE_SIZE);
         pdhi[pd_idx] = pt_pa | PG_P | PG_W;
+    } else if (pdhi[pd_idx] & PG_PS) {
+        /* The slot holds a 2 MiB page, NOT a page table.  Treating it as one
+         * writes a frame's physical address down as a list of PTEs and maps
+         * whatever those bytes point at -- a silent corruption of whatever
+         * the target happened to be, showing up much later as a fault in an
+         * unrelated place.  The old comment ("callers only target fresh
+         * slots so this is fine") was a promise nothing enforced: slot 128
+         * (DEV_VMA) is a plain PT, but nothing checked it before dereferencing.
+         * Split the large page into 512 x 4 KiB so the same physical
+         * memory stays mapped, then overlay the caller's page. */
+        u64 base = pdhi[pd_idx] & PTE_PA_MASK;
+        /* Keep PCD/PWT where they are (bits 4/3) and move PAT: it is bit 12
+         * of a large-page PDE but bit 7 of a 4 KiB PTE -- and bit 7 is the
+         * same value as PG_PS, so copying the low flags verbatim would read
+         * "large page, PAT=0" as "PAT=1" and change the memory type. */
+        u64 dflags = pdhi[pd_idx] & 0xFFF;
+        u64 pat = (pdhi[pd_idx] & (1UL << 12)) ? PG_PS : 0; /* PG_PS == PTE.PAT */
+        u64 pte_flags = (dflags & ~PG_PS) | pat;
+        u64 pt_pa = pmm_alloc();
+        if (!pt_pa) panic("vmm: no frame to split 2 MiB page");
+        u64 *newpt = ptable_ptr(pt_pa);
+        memset(newpt, 0, PAGE_SIZE);
+        for (int i = 0; i < 512; i++)
+            newpt[i] = (base + (u64)i * PAGE_SIZE) | pte_flags;
+        /* the PDE is now a page *table*, not a leaf: PAT does not apply to
+         * it and leaving PG_PS set would mean "still a large page". */
+        pdhi[pd_idx] = pt_pa | (dflags & ~PG_PS);
+        /* the old mapping is replaced wholesale; flush every TLB entry it
+         * covered rather than the one page we are about to write. */
+        __asm__ volatile("invlpg (%0)" ::"r"((va) & ~0x1fffffUL) : "memory");
     }
-    /* split: if it's a 2 MiB page we must not clobber it;
-     * callers only target fresh slots so this is fine. */
     u64 *pt = ptable_ptr(pdhi[pd_idx] & ~0xfffUL);
     u64 pt_idx = (va >> 12) & 511;
     pt[pt_idx] = (pa & ~0xfffUL) | PG_P | PG_W | flags;

@@ -355,7 +355,9 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         ret = sys_sigprocmask((int)f->rdi, (const u64 *)f->rsi, (u64 *)a3);
         break;
     case SYS_getppid:
-        ret = current->parent ? current->parent->pid : 0;
+        /* T-050: the stored pid half of the link; 0 when there is no parent
+         * (init, or an orphan whose parent was reaped before reparenting). */
+        ret = (int32_t)current->parent_pid;
         break;
     case SYS_ps:
         /* T-031: the process table is an enumeration of everyone else's

@@ -5,6 +5,7 @@
 #include <console.h>
 #include <sys/sched.h>
 #include <sys/percpu.h>
+#include <mm/pagefault.h>
 
 /* ---- keyboard: scancode set 1 -> ASCII ---- */
 /* clang-format off */   /* raw lookup table */
@@ -90,16 +91,40 @@ void serial_rx_handler(struct intr_frame *f)
 static volatile char inbuf[INBUF_SZ];
 static volatile u32 in_r, in_w;
 
-/* Single console reader blocked in console_read(); input_push() wakes
- * it (state T_SLEEPING -> T_RUNNABLE + runqueue_add) after enqueueing. */
-static struct task *volatile con_waiter;
+/* T-054: every task blocked in console_read(), linked through each task's
+ * con_next.  A single slot could only ever hold one reader -- a second arm()
+ * threw the first waiter away, so it fell back on its 1-jiffy timeout instead
+ * of waking on the key, and two looping readers kept overwriting each other.
+ * con_lock guards the list: arm()/disarm() run in process context on any CPU
+ * while input_push() runs in the UART ISR (hence irqsave -- see spinlock.h).
+ * The lock, not a `volatile` head, is what orders access (the old code had
+ * no lock and relied on `volatile` plus a 1-jiffy timeout to stay honest). */
+static spinlock_t con_lock = SPINLOCK_INIT;
+static struct task *con_waiters;
 
 void console_waiter_arm(struct task *t)
-{ con_waiter = t; }
+{
+    u64 flags;
+    spin_lock_irqsave(&con_lock, &flags);
+    t->con_next = con_waiters;
+    con_waiters = t;
+    spin_unlock_irqrestore(&con_lock, flags);
+}
 
 void console_waiter_disarm(struct task *t)
 {
-    if (con_waiter == t) con_waiter = NULL;
+    u64 flags;
+    spin_lock_irqsave(&con_lock, &flags);
+    struct task **pp = &con_waiters;
+    while (*pp) {
+        if (*pp == t) {
+            *pp = t->con_next;
+            t->con_next = NULL;
+            break;
+        }
+        pp = &(*pp)->con_next;
+    }
+    spin_unlock_irqrestore(&con_lock, flags);
 }
 
 void input_push(char c)
@@ -108,11 +133,25 @@ void input_push(char c)
     inbuf[in_w] = c;
     __atomic_store_n(&in_w, (in_w + 1) % INBUF_SZ, __ATOMIC_SEQ_CST);
 
-    struct task *w = con_waiter;
-    if (w && w->state == T_SLEEPING) {
-        con_waiter = NULL;
-        w->state = T_RUNNABLE;
-        runqueue_add(w);
+    /* T-054: wake *every* reader, not whoever held the single slot.  Detach
+     * the whole chain under the lock, then wake outside it so con_lock is
+     * never held across runqueue_add().  The readers race for the byte; a
+     * loser finds the queue empty, arms again and sleeps -- which is exactly
+     * the wait the old code could only satisfy by timeout. */
+    u64 flags;
+    spin_lock_irqsave(&con_lock, &flags);
+    struct task *w = con_waiters;
+    con_waiters = NULL;
+    spin_unlock_irqrestore(&con_lock, flags);
+
+    while (w) {
+        struct task *next = w->con_next;
+        w->con_next = NULL;
+        if (w->state == T_SLEEPING) {
+            w->state = T_RUNNABLE;
+            runqueue_add(w);
+        }
+        w = next;
     }
 }
 
@@ -157,7 +196,15 @@ void isr_common(struct intr_frame *f)
 
     if (f->intno < 32) {
         u64 cr2 = 0;
-        if (f->intno == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        if (f->intno == 14) {
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            /* T-090: try to RESOLVE the fault (lazy stack growth) before
+             * reporting or killing.  Only a user-mode fault is a candidate;
+             * a kernel #PF (a bug) or an unfixable fault falls through to
+             * the safe report+kill below.  A fixed fault is silent -- iretq
+             * simply retries the instruction, now that the page exists. */
+            if ((f->cs & 3) == 3 && page_fault_try_fix(f, cr2)) return;
+        }
         kprintf("\n[exception] %s (%d) err=%#lx rip=%#lx rsp=%#lx cr2=%#lx\n",
                 exc_names[f->intno & 31], f->intno, f->err, f->rip, f->ussp, cr2);
         if (f->intno == 14) {

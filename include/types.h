@@ -39,6 +39,21 @@ typedef intptr_t iptr;
 #define VGA_VMA   0xffffffff8c000000UL /* PD_HI[96]     */
 #define DEV_VMA   0xffffffff90000000UL /* PD_HI[128]    */
 #define KHEAP_VMA 0xffffffffa0000000UL /* PD_HI[256...] */
+
+/* The PD slot of a high-half window is (VMA >> 21) & 511.  These asserts pin
+ * the comment above to reality: the slot numbers were once 98/97 in a stale
+ * comment and nothing caught it.  If a VMA moves, the matching page-directory
+ * wiring in entry64.S must move too -- and this fails the build if it is
+ * forgotten.  (Macro because types.h is included from both C and C++ TUs.) */
+#define PD_SLOT_OF(vma) (((vma) >> 21) & 511)
+#ifdef __cplusplus
+#define LNXRM_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define LNXRM_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+LNXRM_STATIC_ASSERT(PD_SLOT_OF(VGA_VMA) == 96, "VGA_VMA must sit in PD_HI[96]");
+LNXRM_STATIC_ASSERT(PD_SLOT_OF(DEV_VMA) == 128, "DEV_VMA must sit in PD_HI[128]");
+LNXRM_STATIC_ASSERT(PD_SLOT_OF(KHEAP_VMA) == 256, "KHEAP_VMA must sit in PD_HI[256]");
 /* high window base = KERNEL_VMA - KERNEL_LMA */
 #define PHYS_TO_VIRT(p) ((uptr)(p) + 0xffffffff80000000UL)
 #define VIRT_TO_PHYS(v) ((uptr)(v) - 0xffffffff80000000UL)

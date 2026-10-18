@@ -9,6 +9,13 @@ struct part_dev {
     struct blkdev *parent;
     u32 start_lba;
     u32 size_sectors;
+    /* The name lives in the object that uses it, not in a file-scope buffer.
+     * blkdev.name is a plain pointer, and one `static char[16]` meant every
+     * partition of every device resolved to the *same* string: enumerate two
+     * partitions (or a second disk) and the mount table and the logs start
+     * reporting one name for all of them.  It also ties the string's
+     * lifetime to the blkdev that points at it. */
+    char name[16];
 };
 
 static int part_read(struct blkdev *dev, u64 lba, u32 count, void *buf)
@@ -104,14 +111,13 @@ int mbr_get_partition(struct mbr_info *mbr, int index, struct blkdev *out_dev,
     pd->size_sectors = mbr->parts[index].sectors_count;
 
     /* Build name manually since kernel doesn't have snprintf */
-    static char part_name_buf[16];
     int nlen = 0;
     const char *src = parent->name;
-    while (*src && nlen < 12) part_name_buf[nlen++] = *src++;
-    part_name_buf[nlen++] = '0' + index + 1;
-    part_name_buf[nlen] = 0;
+    while (*src && nlen < 12) pd->name[nlen++] = *src++;
+    pd->name[nlen++] = '0' + index + 1;
+    pd->name[nlen] = 0;
 
-    out_dev->name = part_name_buf;
+    out_dev->name = pd->name;
     out_dev->sector_size = parent->sector_size;
     out_dev->num_sectors = mbr->parts[index].sectors_count;
     out_dev->read = part_read;
@@ -119,7 +125,7 @@ int mbr_get_partition(struct mbr_info *mbr, int index, struct blkdev *out_dev,
     out_dev->drv = pd;
 
     kprintf("[mbr] partition %d: start_lba=%u size_sectors=%u -> %s\n", index, pd->start_lba,
-            pd->size_sectors, part_name_buf);
+            pd->size_sectors, pd->name);
 
     return 0;
 }

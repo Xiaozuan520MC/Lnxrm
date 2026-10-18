@@ -197,7 +197,12 @@ int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
             break;
         }
         memcpy(tmp + sec_off, (const u8 *)buf + done, chunk);
-        if (fat_write_sector(m, lba, tmp)) {
+        /* File data, not metadata: this bypasses the journal and goes to
+         * the write-back cache, which fat_journal_commit() flushes *before*
+         * it stamps the commit -- ordered mode.  Logging data bytes too
+         * would double every write and buy no structural consistency; the
+         * FAT chain and the dirent below are what keep the file coherent. */
+        if (fat_write_sector_raw(m, lba, tmp)) {
             fat_warn_io(m, "write data", lba);
             rc = LNXRM_EIO;
             break;

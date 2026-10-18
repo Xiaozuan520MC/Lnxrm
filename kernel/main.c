@@ -8,6 +8,7 @@
 #include <pci.h>
 #include <io.h>
 #include <sys/apic.h>
+#include <sys/acpi.h>
 #include <sys/percpu.h>
 #include <sys/smp.h>
 #ifdef CONFIG_KTEST
@@ -26,7 +27,8 @@ static void do_global_ctors(void)
     for (size_t i = 0; &__init_array_start[i] < __init_array_end; i++) __init_array_start[i]();
 }
 
-/* Rust side hooks (rust/lib.rs) */
+/* Spawn a task from a kernel path (defined in task.c; was once also the
+ * hook Rust's lib.rs called -- the Rust component is gone as of 2026-10-17) */
 int kernel_spawn(const char *path);
 
 bool kern_text_ptr(u64 p)
@@ -100,7 +102,15 @@ static void boot_read_vbe(void)
     if (grub_params_pa) {
         const struct screen_lfb *si =
             (const struct screen_lfb *)(u64)grub_params_pa;
-        bootinfo.fb.phys_addr = (u64)si->lfb_base | ((u64)si->ext_lfb_base << 32);
+        /* The high half of the address is meaningful ONLY when the loader
+         * advertised VIDEO_CAPABILITY_64BIT_BASE; otherwise those four bytes
+         * at 0x3a are whatever the firmware left there, and OR-ing them in
+         * would hand fb_init() a wild physical address to map (Linux gates
+         * this the same way: screen_info.__screen_info_lfb_base()). */
+        u64 phys = si->lfb_base;
+        if (si->capabilities & VIDEO_CAPABILITY_64BIT_BASE)
+            phys |= (u64)si->ext_lfb_base << 32;
+        bootinfo.fb.phys_addr = phys;
         bootinfo.fb.width = si->lfb_width;
         bootinfo.fb.height = si->lfb_height;
         bootinfo.fb.pitch = si->lfb_linelength;
@@ -227,7 +237,7 @@ void start_kernel(void)
 
     boot_collect_e820();
 
-    kprintf("\nlnxrm v0.08-TEST -- x86-64\n");
+    kprintf("\nlnxrm v0.09 --x86-64\n");
     kprintf("[boot] %d usable e820 entries\n", bootinfo.map_len);
 
     /* Physical memory map straight from e820: one line per region, then a
@@ -307,9 +317,24 @@ void start_kernel(void)
     pmm_reserve(128UL << 21, 129UL << 21);
     pmm_reserve(256UL << 21, 272UL << 21);
 
+    /* Slot 108 (216..218 MiB) is ACPI_SCRATCH_VA's home (sys/acpi.h):
+     * vmm_init() keeps it out of the alias loop so acpi.c can re-point it
+     * at firmware table pages, so the frames behind it have no high-half
+     * alias either and must stay out of the buddy — same rule as the
+     * VGA/device windows above.  Live as soon as RAM passes 216 MiB,
+     * i.e. always on real hardware (-m 256 stays under it). */
+    pmm_reserve(108UL << 21, 109UL << 21);
+
     pmm_init();
     vmm_init();
     kheap_init();
+    /* RSDP/MADT before cpu_init(): ioapic_init() takes the IOAPIC address
+     * from the MADT, and smp_init() (further down) enumerates APs from it.
+     * The RSDP read is direct (below 1 MiB); the tables themselves are
+     * copied through the bounce window in acpi.c — real firmware parks
+     * them above the identity window, where a plain dereference is a wild
+     * read.  Runs after vmm_init() because it needs vmm_map_kernel_page. */
+    acpi_init();
     cpu_init();
     pit_init(HZ);
 
@@ -335,6 +360,17 @@ void start_kernel(void)
         kprintf("[vfs] disk mounted at /\n");
     else
         kprintf("[vfs] no disk found\n");
+
+    /* A disk that mounted is not a disk that can boot.  A FAT32 data disk
+     * with no /bin/init on it mounts perfectly and then has nothing to
+     * start -- the same dead end as no disk at all, one step later.  When
+     * that happens, or when there is no disk at all, fall back to the
+     * initramfs that `make INITRAMFS=` linked into this image.  A build
+     * without one carries an empty .initramfs section, vfs_mount_initramfs()
+     * answers ENOENT, and this changes nothing. */
+    if (!vfs_root_ready() || !vfs_file_exists("/bin/init")) {
+        if (vfs_mount_initramfs() == 0) kprintf("[vfs] initramfs mounted at /\n");
+    }
 
     do_global_ctors();
 

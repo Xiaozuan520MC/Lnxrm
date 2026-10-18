@@ -14,8 +14,8 @@
 |---|---|
 | 全量构建耗时（`make -B -j8` 强制重建） | **1.4–2.3 秒** |
 | 构建可复现性 | 设 `SOURCE_DATE_EPOCH` 后**逐字节可复现**（3 次重建 SHA256 全同）；默认构建仅 1 字节的 uname 构建时间戳不同（见 §14.3） |
-| 产物 `bzImage` | 162,200 字节（2026-10-06 C71/C72 修复重编；`--gc-sections` 前是 254,920） |
-| 工具链 | gcc 15.2.0 / binutils 2.46 / nasm 3.01 / rustc 1.97.1 / python 3.14.4 |
+| 产物 `bzImage` | 105,688 字节（2026-10-18 夜 ACPI 黑屏修复后非 KTEST 干净构建、0 警告、`SOURCE_DATE_EPOCH` 3× 同 SHA；10-06 记载 162,200、`--gc-sections` 前 254,920，链条见 `CODEBASE.md` §1.2/§33.4） |
+| 工具链 | gcc 15.2.0 / binutils 2.46 / nasm 3.01 / python 3.14.4（Rust 工具链已随组件于 2026-10-18 移除） |
 | 模拟器 | QEMU 10.2.1 |
 | 调试器 | gdb（带完整源码级符号） |
 | 需要的额外工具 | `mtools`（`mcopy`/`mmd`）、`dosfstools`（`mkfs.vfat`） |
@@ -31,12 +31,11 @@
 | 工具 | 实测版本 | 用途 | Debian/Ubuntu 包 |
 |---|---|---|---|
 | `gcc` | 15.2.0 | C 编译（内核 + 用户态） | `gcc` |
-| `g++` | 15.2.0 | C++ 编译（`smp.cpp` `ahci.cpp`） | `g++` |
+| `g++` | 15.2.0 | ~~C++ 编译~~ 2026-10-18 C++ 清零（`smp.cpp`→`kernel/smp.c`）后**不再参与构建**，本行留档 | `g++` |
 | `ld` | 2.46 | 内核链接（`-T arch/kernel.ld`） | `binutils` |
 | `objcopy` | 2.46 | 3 处：ELF→bin、trampoline bin→obj、复制的 usr ELF | `binutils` |
 | `nm` | 2.46 | `patch_setup_jmp.py` 查符号 | `binutils` |
 | `nasm` | 3.01 | 4 个汇编源文件 | `nasm` |
-| `rustc` | 1.97.1 | Rust 组件 → staticlib | `rustc` |
 | `python3` | 3.14.4 | 2 个二进制补丁脚本 | `python3` |
 
 ### 1.2 必需的系统工具（构建磁盘镜像用）
@@ -58,8 +57,9 @@
 ### 1.4 一键安装（Debian/Ubuntu）
 
 ```sh
-sudo apt install gcc g++ binutils nasm rustc python3 \
+sudo apt install gcc binutils nasm python3 \
                  dosfstools mtools qemu-system-x86 gdb
+# g++ 已非必需（2026-10-18 C++ 清零）；装了也不再被用到
 ```
 
 ### 1.5 交叉编译
@@ -77,7 +77,7 @@ CC := $(CROSS)gcc
 make CROSS=x86_64-linux-gnu-
 ```
 
-**但 rustc 不跟着 `CROSS` 走**（`Makefile:6` 是裸 `RUSTC := rustc`），所以真正的交叉编译需要额外处理。这一项目前未支持。
+**2026-10-18**：Rust 组件移除后工具链已无 rustc，"rustc 不跟着 `CROSS` 走"的顾虑随 `RUSTC` 变量一并消失；交叉编译这一项目前仍未支持。
 
 ---
 
@@ -108,7 +108,7 @@ make imageiso               # → build/lnxrm.iso（暂存树 build/iso/）
 
 ### ⚠️ 最大的坑：`make` 不生成磁盘镜像
 
-默认目标 `all: $(BUILD)/bzImage`（`Makefile:68`）**只构建内核**。磁盘镜像是 `run` 目标的依赖（`Makefile:158`），不是 `all` 的依赖。
+默认目标 `all: $(BUILD)/bzImage`（`Makefile:46`）**只构建内核**。磁盘镜像是 `run` 目标的依赖（`Makefile:130-134`），不是 `all` 的依赖。
 
 后果：`make clean && make` 之后直接 `qemu-system-x86_64 ... -drive file=build/disk.img` 会**立即失败**：
 
@@ -123,17 +123,21 @@ qemu-system-x86_64: -drive file=build/disk.img,format=raw,if=ide:
 
 ## 3. 构建系统架构
 
-### 3.1 四组编译标志
+> **2026-10-18（晚）**：单文件 `Makefile`（原 241 行）拆分为根 `Makefile`（194 行：全局配置 + 对象装配 + 链接/镜像/运行/冒烟）与 `arch/Makefile`（23 行）、`kernel/Makefile`（10 行）、`usr/Makefile`（25 行）三个同名片段。根在 `Makefile:48-50` 用 `include` **串联**——共享同一变量空间、单遍 `-j`、KTEST 戳记与 `.d` 依赖照旧；`all`（`Makefile:46`）必须先于 include 声明（片段有显式目标会抢默认目标）。**行为零变化**：`SOURCE_DATE_EPOCH` 构建与拆分前 SHA256 逐字节一致（§14.3）、smoke 179/179、产物尺寸不变。三片段文件头均注明"不能单独 make"。
 
-`Makefile:32-47` 定义了四套完全不同的标志，每一套都有明确的设计理由。
+### 3.1 编译标志
+
+`Makefile:33-41` 定义现行**两套**标志（内核 C、用户态），每一套都有明确的设计理由。
+（2026-10-18 之前另有 `CXXFLAGS` 与 `RUSTFLAGS` 两组；C++ 随 `smp.cpp`→`smp.c` 清零、
+Rust 组件同日移除，两组均已从 Makefile 拆除，小节按历史留档。）
 
 #### 内核 C（`KERNFLAGS`）
 
 ```make
 BASEFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
              -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
-             -O2 -g $(WARN) -Iinclude -Iinclude/cpp -I. -MMD -MP \
-             -ffunction-sections -fdata-sections
+             -O2 -g $(WARN) -Iinclude -I. -MMD -MP \
+             -ffunction-sections -fdata-sections $(KTEST_DEFS)
 KERNFLAGS := $(BASEFLAGS) -std=gnu11
 ```
 
@@ -148,24 +152,32 @@ KERNFLAGS := $(BASEFLAGS) -std=gnu11
 | `-O2 -g` | 优化 + **完整调试信息**（gdb 能看到源码行，见 §11） |
 | `-std=gnu11` | 允许 GNU 扩展（语句表达式等） |
 | `-MMD -MP` | 生成头文件依赖，见 §12 |
-| `-ffunction-sections -fdata-sections` | 每个函数/数据独占一个段，让链接器 `--gc-sections` 能按可达性裁剪（见 §4.4）。没有它，Rust staticlib 的整个 `core` 会拖进镜像，**约 70% 的 `.image` 是死代码**（2026-10-01 加） |
+| `-ffunction-sections -fdata-sections` | 每个函数/数据独占一个段，让链接器 `--gc-sections` 能按可达性裁剪（见 §4.4）。没有它，Rust staticlib 的整个 `core` 会拖进镜像，**约 70% 的 `.image` 是死代码**（2026-10-01 加；**2026-10-18**：Rust staticlib 已删除，死代码构成改变，开关仍保留） |
 
-#### 内核 C++（`CXXFLAGS`）
+#### ~~内核 C++（`CXXFLAGS`）~~（2026-10-18 随 C++ 清零拆除，下方留档）
 
-```make
+> **2026-10-18**：`kernel/smp.cpp` 改写为纯 C 的 `kernel/smp.c` 后全仓 C++ 清零，
+> `CXXFLAGS` 变量、`CXX` 工具链、`%.opp` 规则与 `-Iinclude/cpp` 均从 Makefile 移除，
+> 构建不再需要 `g++`。原标志表按历史留档；其中 `-nostdinc++` 一行提到的
+> `kernel/mm/kheap.cpp` 亦已纯 C 化为 `kheap.c`。
+
+```make（历史）：
 CXXFLAGS := $(BASEFLAGS) -std=c++20 -fno-exceptions -fno-rtti \
             -fno-threadsafe-statics -fno-use-cxa-atexit -nostdinc++
 ```
 
-| 标志 | 理由 |
+| 标志 | 理由（历史） |
 |---|---|
 | `-fno-exceptions` | 没有 unwinder（没有 `.eh_frame`，`kernel.ld:48` 把它 discard 了），抛异常会跳到不存在的代码 |
 | `-fno-rtti` | 去掉 vtable/typeinfo 生成 |
 | `-fno-threadsafe-statics` | 静态局部变量的 guard 变量需要 `__cxa_guard_acquire` |
 | `-fno-use-cxa-atexit` | 不生成 `__cxa_atexit`，所以 `main.c:21-24` **手动遍历 `__init_array`** 调全局构造函数 |
-| `-nostdinc++` | 不引入 libstdc++ 头文件。代价：必须自己提供 `operator new`（见 `kernel/mm/SlabAllocator.cpp`） |
+| `-nostdinc++` | 不引入 libstdc++ 头文件。代价：必须自己提供 `operator new`（见 `kernel/mm/kheap.cpp:179`） |
 
-#### Rust（`RUSTFLAGS`）
+#### ~~Rust（`RUSTFLAGS`）~~（2026-10-18 随组件移除，下方留档）
+
+> **2026-10-18**：Rust 组件整体删除，`RUSTFLAGS`/`RUSTC`/`liblnxrm.a` 规则与 `rust`
+> 目标均已从 Makefile 去掉，构建不再需要任何 Rust 工具链。原标志表按历史留档。
 
 ```make
 RUSTFLAGS := --crate-type staticlib --edition 2021 -C panic=abort -C opt-level=s \
@@ -199,7 +211,7 @@ USRFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie -O2 \
 | `-nostdlib -nostartfiles` | 不用任何 libc，也不用 crt1.o。入口是自己写的 `init/crt0.S` |
 | `-static` | **必须是静态链接** —— 内核的 `elf_load` 不支持 `ET_DYN`/PIE，也不做动态链接 |
 | `-mcmodel=large` | 用户程序链接在 `0x7f8000400000`（`USER_TEXT_VMA`），超出 `small`（±2 GiB）和 `kernel`（高半）的假设 |
-| `-Wl,-Ttext=0x7f8000400000` | `Makefile:151`，把 `.text` 固定到用户地址空间 |
+| `-Wl,-Ttext=0x7f8000400000` | `usr/Makefile:25`，把 `.text` 固定到用户地址空间 |
 | `-Iinit` | 找到 `ulib.h` |
 | `-idirafter include` | 让 `ulib.h` 里的 `#include <abi/lnxrm_abi.h>` 能找到（`abi/` 在 `include/` 下） |
 
@@ -212,11 +224,10 @@ all (默认) ──► build/bzImage
                  │   └─ build/vmlinux.elf        （为了 patch_setup_jmp.py 查符号）
                  └─ build/vmlinux.bin
                      └─ build/vmlinux.elf
-                         ├─ build/**/*.o + build/**/*.opp
-                         │   └─ kernel/**/*.c, kernel/**/*.cpp, arch/*.S
-                         ├─ arch/kernel.ld
-                         └─ build/liblnxrm.a
-                             └─ kernel/rust/*.rs（整体编，单文件 crate）
+                         ├─ build/**/*.o
+                         │   └─ kernel/**/*.c, arch/*.S
+                         └─ arch/kernel.ld
+                             （2026-10-18 前另有 build/liblnxrm.a ← kernel/rust/*.rs）
 
 run ──► usr + build/bzImage + build/disk.img
          │
@@ -229,27 +240,31 @@ run ──► usr + build/bzImage + build/disk.img
 
 ### 3.3 源文件发现
 
-`Makefile:51-57` 用 `$(shell find ...)` **自动发现源文件**：
+2026-10-18（晚）拆分后：`kernel/Makefile`、`arch/Makefile`、`usr/Makefile` 各自用 `$(shell find ...)` **自动发现本目录源文件**（根 `Makefile:48-50` 用 `include` 串联，共享同一变量空间；下列各行标注所属片段）：
 
 ```make
-KSRC_C   := $(shell find kernel arch -name '*.c')
-KSRC_CXX := $(shell find kernel arch -name '*.cpp')
-KASM_ALL := $(shell find arch -name '*.S')
+# kernel/Makefile:1-2
+KERN_SRC_C  := $(shell find kernel -name '*.c' 2>/dev/null)
+KTEST_SRC_C := $(if $(KTEST_DIR),$(shell find $(KTEST_DIR) -name '*.c' 2>/dev/null))   # KTEST_DIR 见 §3.4
+# （历史注记：KSRC_CXX 的 C++ 行 2026-10-18 随 C++ 清零删除；RUST_SRC 的 Rust 行同日随 Rust 组件删除）
+# arch/Makefile:1-2 与 :4
+KASM_ALL := $(shell find arch -name '*.S' 2>/dev/null)
 KASM     := $(filter-out arch/trampoline.S,$(KASM_ALL))   # ← trampoline 特殊处理
-RUST_SRC := $(shell find kernel/rust -name '*.rs')
-USR_ALL_C:= $(shell find usr -maxdepth 1 -name '*.c')
-UIMG     := $(patsubst usr/%.c,%,$(USR_ALL_C))
+ARCH_SRC_C  := $(shell find arch -name '*.c' 2>/dev/null)
+# usr/Makefile:1-2
+USR_ALL_C := $(shell find usr -maxdepth 1 -name '*.c')
+UIMG      := $(patsubst usr/%.c,%,$(USR_ALL_C))
 ```
 
 **含义：新增内核 `.c` 文件不需要改 Makefile**，放进去 `make` 就会编。
 
 新增用户态 `.c` 也自动生效 —— 每个 `usr/*.c` 都是一个独立程序。
 
-⚠️ **注意 `arch/trampoline.S` 被显式排除**在 `KASM` 之外，因为它的目标文件名不是 `build/arch/trampoline.o` 而是 `build/trampoline.o`（为了 `objcopy` 处理），`Makefile:87` 单独加了这个目标。
+⚠️ **注意 `arch/trampoline.S` 被显式排除**在 `KASM` 之外，因为它的目标文件名不是 `build/arch/trampoline.o` 而是 `build/trampoline.o`（为了 `objcopy` 处理），`arch/Makefile:12` 单独加了这个目标。
 
 ### 3.4 KTEST 开关（自测套件的可选编译）
 
-`Makefile:29-45`：**默认不编译** `ktest/` 套件，`make KTEST=1` 才把它编进内核。
+`Makefile:24-31`：**默认不编译** `ktest/` 套件，`make KTEST=1` 才把它编进内核。
 
 ```make
 KTEST ?= 0
@@ -265,10 +280,10 @@ endif
 | 用法 | 效果 |
 |---|---|
 | `make`（默认 `KTEST=0`） | `ktest/` 不进源列表；`kernel/main.c` 的 `ktest_run()` 调用点全部包在 `#ifdef CONFIG_KTEST` 里。镜像约小一半（87 KB vs 带套件 ≈179 KB），启动串口零 `[ktest]` 行 |
-| `make KTEST=1` | `find kernel arch $(KTEST_DIR)`（`Makefile:61-62`）把 `ktest/*.c` 纳入源列表，`-DCONFIG_KTEST=1` 挂进 `BASEFLAGS`（`Makefile:45`，C/C++ 共用），启动时自动跑全部用例 |
-| `make smoke` | **自动强制 `KTEST=1`**（`Makefile:191-192`：先把 `MAKEFLAGS` 里的 `KTEST=%` 滤掉再以 `KTEST=1` 调起脚本——smoke 校验的 `[ktest]` 标记只有这个模式才有）。`make KTEST=0 smoke` 同样生效，且不会把模式戳记带偏 |
+| `make KTEST=1` | `KTEST_DIR := ktest` 让 `kernel/Makefile:1-2` 的两行 `find` 把 `ktest/*.c` 纳入源列表，`-DCONFIG_KTEST=1` 经 `KTEST_DEFS` 挂进 `BASEFLAGS`（`Makefile:36`，内核侧），启动时自动跑全部用例 |
+| `make smoke` | **自动强制 `KTEST=1`**（`Makefile:141-143`：先把 `MAKEFLAGS` 里的 `KTEST=%` 滤掉再以 `KTEST=1` 调起脚本——smoke 校验的 `[ktest]` 标记只有这个模式才有）。`make KTEST=0 smoke` 同样生效，且不会把模式戳记带偏 |
 
-⚠️ **模式戳记 `build/.ktest-mode-$(KTEST)`**（`Makefile:80-85`）：所有 `.o` 依赖它——翻转开关会触发戳记重建，强制**全量重编**，防止两种模式的对象文件混装（残留的 `CONFIG_KTEST` 宏会让符号对不上）。戳记规则必须排在 `all:` 之后，否则它会抢成 make 的默认目标。
+⚠️ **模式戳记 `build/.ktest-mode-$(KTEST)`**（`Makefile:61-66`）：所有 `.o` 依赖它——翻转开关会触发戳记重建，强制**全量重编**，防止两种模式的对象文件混装（残留的 `CONFIG_KTEST` 宏会让符号对不上）。默认目标 `all:`（`Makefile:46`）必须声明在 `include`（`Makefile:48-50`）之前——片段里有显式目标（如 `arch` 的 `trampoline.bin`），排在 `all` 前会抢走 make 的默认目标。
 
 **断言基础设施不随开关走**：计数器与 `selftest_case_failed` / `selftest_bug_seen` 在 `kernel/selftest.c`（始终编译），extern 声明在 `include/console.h`；`ktest/ktest.c` 只剩 harness 本体（`KTEST=1` 才编）——所以 `KTEST=0` 的镜像里这些符号仍然存在，链接不缺。
 
@@ -276,7 +291,7 @@ endif
 
 ## 4. 内核构建阶段详解
 
-### 4.1 单文件规则（`Makefile:100-108`）
+### 4.1 单文件规则（`kernel/Makefile:7-10`）
 
 ```make
 $(BUILD)/%.o: %.c | $(BUILD)
@@ -284,17 +299,16 @@ $(BUILD)/%.o: %.c | $(BUILD)
 	@printf "  CC      %@\n"
 	@$(CC) $(KERNFLAGS) -MMD -MP -c -o $@ $<
 
-$(BUILD)/%.opp: %.cpp | $(BUILD)
-	@mkdir -p $(dir $@)
-	@printf "  CXX     %@\n"
-	@$(CXX) $(CXXFLAGS) -MMD -MP -c -o $@ $<
+# 2026-10-18 随 C++ 清零删除（历史，留档）：
+# $(BUILD)/%.opp: %.cpp | $(BUILD)
+# 	@$(CXX) $(CXXFLAGS) -MMD -MP -c -o $@ $<
 ```
 
 - `%.o: %.c` 模式规则 + `@mkdir -p $(dir $@)` ⇒ **目录结构自动创建**，不需要手写 `build/kernel/fs/fat32/` 之类
 - `@printf` 而不是 `echo` ⇒ 构建输出干净可读，且 `@` 抑制命令回显
-- 目标后缀 `.opp` 用来区分 C++ 的 `.o`（否则模式规则会混淆）
+- ~~目标后缀 `.opp` 用来区分 C++ 的 `.o`（否则模式规则会混淆）~~（2026-10-18 起全仓无 C++ 源，`.opp` 已不存在）
 
-### 4.2 汇编规则（`Makefile:95-98`）
+### 4.2 汇编规则（`arch/Makefile:20-23`）
 
 ```make
 $(BUILD)/arch/%.o: arch/%.S | $(BUILD)
@@ -303,7 +317,7 @@ $(BUILD)/arch/%.o: arch/%.S | $(BUILD)
 
 `-F dwarf -g` 让汇编也有调试信息，gdb 里能看汇编源码。
 
-### 4.3 trampoline 的两段式处理（`Makefile:83-93`）
+### 4.3 trampoline 的两段式处理（`arch/Makefile:8-18`）
 
 这是构建链里最特别的一段。`arch/trampoline.S` 必须在运行时被 `memcpy` 到物理 `0x8000`（AP trampoline 地址），但它同时要参与链接。
 
@@ -322,32 +336,32 @@ $(BUILD)/trampoline.o: $(BUILD)/trampoline.bin
 	                                        # ② 包成带 .trampoline 段的 ELF 对象
 ```
 
-`objcopy -I binary` 会为输入文件生成三个符号：`_binary_<路径>_start/_end/_size`。`--redefine-sym` 把它们改名成 `trampoline_start` / `trampoline_end` / `trampoline_size`，这样 `kernel/smp.cpp:15-16` 就能用：
+`objcopy -I binary` 会为输入文件生成三个符号：`_binary_<路径>_start/_end/_size`。`--redefine-sym` 把它们改名成 `trampoline_start` / `trampoline_end` / `trampoline_size`，这样 `kernel/smp.c:29-30` 就能用：
 
-```cpp
+```c
 extern u8 trampoline_start[];
 extern u8 trampoline_end[];
 ```
 
 `--rename-section .data=.trampoline` 把裸二进制的段名改成 `.trampoline`，**让 `kernel.ld` 的 `*(.text .text.*)` 之类的通配不影响它**（否则会被塞进 `.image`）。
 
-### 4.4 链接（`Makefile:110-114`）
+### 4.4 链接（`Makefile:90-94`）
 
 ```make
-$(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld $(BUILD)/liblnxrm.a
+$(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld
 	@$(LD) -T $(ARCHDIR)/kernel.ld --gc-sections -o $@ $(KOBJ) \
-	      $(BUILD)/liblnxrm.a -Map $(BUILD)/vmlinux.map \
+	      -Map $(BUILD)/vmlinux.map \
 	      --no-warn-rwx-segments
 ```
 
 - `-T arch/kernel.ld` 用自定义链接脚本
-- `--gc-sections` 配合编译期的 `-ffunction-sections/-fdata-sections`，把没有可达引用的段直接扔掉。**实测把 `.image` 从 253,472 缩到 ~77,000 字节（省 ~177 KB，约 70%）** —— 大头是 Rust staticlib 拖进来的 `core::text`（compiler_builtins、unicode 表、浮点格式化），这台内核一行都调不到。注意 `arch/kernel.ld` 必须 `KEEP(*entry64.o(.text.prologue))`：`scripts/patch_setup_jmp.py` 要用 `nm` 查 `_start32`/`_start64` 的符号值来回填 setup 扇区里的远跳转，段被 GC 掉脚本就失败
+- `--gc-sections` 配合编译期的 `-ffunction-sections/-fdata-sections`，把没有可达引用的段直接扔掉。**实测把 `.image` 从 253,472 缩到 ~77,000 字节（省 ~177 KB，约 70%）** —— 大头是 Rust staticlib 拖进来的 `core::text`（compiler_builtins、unicode 表、浮点格式化），这台内核一行都调不到（**2026-10-18**：Rust staticlib 删除后死代码构成已变，`--gc-sections` 仍保留）。注意 `arch/kernel.ld` 必须 `KEEP(*entry64.o(.text.prologue))`：`scripts/patch_setup_jmp.py` 要用 `nm` 查 `_start32`/`_start64` 的符号值来回填 setup 扇区里的远跳转，段被 GC 掉脚本就失败
 - `-Map build/vmlinux.map` 生成链接映射。**排查符号地址、段布局很有用**：`grep <symbol> build/vmlinux.map`
 - `--no-warn-rwx-segments` 抑制警告，因为单一连续段必然是 **RWE**（见 §9.1）
 
-**注意 Rust staticlib 放在最后** —— 这样 C 符号可以覆盖 Rust 的，反之不行。
+~~**注意 Rust staticlib 放在最后** —— 这样 C 符号可以覆盖 Rust 的，反之不行。~~（**2026-10-18**：Rust staticlib 已从链接移除，此顺序规则作废。）
 
-### 4.5 导出裸二进制（`Makefile:116-118`）
+### 4.5 导出裸二进制（`Makefile:96-98`）
 
 ```make
 $(BUILD)/vmlinux.bin: $(BUILD)/vmlinux.elf
@@ -358,7 +372,7 @@ $(BUILD)/vmlinux.bin: $(BUILD)/vmlinux.elf
 
 因为 `kernel.ld` 里 `.image : AT(KERNEL_LMA)` 把 LMA 设为 `0x100000`，导出的裸二进制**从物理地址 `0x100000` 开始**，可以直接和 `setup.bin` 拼接。
 
-### 4.6 setup.bin（`Makefile:120-124`）
+### 4.6 setup.bin（`Makefile:100-104`）
 
 ```make
 $(BUILD)/setup.bin: $(ARCHDIR)/setup.asm $(BUILD)/vmlinux.elf | $(BUILD)
@@ -374,7 +388,7 @@ $(BUILD)/setup.bin: $(ARCHDIR)/setup.asm $(BUILD)/vmlinux.elf | $(BUILD)
 
 ⚠️ 第 3 步依赖 `vmlinux.elf`，所以这个目标依赖 `vmlinux.elf`——但**只为了查符号**。这形成了一条 `setup.asm → vmlinux.elf` 的依赖边。
 
-### 4.7 拼接与打补丁（`Makefile:126-131`）
+### 4.7 拼接与打补丁（`Makefile:106-111`）
 
 ```make
 $(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/vmlinux.bin
@@ -383,30 +397,33 @@ $(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/vmlinux.bin
 	@printf "  SIZE    %s bytes\n" $$(stat -c%s $@)
 ```
 
-`cat` 拼接后调 `patch_bzimage.py` 填 boot protocol 头。**实测输出**：
+`cat` 拼接后调 `patch_bzimage.py` 填 boot protocol 头。**实测输出**（2026-10-18 最终构建）：
 
 ```
   BZIMAGE build/bzImage
-  PATCH   build/bzImage
-          setup_sects = 4 (header byte 0x03)
-          syssize     = 16283 paragraphs (260520 payload bytes)
-  SIZE    262568 bytes
+  SIZE    105688 bytes
 ```
+
+> 在库 WIP 登记（2026-10-18）：现行 `scripts/patch_bzimage.py` 新增 `init_size`（0x260）
+> 回填——取 setup.asm 的 4 MiB 下限与「payload 上取 2 MiB + 2 MiB headroom」的较大者，
+> 防止 GRUB 按此字段预留窗口时把镜像截断；同时原 `PATCH`/`setup_sects`/`syssize`
+> 三行打印被注释为静默（`scripts/patch_bzimage.py:87-92`）。头部实测值（脚本外读取）：
+> `setup_sects=3`、`syssize=6454` paragraphs（103,264 payload bytes）。
 
 ---
 
 ## 5. 用户态与磁盘镜像
 
-### 5.1 用户态程序（`Makefile:133-151`）
+### 5.1 用户态程序（`usr/Makefile:7-25`）
 
 ```make
-$(USR_OBJDIR)/crt0.o: init/crt0.S
+$(USR_OBJDIR)/crt0.o: init/crt0.S | $(BUILD)
 	@$(NASM) -f elf64 -o $@ $<
 
-$(USR_OBJDIR)/ulib.o: init/ulib.c
+$(USR_OBJDIR)/ulib.o: init/ulib.c | $(BUILD)
 	@$(CC) $(USRFLAGS) -MMD -MP -c -o $@ $<
 
-$(USER_ELFS): $(BUILD)/usr/%: $(USR_OBJDIR)/%.o $(USR_OBJDIR)/ulib.o $(USR_OBJDIR)/crt0.o
+$(USER_ELFS): $(BUILD)/usr/%: $(USR_OBJDIR)/%.o $(USR_OBJDIR)/ulib.o $(USR_OBJDIR)/crt0.o | $(BUILD)
 	@$(CC) $(USRFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
 ```
 
@@ -419,14 +436,14 @@ crt0.o  ← 入口（init/crt0.S）
 
 用 `$(CC)`（gcc）而不是 `ld` 驱动链接，是为了自动带上 crtbegin/crtend 之类的包装 —— 虽然 `-nostartfiles` 已经禁掉了它们，`gcc` 仍负责传递正确的 `-L`/`-dynamic-linker`（本项目不需要后者）。
 
-`USER_LINK_BASE = 0x7f8000400000`（`Makefile:49`），对应 `USER_TEXT_VMA`（`include/types.h:51`）。
+`USER_LINK_BASE = 0x7f8000400000`（`Makefile:43`），对应 `USER_TEXT_VMA`（`include/types.h:51`）。
 
-### 5.2 磁盘镜像（`Makefile:204-212`）
+### 5.2 磁盘镜像（`Makefile:176-189`）
 
 ```make
 $(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
 	@dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	@mkfs.vfat -F 32 $@ 2>/dev/null
+	@mkfs.vfat -F 32 -R 1024 $@ >/dev/null 2>/dev/null
 	@mcopy -i $@ $(BUILD)/README.md ::README.md
 	@mmd -i $@ ::bin
 	@for f in $(USER_ELFS); do \
@@ -441,8 +458,9 @@ $(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
 ⚠️ 几个注意点：
 - `dd` 用 `2>/dev/null` 抑制进度输出（`64M` 会刷屏）
 - `mkfs.vfat` 的 stderr 也被抑制，因为会问一堆确认
+- `-R 1024`：保留 1024 扇区（512 KiB）——本内核把崩溃一致性日志放在保留区 8..reserved-1，mkfs 默认的 32 扇区只够 ~11 条记录（见 `Makefile:179-183` 注释）
 - 镜像是 `build/disk.img`，属于构建产物（`make clean` 会删除）
-- `build/README.md` 由 `Makefile:214-215` 的一个 `echo` 生成（`|| order` 保证每次都重建，因为它是 phony-ish 依赖）
+- `build/README.md` 由 `Makefile:191-192` 的一个 `echo` 生成（目标带 order-only 依赖 `| $(BUILD)`，先保证 `build/` 存在）
 
 **验证镜像内容**：
 ```sh
@@ -507,7 +525,8 @@ assert payload_off >= 4 * 512               # 至少 4 扇区（2 KiB）
 
 这些断言保证任何加载器（SeaBIOS / GRUB / syslinux）算出的 payload 偏移都和我们一致。
 
-**输出示例**（实测）：
+**输出示例**（历史实测——2026-10-18 起该脚本三行打印被注释为静默，现行头部值见 §4.7 的
+在库 WIP 登记）：
 ```
   PATCH   build/bzImage
           setup_sects = 4 (header byte 0x03)
@@ -566,7 +585,7 @@ assert payload_off >= 4 * 512               # 至少 4 扇区（2 KiB）
 | `__kernel_start` / `__kernel_end` | `kernel/main.c:35-37`（`kern_text_ptr`）| 判断地址是否在内核文本区 |
 | `__bss_start` / `__bss_end` | `entry64.S:269-274` | 启动时清零 |
 | `__boot_stack_top` | `entry64.S:279` | 启动栈顶 |
-| `__init_array_start` / `__init_array_end` | `main.c:18-24` | 手动调 C++ 全局构造函数 |
+| `__init_array_start` / `__init_array_end` | `main.c:22-27` | `do_global_ctors()` 手动遍历全局构造数组（2026-10-18 C++ 清零后已无可跑的构造函数，**现为空转**，登记为后续清理候选） |
 | `LOADADDR(.image)` / `SIZEOF(.image)` | `patch_setup_jmp.py`（经 `nm`） | 算 payload 起始 |
 
 ### 7.3 查段布局
@@ -593,7 +612,7 @@ run: usr $(BUILD)/bzImage $(BUILD)/disk.img
 
 | 参数 | 作用 | 注意 |
 |---|---|---|
-| `-m 256` | 256 MiB 内存 | 内核把管理窗口钳在 **`PMM_WINDOW_TOP` = 1 GiB** 以下（`include/mm/mm.h:20`）。要复现真机类问题得用 `-m 2048`（见 §8.3） |
+| `-m 256` | 256 MiB 内存 | 内核把管理窗口钳在 **`PMM_WINDOW_TOP` = 2 GiB** 以下（`include/mm/mm.h:22`，恒等映射/高半别名现铺 0..2 GiB）。要复现真机类问题得用 `-m 2048`（见 §8.3） |
 | `-smp 2` | **两个 vCPU** | 触发 SMP 路径。⚠️ 会暴露并发缺陷（比如 C1） |
 | `-kernel build/bzImage` | 用 QEMU 的 `linuxboot` 加载器 | **走 setup.asm 路径**（0x6F00 哨兵 = 0） |
 | `-drive if=ide` | IDE 磁盘 | ⚠️ **AHCI 路径在 `make run` 下完全没被测过** |
@@ -627,7 +646,7 @@ make imageiso            # → build/lnxrm.iso（13,342,720 B）
 
 * 暂存树 `build/iso/`（`boot/bzImage` + `boot/grub/grub.cfg`），产物 `build/lnxrm.iso`
   —— **所有中间文件都在 `build/` 里**，源码树一个字节都不写，`make clean` 一并清掉。
-* `grub.cfg` 是 **Makefile 生成的**（`Makefile:176`），所以 `make clean && make imageiso`
+* `grub.cfg` 是 **Makefile 生成的**（`Makefile:147`），所以 `make clean && make imageiso`
   也能一次跑通，不依赖仓库里有没有模板文件。
 * 依赖 `grub-mkrescue`（`grub-pc-bin` / `grub2-pc`）+ `xorriso`；缺了会打印安装提示而不是
   留半成品——目标上有 `.DELETE_ON_ERROR`。
@@ -641,7 +660,7 @@ qemu-system-x86_64 -m 2048 -smp 2 -cpu qemu64,+smep,+smap -display none \
   -serial stdio -no-reboot
 ```
 
-**生成的 `grub.cfg`**（`Makefile:176-190`）：
+**生成的 `grub.cfg`**（`Makefile:147-161`）：
 
 ```
 serial --unit=0 --speed=115200
@@ -720,7 +739,7 @@ done
 
 ### 9.1 串口日志（最常用）
 
-内核所有 `kprintf` 走 Rust 的 UART 驱动 → `-serial` 指定的目标。
+内核所有 `kprintf` 走串口驱动（`kernel/drivers/uart.c`；2026-10-18 前为 Rust `uart.rs`）→ `-serial` 指定的目标。
 
 ```sh
 # 终端直接看
@@ -890,17 +909,17 @@ quit
 
 ### 10.1 依赖机制
 
-`Makefile:218`：
+`Makefile:194`：
 ```make
--include $(KOBJ_C:.o=.d) $(KOBJ_CXX:.opp=.d) $(USR_ALL_C:usr/%.c=$(USR_OBJDIR)/%.d)
+-include $(KOBJ_C:.o=.d) $(USR_ALL_C:usr/%.c=$(USR_OBJDIR)/%.d)
 ```
 
-配合 `-MMD -MP`（`Makefile:34`），gcc 为每个 `.o` 生成同名的 `.d` 文件。
+配合 `-MMD -MP`（`Makefile:35`），gcc 为每个 `.o` 生成同名的 `.d` 文件。
 
 **实测产物**：
 ```
 build/arch/cpu.d
-build/kernel/ansi.d
+build/kernel/acpi.d
 build/kernel/apic.d
 build/kernel/elf.d
 ...
@@ -920,9 +939,12 @@ $ make | wc -l
 
 依赖跟踪有效：`types.h` 被几乎所有文件包含，所以大面积重编。
 
-### 10.2 `FORCE` 目标
+### 10.2 `FORCE` 目标（已移除，历史留档）
 
-`Makefile:59-60`：
+> **2026-10-18 复核**：`FORCE` / `.PHONY: FORCE` 两行现 Makefile 中**已不存在**
+> （于更早的上传中移除），本节仅留档说明该技巧。以下按历史引用理解：
+
+`Makefile:59-60`（历史）：
 ```make
 FORCE:
 .PHONY: FORCE
@@ -1010,19 +1032,21 @@ nm build/vmlinux.elf | grep -E '_start(32|64)'        # 确认符号存在
 |---|---|
 | `bad header magic at 0x202` | `setup.asm` 的 `HdrS` 魔数被破坏了 |
 | `bad boot flag at 0x1FE` | `0x55AA` 被破坏 |
-| `payload_off must be a multiple of 512` | `setup.bin` 的补零逻辑（`Makefile:123`）被改了 |
+| `payload_off must be a multiple of 512` | `setup.bin` 的补零逻辑（`Makefile:103`）被改了 |
 | `setup must be at least 4 sectors` | `setup.asm` 缩小到 2 KiB 以下 |
 
 **排查**：`xxd -s 0x1f0 -l 32 build/bzImage` 看头部区域。
 
-### 12.4 Rust 编译失败
+### ~~12.4 Rust 编译失败~~（2026-10-18 随组件移除，留档）
+
+> **2026-10-18**：Rust 组件已删，构建不需要 rustc——本节排障路径作废，正文留档。
 
 ```sh
 rustup update                    # 确认 rustc 版本
 rustc --version
 ```
 
-⚠️ `Makefile:6` 是裸 `RUSTC := rustc`，不受 `CROSS` 影响。如果 PATH 里的 `rustc` 是别的 toolchain 的 wrapper，可能出问题。用 `make RUSTC=/path/to/rustc`。
+⚠️ ~~`Makefile:6` 是裸 `RUSTC := rustc`，不受 `CROSS` 影响。如果 PATH 里的 `rustc` 是别的 toolchain 的 wrapper，可能出问题。用 `make RUSTC=/path/to/rustc`。~~（**2026-10-18**：Rust 组件整体移除，`RUSTC` 变量已不存在，本条仅留档。）
 
 **已知限制**：`--target x86_64-unknown-none` 需要对应 target 的 `core` 库。如果报找不到 `core`，说明 `rust-std` 没装：
 ```sh
@@ -1045,17 +1069,20 @@ rm -f build/setup.bin build/bzImage && make
 
 **原因**：某处没加 `-fno-stack-protector`。
 
-**解决**：检查该文件的编译规则。`BASEFLAGS`（`Makefile:32`）里已经有了，所以通常是新加的构建规则忘了继承。
+**解决**：检查该文件的编译规则。`BASEFLAGS`（`Makefile:33`）里已经有了，所以通常是新加的构建规则忘了继承。
 
 ### 12.7 链接错误：`undefined reference to '_start'`
 
-**原因**：用户态链接缺 `crt0.o`。`Makefile:133` 的规则已经包含它。
+**原因**：用户态链接缺 `crt0.o`。`usr/Makefile:22` 的规则已经包含它。
 
 **解决**：确认目标走的是 `$(USER_ELFS)` 规则而不是手写的链接命令。
 
-### 12.8 C++ 链接错误：`undefined reference to 'operator new'`
+### 12.8 ~~C++ 链接错误：`undefined reference to 'operator new'`~~（历史，2026-10-18 起不可复现）
 
-**原因**：`kernel/mm/SlabAllocator.cpp` 没被编进来。
+> **2026-10-18**：C++ 组件清零（`kheap.cpp`→`kheap.c`、`smp.cpp`→`smp.c`）后，链接里已无
+> `operator new` 语义，`.opp` 与 `*.cpp` 均不存在。以下按历史留档：
+
+**原因（历史）**：`kernel/mm/kheap.cpp`（提供 `operator new`）没被编进来。
 
 **排查**：
 ```sh
@@ -1069,7 +1096,7 @@ grep SlabAllocator build/vmlinux.map
 **可能原因**：
 1. 磁盘镜像不存在（但那样 QEMU 会先报错）
 2. IDE 探测失败 —— 检查 `[ide]` 开头的日志
-3. `mkfs.vfat` 失败 —— `Makefile:207` 把 stderr 抑制了，手动验证：
+3. `mkfs.vfat` 失败 —— `Makefile:184` 把 stderr 抑制了，手动验证：
    ```sh
    rm -f build/disk.img && make build/disk.img
    # 如果 mkfs.vfat 报错，去掉 2>/dev/null 看真实错误
@@ -1176,7 +1203,7 @@ static inline long kmyfunc(long a, long b)
 
 ### 13.4 加一个头文件
 
-放 `include/` 下即可，`-Iinclude` 和 `-Iinclude/cpp` 已在 `BASEFLAGS` 里。
+放 `include/` 下即可，`-Iinclude` 已在 `BASEFLAGS` 里（`-Iinclude/cpp` 已随 2026-10-18 C++ 清零拆除）。
 
 ⚠️ **如果新头文件定义了新的地址空间常量**，要同步更新 `kernel/mm/vmm.c:17-18`（`PD_HI`/`PT_FIX`）—— 那两个常量和 `arch/entry64.S:4-10` 的页表物理地址**必须手工保持同步**，编译器不会检查。
 
@@ -1184,7 +1211,7 @@ static inline long kmyfunc(long a, long b)
 
 `arch/setup.asm` 的 4 遍级联（`VBE_TRY_MODE 1920,1080` / `1280,720` → 8bpp → 枚举最大）。
 
-⚠️ 改完**必须重建 `setup.bin`**，但因为 `setup.asm` 是真实依赖，make 会自动处理（`Makefile:120` 有 `$(ARCHDIR)/setup.asm` 依赖）。
+⚠️ 改完**必须重建 `setup.bin`**，但因为 `setup.asm` 是真实依赖，make 会自动处理（`Makefile:100` 有 `$(ARCHDIR)/setup.asm` 依赖）。
 
 ---
 
@@ -1194,26 +1221,26 @@ static inline long kmyfunc(long a, long b)
 
 ```
 Entry point 0xffffffff8010010e
-There are 4 program headers
+There are 3 program headers, starting at offset 64
 
+Program Headers:
   Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
-  LOAD           0x001000 0xffffffff80100000 0x0000000000100000 0x03db18 0x03db18 RWE 0x1000
-  LOAD           0x001000 0xffffffff8013e000 0x000000000013d8a0 0x000000 0x063010 RW  0x1000
-  LOAD           0x03eb18 0xffffffff8013db18 0x000000000013db18 0x0000b0 0x0000b0 RW  0x1000
+  LOAD           0x001000 0xffffffff80100000 0x0000000000100000 0x019358 0x019358 RWE 0x1000
+  LOAD           0x001000 0xffffffff8011a000 0x00000000001192c0 0x000000 0x064720 RW  0x1000
   GNU_STACK      0x000000 0x0000000000000000 0x0000000000000000 0x000000 0x000000 RW  0x10
 
  Section to Segment mapping:
-  00     .image .got
-  01     .bss
-  02     .got.plt .trampoline
-  03
+  Segment Sections...
+   00     .image .trampoline
+   01     .bss
+   02
 ```
 
-解读：
-- 第 1 段 252,696 字节 = 代码 + rodata + data（`.image` 252,064 + `.got` 632），**RWE**（单一连续段的设计代价）
-- 第 2 段 `.bss` 405,520 字节（≈396 KB），`FileSiz=0`（不占文件）
-- 第 3 段 176 字节 = `.got.plt`（24）+ `.trampoline`（152，AP trampoline）
-- **`.bss` 396 KB 主要来自**：`ap_stacks[8][32 KiB]`（256 KB，`smp.cpp`）、`task_table[64]`（62 KB，每槽 992 字节）、`blk_cache[64]`（33.5 KB）、`cpu_table[8]`（8 KB，已不含 idle 栈）、`ring_buf` 与 `idt` 各 4 KB
+解读（**2026-10-18 最终构建**实测）：
+- 第 1 段 103,256 字节 = `.image` 103,104 + `.trampoline` 152（`FileSiz=Memsiz`，**RWE**——单一连续段的设计代价）
+- 第 2 段 `.bss` 411,424 字节（≈402 KB），`FileSiz=0`（不占文件）；`__bss_start 0xffffffff8011a000` → `__bss_end 0xffffffff8017e720`
+- 旧版的第 3 段（`.got.plt` 24 + `.trampoline` 152）已并入第 1 段，`.got`/`.got.plt` 段不复存在——程序头 4 → 3
+- **`.bss` ≈402 KB 主要来自**：`ap_stacks[8][32 KiB]`（256 KB，`smp.c`）、`task_table[64]`（65 KB，每槽 1,040 字节）、`cache`（即 blk_cache，34 KB，64 × 544 B）、`cpu_table[8]`（10.5 KB，每槽 1,344 B，已不含 idle 栈）、`ring_buf` 与 `idt` 各 4 KB（`nm -S --size-sort` 实测；比上一版口径大头不变、槽位因结构体字段增长而变大）
 
 ### 14.2 构建耗时
 
@@ -1227,16 +1254,19 @@ There are 4 program headers
 ### 14.3 可复现性
 
 唯一的字节级变量是 `uname.version` 里嵌的构建时间戳（`__DATE__` +
-`__TIME__`，`kernel/syscall.c:77`）：不设环境变量时相邻两次重建恰好
+`__TIME__`，`kernel/syscall.c:212`）：不设环境变量时相邻两次重建恰好
 相差 1 个字节（时间戳的秒位）。固定 `SOURCE_DATE_EPOCH` 后 gcc 会钉死
 这两个宏，构建恢复逐字节可复现::
 
     export SOURCE_DATE_EPOCH=1767225600
     make -B -j8     # 连续 3 次，SHA256 完全相同
 
-    run 1  d191bba5f58c707d032bd92c5643c896
-    run 2  d191bba5f58c707d032bd92c5643c896
-    run 3  d191bba5f58c707d032bd92c5643c896
+    run 1  00cbd44220acbebc06471b30e79e6c857b98eb71eb4fc5cc8c792d67a184fad8
+    run 2  00cbd44220acbebc06471b30e79e6c857b98eb71eb4fc5cc8c792d67a184fad8
+    run 3  00cbd44220acbebc06471b30e79e6c857b98eb71eb4fc5cc8c792d67a184fad8
+
+（2026-10-18 最终构建复测：3 次全同、单次 1.7 秒、0 警告；旧示例
+`d191bba5…` 为 2026-10-06 口径留档。）
 
 其余构建链（`-frandom-seed`、链接顺序、`ar` 归档顺序）已验证稳定。
 ⚠️ 这个结论依赖于它们未被改动。如果将来引入 LTO、新的时间戳或并行
@@ -1250,12 +1280,20 @@ There are 4 program headers
 | `build/vmlinux.elf` | — | 带符号和调试信息，GDB 用 |
 | `build/vmlinux.bin` | 160,152 | 纯 payload（按 LMA 导出） |
 | `build/setup.bin` | 2,048 | 真模式 setup（补零后） |
-| `build/liblnxrm.a` | — | Rust 组件 |
 | `build/vmlinux.map` | — | 链接映射，排符号地址用 |
 | `build/disk.img` | 67,108,864 | 64 MiB FAT32 镜像 |
 | `build/usr/<16 个>` | — | 静态用户态 ELF |
 | `build/**/*.d` | — | 头文件依赖 |
 | `build/qemu.log` | ~25,420 行 | `make run` 产生的中断跟踪 |
+
+> **2026-10-18 非 KTEST 干净构建重测**（0 警告）：`bzImage` **102,840**、`vmlinux.bin` **100,792**、
+> `vmlinux.elf` 589,848（`.image` 100,640、`.bss` 409,600）、`setup.bin` 2,048。Rust staticlib
+> 删除后 `.image` 大幅缩水；表中为 2026-10-06 记载。
+>
+> **2026-10-18（最终，`smp.c` 375 行卡死修复后）非 KTEST 干净构建**（0 警告，四份文档最终
+> 口径）：`bzImage` **105,304**、`vmlinux.bin` **103,256**、`vmlinux.elf` 603,840
+> （`.image` 103,104 + `.trampoline` 152、`.bss` 411,424）、`setup.bin` 2,048、
+> `disk.img` 67,108,864；上一行为当日早些口径，保留作历史。
 
 ### 14.5 工具链版本矩阵
 
@@ -1263,10 +1301,9 @@ There are 4 program headers
 
 | 工具 | 版本 |
 |---|---|
-| gcc / g++ | 15.2.0 (Ubuntu 15.2.0-16ubuntu1) |
+| gcc（g++ 同版本但 2026-10-18 起不参与构建） | 15.2.0 (Ubuntu 15.2.0-16ubuntu1) |
 | GNU ld / objcopy / nm | 2.46 |
 | NASM | 3.01 |
-| rustc | 1.97.1 |
 | Python | 3.14.4 |
 | QEMU | 10.2.1 |
 | 操作系统 | Ubuntu（`x86_64`） |

@@ -1,0 +1,375 @@
+/* SMP initialization: AP startup via INIT-SIPI-SIPI, per-CPU setup.
+ *
+ * Pure C since 2026-10-18 (the C++ smp.cpp + smp.hpp smp::Manager shell
+ * were folded into this file and include/sys/smp.h).  The bring-up logic
+ * gained three real-hardware fixes in the same move:
+ *   1. APs are enumerated from the ACPI MADT (acpi.c) when available —
+ *      probing APIC IDs 1..N only works on QEMU, where IDs are contiguous;
+ *      real machines have topology-encoded IDs with holes and the old
+ *      "2 consecutive failures -> stop" probe gave up before ever trying
+ *      the second core (single-core boot on real hardware).
+ *   2. A failed AP startup now sends a recovery INIT and clears the
+ *      shared block, so a slow AP can never wake up during the NEXT
+ *      attempt and consume that attempt's ap_id (two cores, one logical
+ *      id).  The whole attempt — wait included — runs under smp_lock.
+ *   3. cpu_table has a single initializer: ap_main itself.  The BSP no
+ *      longer pre-fills slots for APs it has not started yet. */
+#include <sys/smp.h>
+#include <sys/apic.h>
+#include <sys/acpi.h>
+#include <sys/percpu.h>
+#include <mm/mm.h>
+#include <sys/cpu.h>
+#include <console.h>
+#include <sys/sched.h>
+#include <io.h>
+#include <sys/spinlock.h>
+
+/* Trampoline entry/exit (arch/trampoline.S) */
+extern u8 trampoline_start[];
+extern u8 trampoline_end[];
+
+/* ---- Per-AP kernel stacks ---- */
+static u8 ap_stacks[MAX_CPUS][KSTACK_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
+/* ---- Spinlock for serializing AP startups ---- */
+static spinlock_t smp_lock = SPINLOCK_INIT;
+
+/* ---- SMP state ---- */
+static u32 s_online_count = 1; /* BSP is always online */
+static u32 s_next_cpu_id = 1;
+
+/* ---- Trampoline shared data (was kernel/rust/smp.rs, folded in 2026-10-17) ----
+ * The block arch/trampoline.S reads at physical 0x9000 -- layout documented
+ * with struct trampoline_data in sys/smp.h, must match the assembly exactly
+ * (8 × u64).  The struct's fields are volatile, so plain assignments are
+ * already ordered accesses; the two SeqCst fences are the ones the Rust
+ * original issued: the BSP fills the block then fences BEFORE the IPI can
+ * carry it away, and the AP fences BEFORE raising `ready` so everything it
+ * initialized is visible to the BSP first. */
+static inline struct trampoline_data *tramp(void)
+{
+    return (struct trampoline_data *)TRAMPOLINE_DATA_PHYS;
+}
+_Static_assert(sizeof(struct trampoline_data) == 64,
+               "shared block is 8 u64 fields (trampoline.S offsets)");
+
+void trampoline_setup(u64 pml4, u64 stack_top, u32 ap_id, u64 gdt_packed, u64 ap_main_va)
+{
+    struct trampoline_data *p = tramp();
+    p->page_dir = pml4;
+    p->stack_top = stack_top;
+    p->ready = 0;
+    p->ap_id = ap_id;
+    p->gdt_packed = gdt_packed;
+    p->ap_main_va = ap_main_va;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+u32 trampoline_is_ready(void)
+{
+    return tramp()->ready != 0;
+}
+
+void trampoline_signal_ready(void)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    tramp()->ready = 1;
+}
+
+void trampoline_clear(void)
+{
+    struct trampoline_data *p = tramp();
+    p->page_dir = 0;
+    p->stack_top = 0;
+    p->ready = 0;
+    p->ap_id = 0;
+    p->gdt_packed = 0;
+    p->ap_main_va = 0;
+    p->_rsvd0 = 0;
+    p->_rsvd1 = 0;
+}
+
+/* ---- Helpers ---- */
+/* mdelay() lives in arch/cpu.c (TSC-calibrated — see lapic_timer_calibrate). */
+
+/* Build the AP GDT at physical 0x8800 (for trampoline transition only). */
+static void setup_ap_gdt(void)
+{
+    u64 *gdt = (u64 *)AP_GDT_PHYS;
+    gdt[0] = 0x0000000000000000ULL; /* null */
+    gdt[1] = 0x00CF9A000000FFFFULL; /* 32-bit kernel code */
+    gdt[2] = 0x00CF92000000FFFFULL; /* kernel data */
+    gdt[3] = 0x00AF9A000000FFFFULL; /* 64-bit kernel code */
+    gdt[4] = 0x00CF92000000FFFFULL; /* kernel data (LM) */
+}
+
+/* Copy trampoline code to low memory and clear the shared data block. */
+static void copy_trampoline(void)
+{
+    u32 len = (u32)(trampoline_end - trampoline_start);
+    memcpy((void *)TRAMPOLINE_CODE_PHYS, trampoline_start, len);
+    trampoline_clear();
+    setup_ap_gdt();
+}
+
+/* Send INIT-SIPI-SIPI to a specific AP and wait for readiness — the WHOLE
+ * attempt (including the timeout poll) under smp_lock.  The wait used to
+ * run after the unlock, which is what let a slow AP wake up in the middle
+ * of the NEXT attempt and consume that attempt's shared block.
+ * Returns true if AP became ready within timeout. */
+static bool ap_startup(u32 apic_id, u32 cpu_id, u64 pml4_phys)
+{
+    u64 flags;
+    spin_lock_irqsave(&smp_lock, &flags);
+
+    /* Fill the shared data block before any IPI leaves */
+    u64 stack_top = (u64)&ap_stacks[cpu_id][KSTACK_SIZE];
+    u64 gdt_packed = (u64)AP_GDT_LIMIT | ((u64)AP_GDT_PHYS << 16);
+    /* Pass the VIRTUAL address of ap_main — the function's code references
+     * globals via high-half RIP-relative addressing, so calling via physical
+     * address would break all data accesses. */
+    u64 ap_main_va = (u64)ap_main;
+
+    trampoline_setup(pml4_phys, stack_top, cpu_id, gdt_packed, ap_main_va);
+
+    /* INIT IPI (level assert) */
+    apic_send_init_ipi(apic_id);
+    mdelay(10);
+
+    /* SIPI: vector 0x08 => physical 0x8000 (trampoline start) */
+    apic_send_sipi(apic_id, 0x08);
+    mdelay(2);
+
+    /* Second SIPI if AP hasn't responded yet */
+    if (!trampoline_is_ready()) {
+        apic_send_sipi(apic_id, 0x08);
+        mdelay(2);
+    }
+
+    /* Third SIPI attempt (some hardware needs it) */
+    if (!trampoline_is_ready()) {
+        apic_send_sipi(apic_id, 0x08);
+        mdelay(2);
+    }
+
+    /* Wait for AP to signal ready (polling with timeout) */
+    for (u32 i = 0; i < AP_STARTUP_TIMEOUT_MS && !trampoline_is_ready(); i++)
+        mdelay(1);
+
+    bool ok = trampoline_is_ready() != 0;
+    if (!ok) {
+        /* The poll above has 1 ms granularity and the recovery INIT below
+         * resets the core unconditionally — look once more before firing
+         * it, in case `ready` flipped in the last tick. */
+        if (trampoline_is_ready()) {
+            ok = true;
+        } else {
+            /* This attempt failed.  A slow AP may still be MID-FLIGHT: it
+             * would wake after we moved on, read the NEXT attempt's block
+             * and claim the wrong logical id.  INIT parks any such core
+             * back in Wait-for-SIPI (x2APIC-supported delivery, same as
+             * xAPIC), and clearing the block wipes the stale state. */
+            apic_send_init_ipi(apic_id);
+            mdelay(10);
+            trampoline_clear();
+        }
+    }
+
+    spin_unlock_irqrestore(&smp_lock, flags);
+    return ok;
+}
+
+/* ---- Reschedule IPI handler ---- */
+static void reschedule_ipi_handler(void)
+{
+    /* Record the request; isr_common() runs sched_maybe_preempt() when
+     * returning to ring 3 (or the interrupted idle loop calls
+     * schedule() itself after hlt), so the idle CPU actually picks up
+     * whatever runqueue_add() just put on its queue. */
+    this_cpu_data()->need_resched = true;
+}
+
+/* ---- Stop IPI handler ---- */
+static void stop_ipi_handler(void)
+{
+    /* Halt this CPU indefinitely. */
+    for (;;) { __asm__ volatile("cli; hlt"); }
+}
+
+/* ---- SMP bring-up (called once, on the BSP) ---- */
+
+void smp_init(void)
+{
+    u64 pml4 = master_pml4_phys();
+    copy_trampoline();
+
+    /* Register IPI handlers */
+    ipi_handler_install(IPI_VECTOR_RESCHEDULE, reschedule_ipi_handler);
+    ipi_handler_install(IPI_VECTOR_STOP, stop_ipi_handler);
+
+    kprintf("[smp] BSP online, APIC ID=%u\n", apic_get_id());
+
+    s_next_cpu_id = 1;
+    s_online_count = 1;
+
+    /* Two enumeration strategies:
+     *   MADT (acpi.c) — the architecturally correct list; required on real
+     *     hardware, where APIC IDs have topology-encoded holes the probe
+     *     below would give up on (2 consecutive failures -> stop);
+     *   probe — sequential IDs 1..N with the same 2-fail rule, kept for
+     *     boots without ACPI (and as the historical QEMU path).
+     * Logical CPU ids are handed out from s_next_cpu_id on SUCCESS only:
+     * a failed attempt never consumes a slot. */
+    u32 ids[MAX_CPUS];
+    u32 n = acpi_collect_ap_ids(ids, MAX_CPUS);
+    u32 bsp_id = apic_get_id();
+
+    if (n > 0) {
+        for (u32 i = 0; i < n && s_next_cpu_id < MAX_CPUS; i++) {
+            if (ids[i] == bsp_id) continue; /* skip ourselves */
+            if (ap_startup(ids[i], s_next_cpu_id, pml4)) {
+                s_next_cpu_id++;
+                s_online_count++;
+            }
+        }
+    } else {
+        u32 consecutive_fails = 0;
+        for (u32 try_id = 1; try_id < MAX_CPUS && consecutive_fails < 2; try_id++) {
+            if (ap_startup(try_id, s_next_cpu_id, pml4)) {
+                s_next_cpu_id++;
+                s_online_count++;
+                consecutive_fails = 0;
+            } else {
+                consecutive_fails++;
+            }
+        }
+    }
+
+    kprintf("[smp] %u CPUs online\n", s_online_count);
+}
+
+/* ---- AP entry point ---- */
+
+void ap_main(u32 ap_id)
+{
+    struct cpu_info *c = &cpu_table[ap_id];
+    c->id = ap_id;
+    c->bsp = false;
+    c->need_resched = false;
+    /* Mark started only AFTER the idle task exists: preferred_cpu()
+     * must never pick a half-initialized cpu (idle==NULL) as a target.
+     * (Every field of this slot is set HERE and nowhere else — the BSP's
+     * old pre-fill in smp_init() is gone.) */
+    c->started = false;
+
+    /* Settle THIS core's LAPIC access mode first: apic_get_id() and every
+     * later register access go through the x2APIC-vs-MMIO accessors keyed
+     * off s_x2apic, which apic_enable() derives from this core's own
+     * MSR (it may switch an xAPIC-left core to x2APIC — and MSR 0x800+
+     * would #GP if touched while still in xAPIC mode, so the mode has to
+     * be settled before any access). */
+    apic_enable();
+    c->apic_id = apic_get_id();
+
+    /* gdt_init_cpu() ends with gdt_reload() which does mov gs,ax and
+     * (on QEMU TCG) resets the hidden GS base from the GDT entry,
+     * zeroing whatever cpu_set_gs_base() wrote. Install our GDT FIRST,
+     * then set GS, so this_cpu_data() stays valid for the rest of AP
+     * bring-up and for every later interrupt. */
+    gdt_init_cpu((int)ap_id);
+
+    cpu_set_gs_base((u64)c);
+
+    idt_init();
+
+    u64 cr0, cr4;
+    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    cr0 &= ~(CR0_EM | CR0_TS); /* EM=0, TS=0 (TS must be clear or
+                                * any SSE/x87 insn #XM's) */
+    cr0 |= CR0_MP | CR0_NE;    /* MP=1 NE=1 */
+    __asm__ volatile("mov %0,%%cr0" ::"r"(cr0));
+    __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
+    cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+    __asm__ volatile("mov %0,%%cr4" ::"r"(cr4));
+
+    /* CR0.WP (trampoline.S already set it with paging; make it explicit)
+     * + CPUID-gated CR4.SMEP.  Must happen BEFORE started=true: an AP may
+     * only ever schedule user tasks once it refuses to execute them at
+     * CPL=0 and honors read-only mappings for its own stores. */
+    cpu_protect_init();
+
+    /* Receipt for the AP half of the mitigation: without this line only the
+     * BSP's cpu_init() prints its CR0/CR4, and a silently-skipped
+     * cpu_protect_init() on the AP path would be invisible in the boot log
+     * (SMEP is a set-and-enforce bit: user space can never observe it).
+     * kprintf is print_lock-guarded, so the two APs cannot interleave. */
+    c->runq_head.pid = 0;
+    c->runq_head.state = T_UNUSED;
+    c->runq_head.rq_next = &c->runq_head;
+    c->runq_head.rq_cpu = -1;
+    c->need_resched = false;
+
+    apic_write(LAPIC_TPR, 0);
+
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+
+    /* Create this CPU's idle task and install it as current BEFORE
+     * setting started=true, so preferred_cpu() only ever sees a CPU
+     * with a fully-built idle context. _current == idle lets us be
+     * selected; the first schedule() away will swtch() and save this
+     * AP's boot stack into idle->ctx.sp. */
+    struct task *idle = sched_create_idle((int)ap_id);
+    if (!idle) panic("AP%u: cannot allocate idle task", ap_id);
+    c->idle = idle;
+    c->_current = idle;
+
+    c->started = true;
+
+    /* Signal ready BEFORE any console output.  Console I/O must never
+     * sit on the AP-startup critical path: the BSP polls for `ready`
+     * with only AP_STARTUP_TIMEOUT_MS to spare, and a console char can
+     * cost milliseconds when the text/framebuffer aperture is UC (KVM
+     * turns every store into a VM exit; a real-machine UC LFB is the
+     * same story).  Printing first meant a slow console blew the whole
+     * budget, the BSP then fired its recovery INIT at THIS core while
+     * it was mid-kprintf holding print_lock -- and a core reset while
+     * holding the console lock wedges every later kprintf on every
+     * CPU.  With the signal first, a late console can only make the
+     * boot log slow, never the boot. */
+    trampoline_signal_ready();
+
+    /* Receipt for the AP half of the mitigation: without this line only
+     * the BSP's cpu_init() prints its CR0/CR4, and a silently-skipped
+     * cpu_protect_init() on the AP path would be invisible in the boot
+     * log (SMEP is a set-and-enforce bit: user space can never observe
+     * it).  kprintf is print_lock-guarded, so the two APs cannot
+     * interleave. */
+    {
+        u64 c0, c4;
+        __asm__ volatile("mov %%cr0,%0" : "=r"(c0));
+        __asm__ volatile("mov %%cr4,%0" : "=r"(c4));
+        kprintf("[cpu] AP%u CR0.WP=%d CR4.SMEP=%d CR4.SMAP=%d (SMEP/SMAP cpuid=%d/%d)\n",
+                ap_id, (int)((c0 & CR0_WP) != 0), (int)((c4 & CR4_SMEP) != 0),
+                (int)((c4 & CR4_SMAP) != 0), (int)cpu_has_smep(),
+                (int)cpu_has_smap());
+    }
+
+    /* Local periodic tick: without it an AP would never quantum-preempt
+     * its current task and every preempt decision would depend on the
+     * BSP (GAP_ANALYSIS 4.6). Uses the period calibrated by the BSP in
+     * main.c — no PIT access here. jiffies stays BSP-owned (cpu.c).
+     * Arming and its log line come after the ready signal for the same
+     * reason as above. */
+    lapic_timer_start(32, HZ);
+
+    kprintf("[smp] AP%u online (APIC ID=%u)\n", ap_id, c->apic_id);
+
+    /* Same idle protocol as the BSP: schedule first (picks up any task
+     * already queued for us), then sti;hlt until the next IPI/tick. */
+    for (;;) {
+        schedule();
+        __asm__ volatile("sti; hlt");
+    }
+}

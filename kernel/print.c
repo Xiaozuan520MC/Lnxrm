@@ -15,7 +15,7 @@ static spinlock_t print_lock = SPINLOCK_INIT;
 void console_out_lock(u64 *flags) { spin_lock_irqsave(&print_lock, flags); }
 void console_out_unlock(u64 flags) { spin_unlock_irqrestore(&print_lock, flags); }
 
-/* VGA text console at the high alias; COM1 via the Rust UART driver. */
+/* VGA text console at the high alias; COM1 via drivers/uart.c. */
 extern void lnxrm_uart_init(void);
 extern void lnxrm_uart_putc(char c);
 extern int lnxrm_uart_trygetc(void);
@@ -83,6 +83,41 @@ static void vga_scroll(void)
     for (int r = 1; r < VGA_ROWS; r++)
         memcpy((void *)&vga[(r - 1) * VGA_COLS], (void *)&vga[r * VGA_COLS], VGA_COLS * 2);
     for (int c = 0; c < VGA_COLS; c++) vga[(VGA_ROWS - 1) * VGA_COLS + c] = 0x0700;
+}
+
+/* ---- ANSI escape sequence tokenizer --------------------------------------
+ * Lives here rather than in a file of its own because print.c is the console
+ * core: it owns the shared console lock (console_out_lock) and this state
+ * machine, and the two backends -- the VGA text console below and the
+ * framebuffer console in framebuffer.c -- are its consumers.  A thirty-line
+ * shared helper did not justify a translation unit of its own. */
+int ansi_feed(struct ansi_seq *s, char c)
+{
+    if (s->phase == 0) {
+        if (c == '\033') {
+            s->phase = 1;
+            return ANSI_CONSUMED;
+        }
+        return ANSI_TEXT;
+    }
+    if (s->phase == 1) {
+        s->phase = (c == '[') ? 2 : 0;
+        if (c == '[') s->len = 0;
+        return ANSI_CONSUMED;
+    }
+    if (s->len < (int)sizeof(s->buf) - 1) s->buf[s->len++] = c;
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+        s->buf[s->len] = 0;
+        s->phase = 0;
+        return ANSI_DONE;
+    }
+    return ANSI_CONSUMED;
+}
+
+int ansi_color_index(int code)
+{
+    static const u8 map[] = {0, 4, 2, 6, 1, 5, 3, 7};
+    return map[code - 30];
 }
 
 /* ANSI escape sequence state machine (tokenizer shared with framebuffer.c) */
@@ -342,6 +377,34 @@ size_t vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap)
     return p - buf;
 }
 
+/* Emit a NUL-terminated literal with no formatting and no lock.  Used by
+ * panic() for the fixed "[PANIC] " / color-reset wraps around the message. */
+static void putstr_unlocked(const char *s)
+{
+    while (*s) console_putc(*s++);
+}
+
+/* Format `fmt` and push it to the console WITHOUT taking print_lock.
+ * vsnprintf does the formatting and console_putc is itself lock-free, so
+ * the only thing skipped here is the serialization.  This is what panic()
+ * must use: if the caller already holds print_lock (e.g. a BUG inside the
+ * console path itself), taking it again would spin forever with interrupts
+ * off instead of halting -- the exact self-deadlock T-002 describes. */
+void kvprintf_unlocked(const char *fmt, __builtin_va_list ap)
+{
+    static char kbuf[1024];
+    vsnprintf(kbuf, sizeof(kbuf), fmt, ap);
+    for (char *s = kbuf; *s; s++) console_putc(*s);
+}
+
+void kprintf_unlocked(const char *fmt, ...)
+{
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    kvprintf_unlocked(fmt, ap);
+    __builtin_va_end(ap);
+}
+
 void kvprintf(const char *fmt, __builtin_va_list ap)
 {
     static char kbuf[1024];
@@ -360,14 +423,32 @@ void kprintf(const char *fmt, ...)
     __builtin_va_end(ap);
 }
 
+/* Reentrancy latch: once panic() has begun it never returns, so a second
+ * entry (a fault raised inside the panic path) must not recurse -- it halts
+ * the machine immediately.  Exported so tests can observe the guard. */
+static volatile int s_panicking;
+int in_panic(void) { return s_panicking; }
+
 __attribute__((noreturn)) void panic(const char *fmt, ...)
 {
     __builtin_va_list ap;
+
+    __asm__ volatile("cli"); /* interrupts off first: no preemption mid-panic */
+    if (s_panicking) {       /* already panicking: a nested fault must halt, not recurse */
+        __asm__ volatile("hlt; jmp .");
+        for (;;);
+    }
+    s_panicking = 1;
+
+    /* Unlocked, bold-red path: works even if the caller holds print_lock.
+     * Output may interleave with another CPU's print, but the machine is
+     * dying anyway -- halting beats a clean transcript. */
+    putstr_unlocked("\033[1;31m[PANIC] "); /* bold red */
     __builtin_va_start(ap, fmt);
-    kprintf("\033[1;31m[PANIC] "); /* bold red */
-    kvprintf(fmt, ap);
-    kprintf("\033[0m\n"); /* reset color */
+    kvprintf_unlocked(fmt, ap);
     __builtin_va_end(ap);
-    __asm__ volatile("cli; hlt; jmp .");
+    putstr_unlocked("\033[0m\n"); /* reset color */
+
+    __asm__ volatile("hlt; jmp .");
     for (;;);
 }

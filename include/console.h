@@ -15,6 +15,17 @@ void console_putc(char c); /* dual: VGA + COM1 */
 void console_out_lock(u64 *flags);
 void console_out_unlock(u64 flags);
 
+/* Lock-free print path (T-002).  Formats and emits via console_putc WITHOUT
+ * taking print_lock, so it works from a context that already holds the lock
+ * -- a nested kprintf would deadlock.  panic() uses this; the ktest
+ * test_panic_path_survives_held_lock pins the contract. */
+void kvprintf_unlocked(const char *fmt, __builtin_va_list ap);
+void kprintf_unlocked(const char *fmt, ...);
+
+/* True once panic() has latched (never returns to false): lets a nested
+ * fault halt instead of recursing, and lets tests observe the guard. */
+int in_panic(void);
+
 void panic(const char *fmt, ...) __attribute__((noreturn));
 
 /* ---- assertion infrastructure (T-010, live in kernel/selftest.c) ----

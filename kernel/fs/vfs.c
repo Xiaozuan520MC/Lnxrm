@@ -12,6 +12,10 @@
 extern struct fs_ops fat32_ops;
 extern void *fat_mount(struct blkdev *b);
 
+/* ---- initramfs backend (fs/initramfs.c) ---- */
+extern struct fs_ops irfs_ops;
+extern void *irfs_mount(void);
+
 #define DISK_PREFIX "/"
 
 /* Mounted filesystem info */
@@ -693,8 +697,20 @@ static int vfs_try_mount_one(struct blkdev *bd)
             if (mbr_get_partition(&mbr, i, part_dev, bd) == 0) {
                 void *pm = NULL;
 
-                if (mbr.parts[i].type == PART_TYPE_FAT32 ||
-                    mbr.parts[i].type == PART_TYPE_FAT32_LBA) {
+                /* Try FAT32 regardless of the partition's *type byte*.  That
+                 * byte is a label written by whatever formatted the disk and
+                 * it lies routinely: Windows puts FAT32 in 0x06 as often as
+                 * 0x0B, a GPT protective MBR stamps 0xEE over a perfectly
+                 * good FAT32 partition, and hand-built/USB images carry
+                 * whatever the tool felt like.  Restricting to 0x0B/0x0C
+                 * meant a mountable disk was rejected on a formality.
+                 * What actually decides "is this FAT32" is the BPB
+                 * validation inside fat_mount(), which reads the boot sector
+                 * and checks the geometry -- so a Linux or NTFS partition
+                 * fails there in one sector read instead of by name.
+                 * Extended partitions are the one real exclusion: they hold
+                 * a link record, not a filesystem. */
+                if (!mbr.parts[i].is_extended) {
                     kprintf("[vfs]   trying FAT32 on partition %d...\n", i);
                     pm = fat_mount(part_dev);
                     if (pm) {
@@ -705,6 +721,10 @@ static int vfs_try_mount_one(struct blkdev *bd)
                         return 0;
                     }
                 }
+                /* mbr_get_partition() stashed its part_dev in ->drv; it is
+                 * only owned by the mount once fat_mount() succeeds, so the
+                 * failed attempts have to free it here. */
+                kfree(part_dev->drv);
             }
             kfree(part_dev);
         }
@@ -732,4 +752,43 @@ int vfs_try_mount_disk(void)
     for (int i = 0; i < blk_count; i++)
         if (vfs_try_mount_one(blk_list[i]) == 0) return 0;
     return LNXRM_EFAIL;
+}
+
+bool vfs_file_exists(const char *path)
+{
+    struct file *f = NULL;
+    if (vfs_open_file(path, O_RDONLY, &f) < 0 || !f) return false;
+    vfs_close_file(f);
+    return true;
+}
+
+/* Mount the initramfs linked into the kernel image at "/".
+ *
+ * The archive is a *root*, not a subtree: /bin/init is opened by that name
+ * and the shell resolves everything else from "/", so there is no useful
+ * place to mount it when a disk already owns "/".  When the caller asks for
+ * this it is because that disk mounted but cannot boot -- it has no
+ * /bin/init -- and nothing has opened a file from it yet: this runs after
+ * vfs_try_mount_disk() and before sched_init(), i.e. before any task exists
+ * to hold a struct file.  So the disk root is deactivated first, rather than
+ * left mounted underneath and reachable through two roots at once. */
+int vfs_mount_initramfs(void)
+{
+    void *m = irfs_mount();
+    if (!m) return LNXRM_ENOENT;
+
+    for (int i = 0; i < mount_count; i++) {
+        if (!mounts[i].active) continue;
+        if (mounts[i].prefix_len != 1 || mounts[i].prefix[0] != '/') continue;
+        mounts[i].active = false;
+        kprintf("[vfs] unmounted the disk root (it had no /bin/init)\n");
+    }
+
+    register_mount(&irfs_ops, m, DISK_PREFIX);
+    /* disk_ready means "a filesystem answers at /", which vfs_lookup()'s
+     * root case and vfs_root_ready() both key off -- a diskless machine
+     * that boots from initramfs has a root, and the boot self-test should
+     * exercise it instead of skipping its root assertions. */
+    disk_ready = true;
+    return 0;
 }

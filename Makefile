@@ -1,35 +1,26 @@
 CROSS   :=
 CC      := $(CROSS)gcc
-CXX     := $(CROSS)g++
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
-RUSTC   := rustc
 NASM    := nasm -w-implicit-abs-deprecated
 PYTHON3 := python3
 
 BUILD   := build
 ARCHDIR := arch
 
-# Bootable ISO (legacy BIOS + GRUB).  The whole ISO tree is staged inside
-# build/iso/ so nothing is ever written outside $(BUILD), and grub.cfg is
-# generated (not committed) so `make clean && make imageiso` always works.
 ISO_TREE := $(BUILD)/iso
 ISO_CFG  := $(ISO_TREE)/boot/grub/grub.cfg
 ISO_KRN  := $(ISO_TREE)/boot/bzImage
 ISO      := $(BUILD)/lnxrm.iso
 
+KVM ?= $(shell test -r /dev/kvm && test -w /dev/kvm && echo --enable-kvm)
+MACHINE ?= q35
+GRUB_TIMEOUT ?= 0
+
 WARN    := -Wall -Wextra -Wno-unused-parameter
 MAKEFLAGS += --no-print-directory
-
-# A recipe that dies halfway (e.g. mcopy loop on disk.img) must not leave a
-# half-written artifact behind that make then treats as up to date.
 .DELETE_ON_ERROR:
 
-# Boot self-test suite (ktest/): off by default -- a stock `make` links no
-# test code into the kernel.  `make KTEST=1` compiles it: ktest/ joins the
-# source list and main.c's ktest_run() calls appear behind -DCONFIG_KTEST.
-# The ASSERT/WARN/BUG_ON infrastructure is production code and stays either
-# way (kernel/selftest.c).
 KTEST ?= 0
 ifeq ($(KTEST),1)
 KTEST_DIR  := ktest
@@ -41,16 +32,9 @@ endif
 
 BASEFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
              -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
-             -O2 -g $(WARN) -Iinclude -Iinclude/cpp -I. -MMD -MP \
+             -O2 -g $(WARN) -Iinclude -I. -MMD -MP \
              -ffunction-sections -fdata-sections $(KTEST_DEFS)
 KERNFLAGS := $(BASEFLAGS) -std=gnu11
-CXXFLAGS  := $(BASEFLAGS) -std=c++20 -fno-exceptions -fno-rtti \
-             -fno-threadsafe-statics -fno-use-cxa-atexit -nostdinc++
-
-RUSTFLAGS := --crate-type staticlib --edition 2021 -C panic=abort -C opt-level=s \
-             -C relocation-model=static -C code-model=kernel \
-             -C target-feature=-sse -C debuginfo=0 \
-             --target x86_64-unknown-none
 
 USRFLAGS  := -ffreestanding -fno-stack-protector -fno-pic -fno-pie -O2 \
              -nostdlib -nostartfiles -static -no-pie -mcmodel=large $(WARN) \
@@ -58,24 +42,21 @@ USRFLAGS  := -ffreestanding -fno-stack-protector -fno-pic -fno-pie -O2 \
 
 USER_LINK_BASE := 0x7f8000400000
 
-KSRC_C   := $(shell find kernel arch $(KTEST_DIR) -name '*.c' 2>/dev/null)
-KSRC_CXX := $(shell find kernel arch $(KTEST_DIR) -name '*.cpp' 2>/dev/null)
-KASM_ALL := $(shell find arch -name '*.S' 2>/dev/null)
-KASM     := $(filter-out arch/trampoline.S,$(KASM_ALL))
-RUST_SRC := $(shell find kernel/rust -name '*.rs' 2>/dev/null)
-USR_ALL_C := $(shell find usr -maxdepth 1 -name '*.c' 2>/dev/null)
-UIMG      := $(patsubst usr/%.c,%,$(USR_ALL_C))
-# user-space object dir and final ELFs
-USR_OBJDIR := $(BUILD)/usro
-USER_ELFS  := $(addprefix $(BUILD)/usr/,$(UIMG))
-
-KOBJ_C   := $(patsubst %.c,$(BUILD)/%.o,$(KSRC_C))
-KOBJ_CXX := $(patsubst %.cpp,$(BUILD)/%.opp,$(KSRC_CXX))
-KOBJ_ASM := $(patsubst %.S,$(BUILD)/%.o,$(KASM)) $(BUILD)/trampoline.o
-KOBJ     := $(KOBJ_C) $(KOBJ_CXX) $(KOBJ_ASM)
-
-.PHONY: all clean run usr rust smoke imageiso help
+.PHONY: all clean run usr smoke imageiso initramfs help
 all: $(BUILD)/bzImage
+
+include arch/Makefile
+include kernel/Makefile
+include usr/Makefile
+
+KOBJ_C   := $(KERN_OBJS) $(ARCH_C_OBJS) $(KTEST_OBJS)
+KOBJ_ASM := $(ARCH_S_OBJS) $(BUILD)/trampoline.o
+KOBJ     := $(KOBJ_C) $(KOBJ_ASM)
+
+INITRAMFS ?=
+ifneq ($(INITRAMFS),)
+KOBJ += $(BUILD)/initramfs.o
+endif
 
 KTEST_STAMP := $(BUILD)/.ktest-mode-$(KTEST)
 $(KTEST_STAMP):
@@ -84,50 +65,32 @@ $(KTEST_STAMP):
 	@touch $@
 $(KOBJ): $(KTEST_STAMP)
 
-# user space must be built before the disk image and before booting
 usr: $(USER_ELFS)
 
 $(BUILD):
 	@mkdir -p $@
 
-$(BUILD)/liblnxrm.a: $(RUST_SRC) | $(BUILD)
-	@mkdir -p $(BUILD)/rustobj
-	@printf "  RUST    $@\n"
-	@$(RUSTC) $(RUSTFLAGS) --crate-name lnxrmrust -o $@ kernel/rust/lib.rs
+$(BUILD)/ifsrc/.stamp: $(USER_ELFS) $(BUILD)/README.md | $(BUILD)
+	@rm -rf $(BUILD)/ifsrc
+	@mkdir -p $(BUILD)/ifsrc/bin
+	@cp $(USER_ELFS) $(BUILD)/ifsrc/bin/
+	@cp $(BUILD)/README.md $(BUILD)/ifsrc/
+	@touch $@
 
-rust: $(BUILD)/liblnxrm.a
+$(BUILD)/initramfs.cpio: $(BUILD)/ifsrc/.stamp scripts/mkinitramfs.py
+	@$(PYTHON3) scripts/mkinitramfs.py $@ $(BUILD)/ifsrc
 
-$(BUILD)/trampoline.bin: arch/trampoline.S | $(BUILD)
-	@printf "  NASM    $@\n"
-	@$(NASM) -f bin -o $@ $<
-
-$(BUILD)/trampoline.o: $(BUILD)/trampoline.bin | $(BUILD)
-	@printf "  OBJCOPY $@\n"
+$(BUILD)/initramfs.o: $(INITRAMFS) | $(BUILD)
+	@printf "  OBJCOPY $@ (initramfs %s)\n" "$$(stat -c%s $< 2>/dev/null || echo '?') bytes"
 	@$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
-	  --rename-section .data=.trampoline $< $@ \
-	  --redefine-sym _binary_build_trampoline_bin_start=trampoline_start \
-	  --redefine-sym _binary_build_trampoline_bin_end=trampoline_end \
-	  --redefine-sym _binary_build_trampoline_bin_size=trampoline_size
+	  --rename-section .data=.initramfs,alloc,load,readonly,data,contents $< $@
 
-$(BUILD)/arch/%.o: arch/%.S | $(BUILD)
-	@mkdir -p $(dir $@)
-	@printf "  NASM    $@\n"
-	@$(NASM) -f elf64 -F dwarf -g -o $@ $<
+initramfs: $(BUILD)/initramfs.cpio
 
-$(BUILD)/%.o: %.c | $(BUILD)
-	@mkdir -p $(dir $@)
-	@printf "  CC      $@\n"
-	@$(CC) $(KERNFLAGS) -MMD -MP -c -o $@ $<
-
-$(BUILD)/%.opp: %.cpp | $(BUILD)
-	@mkdir -p $(dir $@)
-	@printf "  CXX     $@\n"
-	@$(CXX) $(CXXFLAGS) -MMD -MP -c -o $@ $<
-
-$(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld $(BUILD)/liblnxrm.a
+$(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld
 	@printf "  LD      $@\n"
 	@$(LD) -T $(ARCHDIR)/kernel.ld --gc-sections -o $@ $(KOBJ) \
-	      $(BUILD)/liblnxrm.a -Map $(BUILD)/vmlinux.map \
+	      -Map $(BUILD)/vmlinux.map \
 	      --no-warn-rwx-segments
 
 $(BUILD)/vmlinux.bin: $(BUILD)/vmlinux.elf
@@ -147,45 +110,32 @@ $(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/vmlinux.bin
 	@printf "  SIZE    %s bytes\n" $$(stat -c%s $@)
 	@printf "  Done!\n"
 
-$(USR_OBJDIR)/crt0.o: init/crt0.S | $(BUILD)
-	@mkdir -p $(USR_OBJDIR)
-	@printf "  NASM    $@\n"
-	@$(NASM) -f elf64 -o $@ $<
-
-$(USR_OBJDIR)/ulib.o: init/ulib.c | $(BUILD)
-	@mkdir -p $(USR_OBJDIR)
-	@printf "  CC      $@\n"
-	@$(CC) $(USRFLAGS) -MMD -MP -c -o $@ $<
-
-$(USR_OBJDIR)/%.o: usr/%.c | $(BUILD)
-	@mkdir -p $(USR_OBJDIR)
-	@printf "  CC      $@\n"
-	@$(CC) $(USRFLAGS) -MMD -MP -c -o $@ $<
-
-$(USER_ELFS): $(BUILD)/usr/%: $(USR_OBJDIR)/%.o $(USR_OBJDIR)/ulib.o $(USR_OBJDIR)/crt0.o | $(BUILD)
-	@mkdir -p $(dir $@)
-	@printf "  LD      $@\n"
-	@$(CC) $(USRFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
-
 clean:
 	@rm -rf $(BUILD)
-	@rm -f usr/*.o usr/*.d
 	@echo Done!
 
 help:
-	@echo make -Build kernel
-	@echo make clean -Clean compiled files
-	@echo make usr -Build Build user program
-	@echo make run -Start the kernel
-	@echo make rust -Compile Rust
-	@echo make smoke -Smoke test
-	@echo make KTEST=1 -Build with the ktest self-test suite
-	@echo make imageiso -Build ISO image
+	@echo make
+	@echo make clean
+	@echo make usr
+	@echo make run
+	@echo make smoke
+	@echo make KTEST=1
+	@echo make initramfs
+	@echo make imageiso
+	@echo make INITRAMFS=build/initramfs.cpio
 
-run: usr $(BUILD)/bzImage $(BUILD)/disk.img
-	@qemu-system-x86_64 -m 256 -smp 2 -cpu qemu64,+smep,+smap -kernel $(BUILD)/bzImage \
-	  -drive file=$(BUILD)/disk.img,format=raw,if=ide,index=0,media=disk \
-	  -serial stdio -no-reboot -d int -D build/qemu.log  
+DISK ?= 1
+ifeq ($(DISK),1)
+RUN_DEPS  := $(BUILD)/disk.img
+RUN_DRIVE := -drive file=$(BUILD)/disk.img,format=raw,if=ide,index=0,media=disk
+endif
+
+run: usr build/bzImage $(RUN_DEPS)
+	@qemu-system-x86_64 $(KVM) -machine $(MACHINE) -m 256 -smp 2 -cpu qemu64,+smep,+smap \
+	  -kernel build/bzImage $(RUN_DRIVE) \
+	  -serial stdio -no-reboot -d int -D build/qemu.log
+ahci: run
 
 smoke:
 	@echo "smoke: forcing KTEST=1 (self-test markers are what it checks)"
@@ -199,12 +149,12 @@ $(ISO_CFG): | $(BUILD)
 	@printf "  GRUB    $@\n"
 	@printf '%s\n' \
 	  'serial --unit=0 --speed=115200' \
-	  'terminal_output serial' \
-	  'set timeout=0' \
+	  'terminal_output serial console' \
+	  "set timeout=$(GRUB_TIMEOUT)" \
 	  'set default=0' \
 	  'insmod all_video' \
-	  'set gfxmode=1280x720x32' \
-	  'set gfxpayload=1280x720x32' \
+	  'set gfxmode=1920x1080x32,1280x720x32,auto' \
+	  'set gfxpayload=1920x1080x32,1280x720x32,keep' \
 	  'menuentry "lnxrm" {' \
 	  '  linux /boot/bzImage console=ttyS0' \
 	  '  boot' \
@@ -214,8 +164,6 @@ $(ISO_KRN): $(BUILD)/bzImage | $(BUILD)
 	@mkdir -p $(dir $@)
 	@cp $< $@
 
-# grub-mkrescue/xorriso chat on stderr; keep it out of the build output but
-# dump the whole transcript when the build fails (build/iso.log has it too).
 $(ISO): $(ISO_KRN) $(ISO_CFG)
 	@command -v grub-mkrescue >/dev/null 2>&1 || { \
 	  echo "error: grub-mkrescue not found -- install grub-pc-bin (Debian/Ubuntu)"; \
@@ -228,7 +176,12 @@ $(ISO): $(ISO_KRN) $(ISO_CFG)
 $(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
 	@printf "  DISK    $@\n"
 	@dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	@mkfs.vfat -F 32 $@ >/dev/null 2>/dev/null
+	@# -R 1024: reserve 1024 sectors (512 KiB).  FAT32 leaves the reserved
+	@# area to the OS, and this kernel keeps its crash-consistency journal
+	@# in sectors 8..reserved-1 of it -- mkfs's default 32 sectors would give
+	@# the log only 24 sectors (~11 records), too small for the unlink/write
+	@# transactions the driver runs.  Nothing else in FAT32 uses them.
+	@mkfs.vfat -F 32 -R 1024 $@ >/dev/null 2>/dev/null
 	@mcopy -i $@ $(BUILD)/README.md ::README.md
 	@mmd -i $@ ::bin
 	@for f in $(USER_ELFS); do \
@@ -236,6 +189,6 @@ $(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
 	done
 
 $(BUILD)/README.md: | $(BUILD)
-	@echo "A tiny unix-like kernel in ASM + C + C++ + Rust!" > $@
+	@echo "A tiny unix-like kernel in ASM + C!" > $@
 
--include $(KOBJ_C:.o=.d) $(KOBJ_CXX:.opp=.d) $(USR_ALL_C:usr/%.c=$(USR_OBJDIR)/%.d)
+-include $(KOBJ_C:.o=.d) $(USR_ALL_C:usr/%.c=$(USR_OBJDIR)/%.d)

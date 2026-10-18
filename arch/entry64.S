@@ -4,8 +4,10 @@
 %define PML4_M    0x50000            ; master PML4 (permanent)
 %define PDPT_M    0x51000            ; identity subtree PDPT
 %define PD_M      0x52000            ; identity 1 GiB, 2 MiB pages
+%define PD_M2     0x57000            ; identity 1..2 GiB, 2 MiB pages
 %define PDPT_HI   0x53000            ; high-half subtree PDPT (PML4[511])
 %define PD_HI     0x54000            ; kernel/heap/dev/vga, 2 MiB pages
+%define PD_HI2    0x58000            ; high-half alias of 1..2 GiB
 %define PT_VGA    0x55000            ; text framebuffer window
 %define PT_DEV    0x56000            ; device MMIO window
 
@@ -193,6 +195,7 @@ _start64:
     cmp ecx, 512
     jb .clr_pdptm
     mov DWORD [PDPT_M + 0*8], PD_M | 0x003
+    mov DWORD [PDPT_M + 1*8], PD_M2 | 0x003  ; identity 1..2 GiB
 
     xor ecx, ecx
 .clr_pdpthi:
@@ -202,6 +205,7 @@ _start64:
     cmp ecx, 512
     jb .clr_pdpthi
     mov DWORD [PDPT_HI + 510*8], PD_HI | 0x003
+    mov DWORD [PDPT_HI + 511*8], PD_HI2 | 0x003 ; alias of 1..2 GiB
 
     mov al, 'b'
     out 0xE9, al
@@ -215,6 +219,17 @@ _start64:
     add edi, 8
     cmp eax, 0x083 + 512*0x200000
     jb .idloop
+
+    ; identity map 1..2 GiB (PD_M2), continuing straight past PD_M's top
+    mov rdi, PD_M2
+    mov eax, 0x083 + 512*0x200000      ; phys 1 GiB
+.idloop2:
+    mov [edi], eax
+    mov DWORD [edi+4], 0
+    add eax, 0x200000
+    add edi, 8
+    cmp eax, 0x083 + 1024*0x200000     ; phys 2 GiB
+    jb .idloop2
 
     ; high half: kernel image window 0..32 x 2 MiB
     mov rdi, PD_HI
@@ -232,6 +247,19 @@ _start64:
     add edi, 8
     cmp edi, PD_HI + 512*8
     jb .zhi
+
+    ; high-half alias of physical 1..2 GiB -> PDPT_HI[511] -> PD_HI2.
+    ; Unlike PD_HI there is no kernel image / VGA / device carve-out here,
+    ; so every one of the 512 slots is a plain 2 MiB alias of its frame.
+    mov rdi, PD_HI2
+    mov eax, 0x083 + 512*0x200000      ; phys 1 GiB
+.hiloop2:
+    mov [edi], eax
+    mov DWORD [edi+4], 0
+    add eax, 0x200000
+    add edi, 8
+    cmp eax, 0x083 + 1024*0x200000     ; phys 2 GiB
+    jb .hiloop2
 
     mov al, 'c'
     out 0xE9, al

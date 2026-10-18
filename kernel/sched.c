@@ -1,9 +1,14 @@
 /* Round-robin preemptive scheduler with per-CPU run queues.
  *
  * Queue topology:
- *   - Each cpu_info has its own circular run queue (sentinel at
- *     cpu->runq_head). A RUNNABLE task sits on exactly one queue,
- *     identified by task->rq_cpu (-1 == not queued).
+ *   - Each cpu_info has its own run queue (sentinel at cpu->runq_head).
+ *     A RUNNABLE task sits on exactly one queue, identified by
+ *     task->rq_cpu (-1 == not queued).
+ *   - The queue is a push-front singly linked list, NOT a circular list:
+ *     enqueue_on() inserts at the HEAD and pick_next() takes from the HEAD,
+ *     so under continuous contention it behaves LIFO, not round-robin (C62).
+ *     The topology is circular only in the weak sense that the sentinel
+ *     runq_head closes the list (last->rq_next == &runq_head).
  *   - A single global runq_lock (taken with interrupts off) serializes
  *     every enqueue/dequeue/pick so cross-CPU handoff cannot corrupt
  *     links. Critical sections are only a few pointer stores, so one
@@ -20,7 +25,42 @@
 #include <sys/apic.h>
 #include <sys/smp.h>
 
+/* ---- spinlock: busy-wait mutual exclusion for SMP ------------------------
+ * Lives here rather than in a file of its own because this kernel's spinlocks
+ * exist *for* the scheduler -- runq_lock below is the reason they have to be
+ * irqsave at all -- and a twenty-line primitive did not merit a translation
+ * unit.  Reference: Linux kernel/locking/spinlock.c.
+ *
+ * Only the irqsave variant exists: every lock in this kernel can be taken
+ * from interrupt context (handlers print, the tick calls the scheduler), so
+ * a lock held with interrupts on would self-deadlock when the same CPU
+ * re-enters it from an IRQ.  The historical non-irq
+ * spin_lock()/spin_unlock()/spin_init() trio had no callers left after every
+ * call site migrated to irqsave and was removed (2026-10-01); static
+ * initialization goes through SPINLOCK_INIT. */
+void spin_lock_irqsave(spinlock_t *l, u64 *flags)
+{
+    u64 fl;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl));
+    *flags = fl;
+    while (__sync_lock_test_and_set(&l->locked, 1));
+    __sync_synchronize();
+}
+
+void spin_unlock_irqrestore(spinlock_t *l, u64 flags)
+{
+    __sync_synchronize();
+    __sync_lock_release(&l->locked);
+    __asm__ volatile("push %0; popfq" ::"r"(flags) : "memory");
+}
+
 static struct task task_table[NR_TASKS];
+/* T-050: one monotonic generation handed out on every slot claim, guarded by
+ * task_table_lock.  It is global rather than per-slot on purpose: two *live*
+ * slots may both be on their first occupant (generation 1 each), and only a
+ * value no other slot can hold makes a stale (pid, gen) reference unambiguous
+ * even after pid_counter wraps. */
+static u32 task_generation_counter;
 
 /* Global lock covering all per-CPU run queues. Always taken irqsave. */
 static spinlock_t runq_lock = SPINLOCK_INIT;
@@ -240,7 +280,9 @@ struct task *sched_create_idle(int cpu_id)
     t->cpu_id = cpu_id;
     t->rq_cpu = -1;
     t->rq_next = NULL;
-    t->parent = NULL;
+    t->con_next = NULL;
+    t->parent_pid = 0; /* an idle task has no parent */
+    t->parent_gen = 0;
     t->kstack = NULL;
     t->kstack_top = NULL;
     /* Same justification as BSP idle: switch_to may load this as CR3. */
@@ -432,6 +474,15 @@ struct task *task_alloc_slot(void)
               * caller assigns a fresh one, find_task(old_pid) must not
               * match this half-built task. Every caller assigns its own
               * pid right after alloc (fork/spawn/idle). */
+            /* T-050: this claim is a NEW incarnation -- and none of the
+             * previous occupant's links may survive it.  parent is cleared
+             * here (not only where a caller remembers to set it) because
+             * kernel_spawn never assigned one: without this line a recycled
+             * slot would hand init the dead occupant's parent. */
+            task_table[i].generation = ++task_generation_counter;
+            task_table[i].parent_pid = 0;
+            task_table[i].parent_gen = 0;
+            task_table[i].con_next = NULL;
             task_table[i].rq_cpu = -1;
             task_table[i].rq_next = NULL;
             task_table[i].cpu_id = -1;
@@ -455,6 +506,11 @@ struct task *task_alloc_slot(void)
              * never report the 64 MiB the previous occupant died holding. */
             task_table[i].mem_pages = 0;
             task_table[i].mem_peak = 0;
+            /* T-094: and never the previous occupant's stack watermark --
+             * a stale non-zero value would let a fresh task "grow" a stack
+             * it never mapped.  0 means "no stack tracked", so every growth
+             * attempt declines until exec/spawn/fork sets it. */
+            task_table[i].ustack_lo = 0;
             t = &task_table[i];
             break;
         }
@@ -478,6 +534,24 @@ void task_free_slot(struct task *t)
     t->cpu_id = -1;
     t->rq_cpu = -1;
     t->rq_next = NULL;
+    /* T-051: leave the table with no parent link naming the incarnation just
+     * released.  sys_exit reparents orphans to init *before* a task can turn
+     * into a zombie, so this normally finds nothing -- which is the point:
+     * it turns "every caller remembered to reparent first" into a property of
+     * the free itself.  A child found here would resolve its parent to NULL,
+     * be invisible to init's waitpid, and its zombie would never be reaped. */
+    struct task *init_t = NULL;
+    for (int i = 0; i < NR_TASKS; i++)
+        if (task_table[i].state != T_UNUSED && task_table[i].pid == 1)
+            init_t = &task_table[i];
+    for (int i = 0; i < NR_TASKS; i++) {
+        struct task *c = &task_table[i];
+        if (c == t || c->state == T_UNUSED) continue;
+        if (c->parent_pid == t->pid && c->parent_gen == t->generation) {
+            c->parent_pid = init_t ? init_t->pid : 0;
+            c->parent_gen = init_t ? init_t->generation : 0;
+        }
+    }
     /* T-032: hand the account back with the frames.  The caller (reap)
      * destroyed the address space a line ago, so anything left in these
      * two numbers is a claim on memory nobody owns. */
@@ -504,6 +578,35 @@ struct task *find_task(u32 pid)
     }
     spin_unlock_irqrestore(&task_table_lock, flags);
     return t;
+}
+
+/* T-050: the lookup a stale reference performs.  find_task() answers "whoever
+ * holds this pid now", which is what kill()/waitpid() from user space mean; a
+ * reference taken *against one incarnation* must also see that incarnation's
+ * generation, or a recycled slot answers in someone else's name. */
+struct task *find_task_gen(u32 pid, u32 gen)
+{
+    u64 flags;
+    struct task *t = NULL;
+    spin_lock_irqsave(&task_table_lock, &flags);
+    for (int i = 0; i < NR_TASKS; i++) {
+        if (task_table[i].state != T_UNUSED && task_table[i].pid == pid &&
+            task_table[i].generation == gen) {
+            t = &task_table[i];
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&task_table_lock, flags);
+    return t;
+}
+
+struct task *task_parent(struct task *t)
+{
+    if (!t || !t->parent_pid) return NULL;
+    /* NULL when the slot was freed (state T_UNUSED) or claimed by a later
+     * incarnation (generation differs) -- both mean "no parent to speak of"
+     * rather than "a stranger wearing the old pid". */
+    return find_task_gen(t->parent_pid, t->parent_gen);
 }
 
 struct task *task_iter(int *i)

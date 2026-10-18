@@ -63,9 +63,15 @@ struct screen_lfb {
     u8 blue_pos;        /* 0x2b */
     u8 rsvd_size;       /* 0x2c */
     u8 rsvd_pos;        /* 0x2d */
-    u8 _pad2[0x3a - 0x2e];
+    u8 _pad2[0x36 - 0x2e]; /* 0x2e..0x35: vesapm/vesa_attrib/pages */
+    u32 capabilities;   /* 0x36, VIDEO_CAPABILITY_* */
     u32 ext_lfb_base;   /* 0x3a, high 32 bits of the LFB address */
 } __attribute__((packed));
+
+/* Valid only when set in screen_info.capabilities: ext_lfb_base then holds
+ * the high half of a 64-bit LFB address.  Without the bit those bytes are
+ * not a promise about anything (GRUB only writes them on EFI + x86_64). */
+#define VIDEO_CAPABILITY_64BIT_BASE (1u << 1)
 
 /* Kernel-side description of the linear framebuffer. */
 struct fb_info {
@@ -95,6 +101,7 @@ extern struct boot_info bootinfo;
 _Static_assert(sizeof(struct screen_lfb) == 0x3e, "screen_info layout");
 _Static_assert(offsetof(struct screen_lfb, lfb_width) == 0x12, "screen_info layout");
 _Static_assert(offsetof(struct screen_lfb, lfb_linelength) == 0x24, "screen_info layout");
+_Static_assert(offsetof(struct screen_lfb, capabilities) == 0x36, "screen_info layout");
 _Static_assert(offsetof(struct screen_lfb, ext_lfb_base) == 0x3a, "screen_info layout");
 _Static_assert(sizeof(struct vbe_lfb_info) == 0x17, "setup.asm block layout");
 #endif

@@ -22,6 +22,15 @@
 
 #define IDE_CMD_READ     0x20
 #define IDE_CMD_WRITE    0x30
+
+/* Sectors carried by ONE PIO command.  READ SECTORS/WRITE SECTORS take an
+ * 8-bit count: 1..255 with 0 meaning 256.  Issuing a command per sector costs
+ * a full command round trip -- several hundred microseconds in PIO -- for every
+ * 512 bytes.  QEMU answers in nanoseconds, so every test passed while hiding
+ * what it does on a real drive: fat_mount() loads the *whole* FAT up front,
+ * and one-sector-at-a-time turns that into minutes of silence with irqs off,
+ * which is indistinguishable from a hang.  Same fix as ahci.c. */
+#define IDE_MAX_CHUNK 256
 #define IDE_CMD_IDENTIFY 0xEC
 
 static int ide_wait_ready(int mask, int timeout)
@@ -43,46 +52,58 @@ static int ide_wait_drq(void)
     return LNXRM_EFAIL;
 }
 
-static int ide_read_sector(u64 lba, void *buf)
+static int ide_read_sectors(u64 lba, u32 n, void *buf)
 {
     /* LBA28 tops out at 128 GiB (2^28 sectors).  Without this line the
      * (lba >> 24) & 0x0F below drops the top bits and answers from a
      * *different* sector instead of failing: wrong data, no error, nothing
      * in the log to trace it by (C53). */
     if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
+    if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
     if (ide_wait_ready(IDE_SR_DRDY, 100000)) return LNXRM_EFAIL;
 
-    outb(IDE_SECCOUNT, 1);
+    outb(IDE_SECCOUNT, (u8)n); /* n == 256 encodes as 0, which ATA reads as 256 */
     outb(IDE_LBA_LO, (u8)(lba));
     outb(IDE_LBA_MID, (u8)(lba >> 8));
     outb(IDE_LBA_HI, (u8)(lba >> 16));
     outb(IDE_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
     outb(IDE_CMD, IDE_CMD_READ);
 
-    if (ide_wait_drq()) return LNXRM_EFAIL;
-
     u16 *p = (u16 *)buf;
-    for (int i = 0; i < 256; i++) p[i] = inw(IDE_DATA);
+    for (u32 s = 0; s < n; s++) {
+        /* One DRQ per sector, not one per command: the drive raises DRQ as
+         * each sector becomes ready, so waiting only before the first would
+         * race every sector after it. */
+        if (ide_wait_drq()) return LNXRM_EFAIL;
+        for (int i = 0; i < 256; i++) p[i] = inw(IDE_DATA);
+        p += 256;
+    }
     return 0;
 }
 
-static int ide_write_sector(u64 lba, const void *buf)
+static int ide_write_sectors(u64 lba, u32 n, const void *buf)
 {
-    /* Same ceiling as the read path: see ide_read_sector(). */
+    /* Same ceiling as the read path. */
     if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
+    if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
     if (ide_wait_ready(IDE_SR_DRDY, 100000)) return LNXRM_EFAIL;
 
-    outb(IDE_SECCOUNT, 1);
+    outb(IDE_SECCOUNT, (u8)n);
     outb(IDE_LBA_LO, (u8)(lba));
     outb(IDE_LBA_MID, (u8)(lba >> 8));
     outb(IDE_LBA_HI, (u8)(lba >> 16));
     outb(IDE_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
     outb(IDE_CMD, IDE_CMD_WRITE);
 
-    if (ide_wait_drq()) return LNXRM_EFAIL;
-
     const u16 *p = (const u16 *)buf;
-    for (int i = 0; i < 256; i++) outw(IDE_DATA, p[i]);
+    for (u32 s = 0; s < n; s++) {
+        /* The device takes the data one sector at a time and re-asserts DRQ
+         * between them; writing the next 256 words without that wait would
+         * overrun a device that is still flushing the previous one. */
+        if (ide_wait_drq()) return LNXRM_EFAIL;
+        for (int i = 0; i < 256; i++) outw(IDE_DATA, p[i]);
+        p += 256;
+    }
 
     /* flush */
     ide_wait_ready(IDE_SR_DRDY, 100000);
@@ -105,11 +126,21 @@ static int ide_blk_read(struct blkdev *b, u64 lba, u32 count, void *buf)
     u8 *p = buf;
     u64 flags;
     spin_lock_irqsave(&ide_lock, &flags);
-    for (u32 i = 0; i < count; i++) {
-        if (lba + i >= b->num_sectors || ide_read_sector(lba + i, p + i * 512)) {
+    /* Same bound the old per-sector loop enforced: a request reaching past the
+     * end of the device fails as a whole rather than reading what it can. */
+    if (count && lba + count > b->num_sectors) {
+        spin_unlock_irqrestore(&ide_lock, flags);
+        return LNXRM_EFAIL;
+    }
+    while (count) {
+        u32 n = count > IDE_MAX_CHUNK ? IDE_MAX_CHUNK : count;
+        if (ide_read_sectors(lba, n, p)) {
             spin_unlock_irqrestore(&ide_lock, flags);
             return LNXRM_EFAIL;
         }
+        lba += n;
+        p += n * 512;
+        count -= n;
     }
     spin_unlock_irqrestore(&ide_lock, flags);
     return 0;
@@ -120,11 +151,19 @@ static int ide_blk_write(struct blkdev *b, u64 lba, u32 count, const void *buf)
     const u8 *p = buf;
     u64 flags;
     spin_lock_irqsave(&ide_lock, &flags);
-    for (u32 i = 0; i < count; i++) {
-        if (lba + i >= b->num_sectors || ide_write_sector(lba + i, p + i * 512)) {
+    if (count && lba + count > b->num_sectors) {
+        spin_unlock_irqrestore(&ide_lock, flags);
+        return LNXRM_EFAIL;
+    }
+    while (count) {
+        u32 n = count > IDE_MAX_CHUNK ? IDE_MAX_CHUNK : count;
+        if (ide_write_sectors(lba, n, p)) {
             spin_unlock_irqrestore(&ide_lock, flags);
             return LNXRM_EFAIL;
         }
+        lba += n;
+        p += n * 512;
+        count -= n;
     }
     spin_unlock_irqrestore(&ide_lock, flags);
     return 0;

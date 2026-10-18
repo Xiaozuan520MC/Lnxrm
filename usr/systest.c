@@ -59,6 +59,28 @@ static long ps_mem_kib(long pid, long *peak_kib, int *state)
     return -1;
 }
 
+/* T-094: a sink that keeps stack frames "real" (written and read across the
+ * recursive call) so the compiler can neither elide the frames nor turn the
+ * recursion into a loop -- either would defeat the point of the test. */
+static volatile unsigned char ustack_sink;
+
+/* Recurse with a ~200-byte frame.  depth frames * ~216 bytes is well past the
+ * 16 KiB the kernel maps up front, so reaching depth 0 proves the stack was
+ * grown lazily on the way down.  The base case reads a sentinel that lives in
+ * the *shallow* caller frame (a higher address, untouched by growth): getting
+ * its value back at the top proves growth did not corrupt the original stack. */
+static long ustack_recurse(int depth, volatile unsigned char *sentinel)
+{
+    volatile unsigned char frame[200];
+    frame[0] = (unsigned char)depth;
+    frame[199] = (unsigned char)(depth ^ 0x5A);
+    ustack_sink = frame[0]; /* frame is live before the call */
+    if (depth == 0) return *sentinel;
+    long child = ustack_recurse(depth - 1, sentinel);
+    ustack_sink = frame[199]; /* ... and after it: not a tail call */
+    return child;
+}
+
 int main(int argc, char **argv)
 {
     extern char **environ;
@@ -720,10 +742,13 @@ int main(int argc, char **argv)
         say("brk.oom.rounds", rounds);              /* 8 MiB chunks handed out */
         say("brk.shrink", kbrk(base) == base);      /* all of them back */
 
-        /* the machine still has to be able to run a process after that */
+        /* the machine still has to be able to run a process after that.
+         * The child exits *before* the parent reports: a say() here in both
+         * processes races the two writes for the serial line, and an
+         * interleaved "brk.after.fork=…=0" garbles the value the gate greps. */
         long p = kfork();
-        say("brk.after.fork", p);
         if (p == 0) kexit(0);
+        say("brk.after.fork", p);
         if (p > 0) {
             int st = 0;
             kwaitpid(p, &st, 0);
@@ -821,6 +846,25 @@ int main(int argc, char **argv)
             int st = 0;
             kwaitpid(c2, &st, 0);
         }
+    }
+
+    /* ---- lazy user stack growth (T-094) ----
+     * The kernel maps only 16 KiB of stack at exec.  Fork a child that
+     * recurses with ~200-byte frames deep enough to need ~110 KiB: without
+     * lazy growth the child would #PF (not-present below the stack) and die
+     * of SIGSEGV, never reaching the sentinel read at the deepest frame --
+     * so surviving with status 0 is the proof the kernel grew the stack. */
+    {
+        volatile unsigned char sentinel = 0x77;
+        long pid = kfork();
+        if (pid == 0) {
+            long r = ustack_recurse(512, &sentinel);
+            kexit(r == 0x77 ? 0 : 1);
+        }
+        int st = 0;
+        long w = kwaitpid(pid, &st, 0);
+        say("ustack.waitpid", w);
+        say("ustack.status", st); /* 0 = deep recursion survived */
     }
 
     say("systest.done", 1);

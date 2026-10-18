@@ -40,6 +40,21 @@ SECTIONS
         KEEP(*(.ktest))
         __ktest_end = .;
 
+        /* The initramfs (`make INITRAMFS=`): an objcopy'd newc cpio archive,
+         * so it is real payload that travels inside bzImage.  KEEP is as
+         * mandatory as it is for .ktest -- nothing in the kernel references
+         * these bytes by name (fs/initramfs.c reaches them through the two
+         * symbols below), so --gc-sections would delete the archive the user
+         * asked for and leave those symbols pointing at whatever followed.
+         * With no INITRAMFS= nothing contributes the section and the two
+         * symbols coincide, which is how fs/initramfs.c tells "no archive"
+         * from "an empty one".  It sits inside .image, hence inside the
+         * [1 MiB, __bss_end) range pmm_init() keeps out of the buddy. */
+        . = ALIGN(4);
+        __initramfs_start = .;
+        KEEP(*(.initramfs))
+        __initramfs_end = .;
+
         . = ALIGN(16);
     }
 

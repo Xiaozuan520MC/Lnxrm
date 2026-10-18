@@ -255,9 +255,31 @@ static void test_assert_macros(void)
     K_EXPECT_EQ(selftest_fail, f0);
 }
 
+/* T-002: panic() must not take print_lock, or panicking from a context that
+ * already holds it deadlocks instead of halting.  panic() itself never
+ * returns so it cannot be called here -- but its whole safety rests on the
+ * unlocked path working while the lock is HELD.  Prove exactly that: grab
+ * print_lock (as a panicking caller would), print through the lock-free
+ * path, and confirm we come back.  A regression that re-locks inside
+ * kprintf_unlocked would spin here forever and hang the boot (caught by
+ * make smoke), rather than fail an assertion. */
+static void test_unlocked_print_survives_held_lock(void)
+{
+    u64 flags = 0;
+    ASSERT(!in_panic(), "guard starts clear: not yet panicking");
+
+    console_out_lock(&flags); /* hold print_lock, simulating the deadlock context */
+    kprintf_unlocked("[ktest] unlocked path under a held print_lock\n");
+    ASSERT(1, "kprintf_unlocked returned with print_lock held: no self-deadlock");
+    console_out_unlock(flags);
+
+    ASSERT(!in_panic(), "printing did not latch the panic guard");
+}
+
 KTEST("lib", KTEST_EARLY, test_mem);
 KTEST("lib", KTEST_EARLY, test_strings);
 KTEST("lib", KTEST_EARLY, test_align_macros);
 KTEST("console", KTEST_EARLY, test_ansi_tokenizer);
 KTEST("console", KTEST_EARLY, test_ansi_truncation);
 KTEST("ktest", KTEST_EARLY, test_assert_macros);
+KTEST("console", KTEST_EARLY, test_unlocked_print_survives_held_lock);

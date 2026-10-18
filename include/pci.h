@@ -12,7 +12,7 @@ void pci_scan(pci_match_fn fn, void *ctx);
 u32 pci_read(u8 bus, u8 dev, u8 fn, u8 off);
 void pci_write(u8 bus, u8 dev, u8 fn, u8 off, u32 val);
 
-/* AHCI/SATA controller (drivers/ahci.cpp) — a PCI class 01h/06h device. */
+/* AHCI/SATA controller (drivers/ahci.c) — a PCI class 01h/06h device. */
 void ahci_init(void);
 
 static inline void pci_enable_bm(u8 b, u8 d, u8 f)

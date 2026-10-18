@@ -28,7 +28,7 @@ int main(int argc, char **argv)
     char pathbuf[64];
 
     for (;;) {
-        xputs("# ");
+        xputs("root@lnxrm$ ");
         int pos = 0;
         for (;;) {
             char c;

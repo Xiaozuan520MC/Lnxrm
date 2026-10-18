@@ -68,18 +68,28 @@ def main():
     # Uncomment and set if you move the payload:
     # struct.pack_into("<I", data, 0x214, 0x100000)
 
-    # ---- init_size (0x260): amount of memory the kernel needs -----------
-    # We leave this alone; setup.asm sets 0x400000 (4 MiB).
-    # struct.pack_into("<I", data, 0x260, 0x400000)
+    # ---- init_size (0x260): memory the loader must keep for the kernel ---
+    # setup.asm hardcodes 4 MiB, which is enough for the kernel alone and too
+    # small once `make INITRAMFS=` has linked a cpio archive into the image:
+    # the payload is uncompressed, so the memory the image occupies is the
+    # payload, and a loader that trusts this field (GRUB does -- it sizes the
+    # window it reserves and may load the kernel into from it) would cut the
+    # image off mid-way.  Take the larger of setup.asm's floor and the
+    # payload rounded up to 2 MiB, plus 2 MiB of headroom above that for the
+    # .bss, the boot stack and whatever the kernel allocates before the
+    # buddy is up.
+    need = max(0x400000, ((payload + 0x1FFFFF) & ~0x1FFFFF) + 0x200000)
+    struct.pack_into("<I", data, 0x260, need)
 
     with open(path, "wb") as f:
         f.write(bytes(data))
 
-    print("  PATCH   %s" % path)
+    '''print("  PATCH   %s" % path)
     print("          setup_sects = %d (header byte 0x%02x)"
           % (setup_sects, setup_sects - 1))
     print("          syssize     = %d paragraphs (%d payload bytes)"
           % (syssize, payload))
+    print("          init_size   = %d bytes (0x%x)" % (need, need))'''
     return 0
 
 

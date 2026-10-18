@@ -13,10 +13,18 @@ Six phases, each one must pass:
 
 Usage:
     scripts/smoke_test.py [--no-build] [--clean] [--timeout SECS] [--jobs N]
-                           [--qemu-args "-extra qemu flags"]
+                           [--smp N] [--qemu-args "-extra qemu flags"]
+
+--smp N picks the guest CPU count (default 2) and adjusts the ordered boot
+markers to match, which is what the separate scripts/smoke_smp1.py existed
+for: two markers assume a second CPU (the AP must print its CR0/CR4, and the
+kernel must count 2 online), so `--qemu-args "-smp 1"` could never get past
+phase 4.  Run `--smp 1` for that half -- same script, same phases, same
+systest tag set.
 
 Exit status is 0 only when every check passed.  The full serial transcript
-is kept in build/smoke/serial.log.
+is kept in build/smoke/serial.log, or build/smoke/serial-smpN.log when the
+run is not the -smp 2 default (so the two do not overwrite each other).
 """
 
 import argparse
@@ -35,23 +43,40 @@ BUILD = os.path.join(ROOT, "build")
 SMOKE_DIR = os.path.join(BUILD, "smoke")
 SERIAL_LOG = os.path.join(SMOKE_DIR, "serial.log")
 
+
+def serial_log_path(smp):
+    """Transcript path for a run with -smp N.
+
+    The -smp 2 default keeps the historical serial.log that other tooling
+    greps; every other CPU count gets its own file so running one flavour
+    does not silently overwrite the transcript of the other."""
+    return SERIAL_LOG if smp == 2 else os.path.join(
+        SMOKE_DIR, "serial-smp%d.log" % smp)
+
 BZIMAGE = os.path.join(BUILD, "bzImage")
 VMLINUX = os.path.join(BUILD, "vmlinux.elf")
 DISK = os.path.join(BUILD, "disk.img")
 
 USER_LINK_BASE = 0x7F8000400000
-README_LINE = b"A tiny unix-like kernel in ASM + C + C++ + Rust!"
+README_LINE = b"A tiny unix-like kernel in ASM + C!"  # "+ Rust" dropped 2026-10-18 (Rust gone); "+ C++" dropped same day, evening (C++ count zero)
+
+# usr/sh.c prints "root@lnxrm$ "; older builds printed "# ".  Accept both so
+# the boot phase and every shell step don't hinge on the prompt's wording.
+SHELL_PROMPT = br"(?:# |root@lnxrm\$ )"
 
 BUILD_TIMEOUT = 600
 
 REQUIRED_TOOLS = [
-    "make", "gcc", "g++", "ld", "objcopy", "nm", "nasm", "rustc",
+    "make", "gcc", "g++", "ld", "objcopy", "nm", "nasm",
     "python3", "dd", "mkfs.vfat", "mcopy", "mmd", "qemu-system-x86_64",
 ]
 OPTIONAL_TOOLS = ["fsck.vfat", "mdir"]
 
 BOOT_MARKERS = [
-    ("kernel banner", br"lnxrm v[0-9][^\s]* -- x86-64"),
+    # main.c prints "--x86-64"; older builds printed "-- x86-64".  Accept both
+    # rather than making the whole boot phase -- and with it every shell step
+    # -- hinge on spacing in a banner.
+    ("kernel banner", br"lnxrm v[0-9][^\s]* -{1,2}\s?x86-64"),
     ("e820 map", br"\[boot\] \d+ usable e820 entries"),
     ("early selftest", br"\[ktest\] stage early: [1-9]\d* cases, [1-9]\d* checks, 0 failed"),
     ("pmm", br"\[pmm\] frames [0-9a-f]+\.\.#[0-9a-f]+"),
@@ -69,6 +94,11 @@ BOOT_MARKERS = [
     # printed before the mount succeeds.
     ("disk capacity is the real 64 MiB image",
      br"\[vfs\] attempting disk mount on \w+ \(131072 sectors, 64 MiB\)"),
+    # C13: the FAT32 journal lays itself out on every mount -- "clean" once the
+    # log exists, "formatted" the first time, "recovering" when a transaction
+    # was left committed.  It prints before the mount summary because it runs
+    # inside fat_mount(), so it has to sit ahead of the marker below.
+    ("fat32 journal laid out", br"\[fat32\] journal: \d+-sector log at LBA 8 \(\w+\)"),
     ("fat32 mounted", br"\[vfs\] FAT32 mounted at /"),
     # T-005: the late self-test arms a failing block device; the FAT32 layer
     # must say so out loud rather than pass the garbage through.
@@ -86,7 +116,7 @@ BOOT_MARKERS = [
     ("2 cpus online", br"\[smp\] 2 CPUs online"),
     ("boot ready", br"\[boot\] ready in \d+ ms"),
     ("init read /README.md", re.escape(README_LINE)),
-    ("shell prompt", br"# "),
+    ("shell prompt", SHELL_PROMPT),
 ]
 
 # The block cache reports what it measured (T-007/T-008).  These are checked
@@ -100,7 +130,48 @@ LATE_REPORTS = [
     ("t-007 hot set written back once", br"\[blk_cache\] T-007 hot set:"),
     ("t-008 write then read is coherent", br"\[fat32\] T-008 coherent:"),
     ("t-008 FAT region stays out of the cache", br"\[fat32\] T-008 FAT region:"),
+    # C13: the journal cases proved write-ahead, replay-after-a-refused-apply
+    # and "no log, no trace" with blk_inject_io() standing in for the power
+    # cut.  Without this the suite would pass on tally alone.
+    ("c13 journal write-ahead + replay verified",
+     br"\[fat32\] C13 journal: write-ahead \+ replay verified"),
 ]
+
+# Two BOOT_MARKERS entries assume a second CPU came up: the AP has to print
+# its CR0/CR4, and the kernel has to count 2 online.  They are keyed by
+# label so boot_markers() can *swap* them per CPU count instead of dropping
+# them -- silently removing them would let a guest that QEMU never gave a
+# second CPU pass phase 4 with nothing missing.
+AP_MARKER = "CR0.WP + SMEP + SMAP on APs"
+CPU_COUNT_MARKER = "2 cpus online"
+
+# A -smp 1 guest has no AP at all, so this must never appear.  Checked as a
+# negative rather than as a boot marker, because an ordered marker can only
+# demand that something *is* printed.
+PHANTOM_AP = re.compile(br"\[cpu\] AP\d+ ")
+
+
+def boot_markers(smp):
+    """BOOT_MARKERS adjusted for a -smp N guest, in the same order.
+
+    -smp 2 (the default) comes back untouched.  Any other count rewrites the
+    CPU-count marker to the number the kernel must actually report, and on
+    -smp 1 also drops the AP marker since no AP exists to print it.
+    """
+    if smp == 2:
+        return list(BOOT_MARKERS)
+    marks = []
+    for name, pat in BOOT_MARKERS:
+        if name == AP_MARKER:
+            if smp != 1:
+                marks.append((name, pat))
+        elif name == CPU_COUNT_MARKER:
+            marks.append(("smp online count is %d" % smp,
+                          r"\[smp\] %d CPUs online" % smp))
+        else:
+            marks.append((name, pat))
+    return marks
+
 
 SYSTEST_TAGS = [
     ("uname.ret", br"uname\.ret=0"),
@@ -202,6 +273,10 @@ SYSTEST_TAGS = [
     ("parent's account untouched", br"mem\.parent\.unchanged=1"),
     ("child reaped cleanly", br"mem\.status=0"),
     ("recycled slot starts clean", br"mem\.slot\.clean=1"),
+    # T-094: a child recursed ~110 KiB deep on a stack the kernel mapped
+    # only 16 KiB of.  status 0 means it survived: the kernel grew the stack
+    # lazily instead of letting the not-present #PF kill it.
+    ("deep recursion survived (stack grew)", br"ustack\.status=0"),
     ("systest.done = 1", br"systest\.done=1"),
 ]
 
@@ -443,7 +518,7 @@ class Guest:
     def __init__(self, args, timeout, disk=DISK):
         self.timeout = timeout
         cmd = ["qemu-system-x86_64",
-               "-m", "256", "-smp", "2",
+               "-m", str(args.mem), "-smp", str(args.smp),
                # the stock qemu64 model has neither SMEP (CR4 bit 20) nor
                # SMAP (bit 21) -- both would be reserved bits => #GP; the
                # kernel CPUID-gates on them, so offer both here or the
@@ -540,7 +615,7 @@ def phase_boot_and_shell(report, args):
     try:
         booted = True
         with Phase(report, "4/6 boot") as boot_phase:
-            for name, pat in BOOT_MARKERS:
+            for name, pat in boot_markers(args.smp):
                 m = guest.wait(pat, args.timeout)
                 if not report.add("serial: %s" % name, m is not None):
                     booted = False
@@ -567,6 +642,14 @@ def phase_boot_and_shell(report, args):
             # size.  Either way every bounds check downstream is lying.
             report.add("no all-ones disk capacity",
                        b"4294967295 sectors" not in whole)
+            # -smp 1 has no AP_MARKER to wait for (boot_markers() removed
+            # it), so the absence is the assertion: a kernel that "brought
+            # up" an AP QEMU never gave us would otherwise slip through
+            # with the rest of the list happily green.
+            if args.smp == 1:
+                report.add("no AP on a -smp 1 guest",
+                           PHANTOM_AP.search(whole) is None,
+                           "kernel printed an AP line on a 1-CPU guest")
 
         with Phase(report, "5/6 shell") as shell_phase:
             if not booted:
@@ -575,11 +658,12 @@ def phase_boot_and_shell(report, args):
                 run_shell_steps(report, guest, args)
         return boot_phase.ok and shell_phase.ok
     finally:
-        with open(SERIAL_LOG, "wb") as f:
+        log = serial_log_path(args.smp)
+        with open(log, "wb") as f:
             f.write(bytes(guest.buf))
         guest.stop()
         print("\n  serial transcript: %s (%d bytes)"
-              % (os.path.relpath(SERIAL_LOG, ROOT), os.path.getsize(SERIAL_LOG)),
+              % (os.path.relpath(log, ROOT), os.path.getsize(log)),
               flush=True)
 
 
@@ -690,7 +774,7 @@ def phase_forged_fat(report, args):
                 continue
             guest = Guest(args, args.timeout, disk=img)
             try:
-                if guest.wait(br"# ", args.timeout) is None:
+                if guest.wait(SHELL_PROMPT, args.timeout) is None:
                     report.add("forged FAT boot (%s)" % label, False,
                                "no shell prompt")
                     dump_tail(guest)
@@ -700,12 +784,15 @@ def phase_forged_fat(report, args):
                            guest.wait(warn, args.timeout) is not None,
                            "driver stayed silent about the forged entry")
                 report.add("shell returns (%s)" % label,
-                           guest.wait(br"# ", args.timeout) is not None,
+                           guest.wait(SHELL_PROMPT, args.timeout) is not None,
                            "guest hung walking the forged chain")
             finally:
-                with open(os.path.join(
-                        SMOKE_DIR, "serial-forged-%s.log" % label.split()[0]),
-                        "wb") as f:
+                # same non-default suffix as the main transcript: an smp1
+                # run must not overwrite the smp2 evidence
+                stem = "serial-forged-%s" % label.split()[0]
+                if args.smp != 2:
+                    stem += "-smp%d" % args.smp
+                with open(os.path.join(SMOKE_DIR, stem + ".log"), "wb") as f:
                     f.write(bytes(guest.buf))
                 guest.stop()
         return ph.ok
@@ -724,9 +811,22 @@ def main():
                     help="make -jN (default: 2x cores)")
     ap.add_argument("--qemu-args", default="",
                     help="extra QEMU arguments as one quoted string")
+    ap.add_argument("--smp", type=int, default=2, metavar="N",
+                    help="guest CPU count (default 2).  1 switches the boot "
+                         "markers to the single-CPU pair -- this is the old "
+                         "scripts/smoke_smp1.py folded in here")
+    ap.add_argument("--mem", type=int, default=256, metavar="MIB",
+                    help="guest RAM in MiB (default 256).  Raise above the "
+                         "kernel's managed window (>=1024) to exercise a "
+                         "physical window that spans >1 GiB")
     args = ap.parse_args()
+    if args.smp < 1:
+        ap.error("--smp must be >= 1")
+    if args.mem < 16:
+        ap.error("--mem must be >= 16")
 
-    print("lnxrm smoke test  (root: %s)" % ROOT)
+    print("lnxrm smoke test  (root: %s, -smp %d, -m %d)"
+          % (ROOT, args.smp, args.mem))
     report = Report()
 
     if not phase_toolchain(report):

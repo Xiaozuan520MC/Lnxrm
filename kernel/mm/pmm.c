@@ -6,6 +6,7 @@
 #include <console.h>
 #include <boot.h>
 #include <sys/spinlock.h>
+#include <sys/percpu.h>
 
 #define MAX_ORDER      11
 #define MIN_ORDER_BITS 12
@@ -180,29 +181,24 @@ void pmm_inject_oom(int n)
     oom_inject = n;
 }
 
-u64 pmm_alloc_order(int order)
+/* ---- four.4: raw take/put on the global free lists (caller holds pmm_lock) ----
+ * These deliberately do NOT touch free_pg: accounting happens at the boundary
+ * where a frame actually changes hands between a CPU's stash and a caller, so
+ * that moving a batch between the global lists and a per-CPU stash (which does
+ * not change how many frames are "free") leaves the count alone. */
+static u64 buddy_take_locked(int order)
 {
-    u64 flags;
-    spin_lock_irqsave(&pmm_lock, &flags);
-
-    if (oom_inject > 0) { /* injected failure: behave like a dry buddy */
-        oom_inject--;
-        goto fail;
-    }
-
     int o = order;
-    if (o >= MAX_ORDER) goto fail;
+    if (o >= MAX_ORDER) return 0;
     while (o < MAX_ORDER && fl[o].count == 0) o++;
-    if (o >= MAX_ORDER) goto fail;
+    if (o >= MAX_ORDER) return 0;
 
     u64 addr = fl[o].head;
-    u64 next = *(u64 *)(uptr)addr;
-    fl[o].head = next;
+    fl[o].head = *(u64 *)(uptr)addr;
     fl[o].count--;
     bit_clr(o, addr);
 
-    /* split down to the requested order */
-    while (o > order) {
+    while (o > order) { /* split down to the requested order */
         o--;
         u64 half = addr + (1UL << (MIN_ORDER_BITS + o));
         *(u64 *)(uptr)half = fl[o].head;
@@ -210,21 +206,11 @@ u64 pmm_alloc_order(int order)
         fl[o].count++;
         bit_set(o, half);
     }
-    free_pg -= 1UL << order;
-
-    spin_unlock_irqrestore(&pmm_lock, flags);
     return addr;
-
-fail:
-    spin_unlock_irqrestore(&pmm_lock, flags);
-    return 0;
 }
 
-void pmm_free_order(u64 pa, int order)
+static void buddy_put_locked(u64 pa, int order)
 {
-    u64 flags;
-    spin_lock_irqsave(&pmm_lock, &flags);
-
     int o = order;
     while (o + 1 < MAX_ORDER) {
         u64 bud = buddy_of(pa, o);
@@ -243,8 +229,88 @@ void pmm_free_order(u64 pa, int order)
     fl[o].head = pa;
     fl[o].count++;
     bit_set(o, pa);
-    free_pg += 1UL << order;
+}
 
+/* Disable/restore interrupts for the lock-free stash fast path.  The stash is
+ * only ever touched by the local CPU with IRQs off, so an interrupt handler
+ * that itself allocates/frees cannot interleave with a half-done push/pop. */
+static inline u64 irq_save(void)
+{
+    u64 f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(u64 f)
+{
+    __asm__ volatile("push %0; popfq" :: "r"(f) : "memory", "cc");
+}
+
+u64 pmm_alloc_order(int order)
+{
+    /* T-004 fault injection bypasses the stash so the OOM self-test still sees
+     * a dry allocator even when the per-CPU cache is warm. */
+    if (__atomic_load_n(&oom_inject, __ATOMIC_RELAXED) > 0) {
+        __atomic_fetch_sub(&oom_inject, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+
+    if (order == 0) {
+        struct cpu_info *ci = this_cpu_data();
+        u64 f = irq_save();
+        if (ci->pcache_n == 0) {
+            /* stash empty: bridge a batch in from the buddy.  Holds pmm_lock
+             * (irqsave nests, still off) then pops one before re-enabling. */
+            u64 flags;
+            spin_lock_irqsave(&pmm_lock, &flags);
+            int got = 0;
+            while (got < PCACHE_N) {
+                u64 a = buddy_take_locked(0);
+                if (!a) break;
+                ci->pcache[got++] = a;
+            }
+            ci->pcache_n = got;
+            spin_unlock_irqrestore(&pmm_lock, flags); /* back to IRQs-off (f) */
+            if (ci->pcache_n == 0) { irq_restore(f); return 0; } /* buddy dry */
+        }
+        u64 addr = ci->pcache[--ci->pcache_n];
+        __atomic_fetch_sub(&free_pg, 1, __ATOMIC_RELAXED);
+        irq_restore(f);
+        return addr;
+    }
+
+    u64 flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+    u64 addr = buddy_take_locked(order);
+    if (addr) __atomic_fetch_sub(&free_pg, 1UL << order, __ATOMIC_RELAXED);
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return addr;
+}
+
+void pmm_free_order(u64 pa, int order)
+{
+    if (order == 0) {
+        struct cpu_info *ci = this_cpu_data();
+        u64 f = irq_save();
+        if (ci->pcache_n < PCACHE_N) {
+            ci->pcache[ci->pcache_n++] = pa;
+            __atomic_fetch_add(&free_pg, 1, __ATOMIC_RELAXED);
+            irq_restore(f);
+            return;
+        }
+        /* stash full: hand this frame straight to the buddy under the lock */
+        u64 flags;
+        spin_lock_irqsave(&pmm_lock, &flags);
+        buddy_put_locked(pa, 0);
+        __atomic_fetch_add(&free_pg, 1, __ATOMIC_RELAXED);
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        irq_restore(f);
+        return;
+    }
+
+    u64 flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+    buddy_put_locked(pa, order);
+    __atomic_fetch_add(&free_pg, 1UL << order, __ATOMIC_RELAXED);
     spin_unlock_irqrestore(&pmm_lock, flags);
 }
 

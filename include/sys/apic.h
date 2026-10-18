@@ -29,9 +29,6 @@ extern "C" {
 /* LVT timer modes */
 #define LVT_TIMER_PERIODIC 0x20000
 
-/* APIC ID */
-#define MAX_CPUS    8
-
 void apic_init(void); /* init LAPIC on BSP */
 void apic_enable(void);
 void apic_eoi(void);

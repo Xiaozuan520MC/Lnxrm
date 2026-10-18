@@ -53,16 +53,16 @@ def main():
 
     imm = struct.unpack_from("<I", data, idx + 1)[0]
     if imm == target:
-        print("  PATCH   jmp 0x18:0x%08X already correct (offset 0x%x)"
-              % (target, idx))
+        '''print("  PATCH   jmp 0x18:0x%08X already correct (offset 0x%x)"
+              % (target, idx))'''
         return 0
 
     struct.pack_into("<I", data, idx + 1, target)
     with open(setup_bin, "wb") as f:
         f.write(bytes(data))
 
-    print("  PATCH   jmp 0x18:0x%08X -> 0x18:0x%08X (offset 0x%x)"
-          % (SENTINEL, target, idx))
+    '''print("  PATCH   jmp 0x18:0x%08X -> 0x18:0x%08X (offset 0x%x)"
+          % (SENTINEL, target, idx))'''
     return 0
 
 if __name__ == "__main__":

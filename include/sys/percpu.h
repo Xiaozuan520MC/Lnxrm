@@ -8,7 +8,11 @@
 extern "C" {
 #endif
 
-#define MAX_CPUS 8
+/* four.4: per-CPU cache of order-0 (4 KiB) frames.  A small lock-free stash
+ * that keeps the single most common allocation off the global buddy lock.
+ * Only the owning CPU touches its own entry, always with interrupts off
+ * (see pmm.c), so no cross-CPU synchronisation is needed. */
+#define PCACHE_N 32
 
 struct cpu_info {
     u32 id;       /* logical CPU id */
@@ -24,6 +28,9 @@ struct cpu_info {
      * here; per-CPU run queues are guarded by sched.c's runq_lock. */
 
     volatile bool need_resched; /* per-CPU reschedule flag */
+
+    u64 pcache[PCACHE_N]; /* order-0 frame stash (four.4) */
+    int pcache_n;         /* frames currently in the stash */
 };
 
 /* GS-relative per-CPU struct. Size must be a power of 2 for easy addressing. */

@@ -1,10 +1,11 @@
 # lnxrm 差距分析 · 评审记录 · 行动计划
 
-> 评估对象：`lnxrm` 内核，10,151 行内核 + 761 行用户态（11,068 行源码，80 个源文件 + 2 个构建脚本）
+> 评估对象：`lnxrm` 内核，14,890 行内核（kernel/+arch/+include/）+ 4,565 行内核自测（ktest/）+ 1,809 行用户态（16 个程序）
+> **2026-10-18（夜）现状**：内核 **20,260** 行（`kernel/` 11,237 + `arch/` 1,723 + `include/` 2,556 + `ktest/` 4,744 自测）+ 用户态 **1,783** 行（16 个程序）；ktest 85 用例 / 1,633 检查；语言 **ASM + C**（Rust 组件当日整体移除；C++ 组件同日晚随 SMP 纯 C 重写清零）——口径与差值见 `CODEBASE.md` §35 的 2026-10-18 追加表（上行是 10-01 起点，保留）
 > 评估方式：全量阅读源码 + 从零构建 + QEMU 实机启动验证
 > 文档性质：工程差距分析，不是路线图许愿，也不是缺陷清单堆砌
-> 本文三部分：**第一部分 差距分析**（66 条编号缺陷，§0–§11） · **第二部分 评审记录**（2026-10-01 实测与安全审查，§12–§18） ·
-> **第三部分 行动计划**（T-000… 任务卡，按依赖排序，§19–§37）；章节号在全文件范围内唯一
+> 本文三部分：**第一部分 差距分析**（72 条编号缺陷 C1–C72，§0–§11） · **第二部分 评审记录**（实测与安全审查，§12–§18） ·
+> **第三部分 行动计划**（T-000…T-099 任务卡，按依赖排序，§19–§37）；章节号在全文件范围内唯一
 
 ---
 
@@ -13,19 +14,19 @@
 
 ### 0. 结论摘要
 
-**lnxrm 是一个内核。** 不是"像内核"，是内核：ring-0 特权代码、直接管理硬件（PCI 枚举 / IDE PIO / AHCI / PS/2 / 16550 / VBE）、每进程独立地址空间、进程生命周期、SMP 抢占调度、系统调用边界、ELF 装载、持久化存储、POSIX 信号、init + 用户态 shell。10,151 行内核达到这个功能密度，在同类项目中处于很高的分位，而且**它真的能跑**——从 VBE 选型一路到 `[smp] 2 CPUs online` 再到用户态 `/bin/init` 输出，没有任何一步是纸面上的。
+**lnxrm 是一个内核。** 不是"像内核"，是内核：ring-0 特权代码、直接管理硬件（PCI 枚举 / IDE PIO / AHCI / PS/2 / 16550 / VBE）、每进程独立地址空间、进程生命周期、SMP 抢占调度、系统调用边界、ELF 装载、持久化存储、POSIX 信号、init + 用户态 shell。约 1.5 万行内核达到这个功能密度，在同类项目中处于很高的分位，而且**它真的能跑**——从 VBE 选型一路到 `[smp] 2 CPUs online` 再到用户态 `/bin/init` 输出，没有任何一步是纸面上的。
 
-**但它不是"合格"的内核。** 三句话概括差距：
+**它已跨过"作品"到"工程可用"的门槛，但离"稳健/可投产"仍有结构性距离。** 三句话概括**当前**差距（注：本文档早期版本列的"无安全边界/零测试"已随 Step 2–4 修掉，见下）：
 
-1. **它假设所有代码都可信，而缺的不是补丁，是整个安全模型。** 全树没有 `uid`/`gid`/`capability`/`RLIMIT` 的任何概念；`EFER.NXE`、`CR0.WP`、`CR4.WP`、`SMEP`、`SMAP` **一个都没开**。所有进程都是 root，所有内存页都可执行，只读页实际可写。没有"不可信代码"这个概念，意味着所有内存安全缺陷的杀伤半径都是整机。
+1. **安全边界已由硬件强制，但内核自身的加固仍未做。** `EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 已开启且有 ktest 守着（Step 3 ✅）；`struct cred` + 三类 capability + 每用户 64 MiB 内存配额已落地（Step 4 ✅）。**仍未做**：内核镜像 RWX（无 W^X/NX）、无栈保护、无 KASLR/KPTI（后者按 §10 明确不做）、入口路径无 `swapgs`、无 IST/双故障栈。杀伤半径仍大于应有的。
 
-2. **它没有验证能力，因此没有工程纪律。** 零测试、零 CI、零可观测性、零内部断言。唯一的验证回路是"启动，看串口日志"。这直接导致第三点。
+2. **验证能力已建立，但中断/锁模型仍不可用于任何延迟敏感场景。** ktest 85 用例 + `make smoke` 179/179 已是常规门控（Step 2 ✅）。**仍未做**：所有系统调用全程关中断、一把全局 FS 锁跨多秒磁盘 I/O、调度器是 LIFO 而非 RR、无内核抢占、无 CI。并发正确性仍是软肋。
 
-3. **它存在系统性的契约漂移。** 意图写进注释和 ABI，实现漂移了，没有任何东西会发现——因为没有测试会失败。`fat32_journal` 承诺原子性但提供的是"多写一遍"；调度器注释声称 circular queue 而实现是 LIFO；`mm.h` 的槽号注释与实际相差 31 个槽。
+3. **契约漂移已开始收敛，但文档尚未同步。** `fat32_journal` 已重建为真 on-disk redo 日志 + mount replay（T-072 ✅）；块缓存改时间戳 LRU；console/FAT 链/kmalloc 失败路径等止血项已完成（Step 1 ✅）。**仍未做**：本文档与 CODEBASE 的行数/文件清单/缺陷计数是旧快照，多处仍描述已删除的文件——这正是 Step 5 要修的。
 
-**量化差距：综合成熟度 2.1 / 5.0，目标 3.9 / 5.0。** 详见第 8 节。
+**量化差距：综合成熟度从旧基线 2.1/5.0 上移（安全硬件边界、验证框架两个 L0 维度已抬升），但并发/抢占/CI/可观测性仍在低位，距离 L3「稳健」的 3.9 目标不变。** 详见第 8 节。
 
-**如果只能做一件事**：给 `console_write` 加 `print_lock`（一行，解掉 SMP 下最显眼的竞争）。**如果只能做两件事**：给 FAT 簇链遍历加迭代上限（十几行，解掉"一个坏扇区挂死整机"）。**如果只能做一件战略性的事**：砍掉一半子系统，把剩下的做到能写测试、能被测。
+**如果只能做一件事**：commit 当前 1786 行未提交改动 + 加 LICENSE（可复现性与合法性的地基，Step 5 的一半）。**如果只能做两件事**：再修 C41（`O_RDONLY` 文件可写）与 C29（`bps>512` 缓冲溢出）——两个可被测试门控抓到的真实缺陷（Step 7）。**如果只能做一件战略性的事**：不要加新子系统，把文件系统硬化与并发模型做到能测、能被测。
 
 ---
 
@@ -118,6 +119,19 @@ VGA 文本后端仍作为 `fb_init` 失败时的回退保留。
 #### 2.5 多语言工程
 
 C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`、trampoline 共享数据（`kernel/rust/*.rs`）。Rust 侧以 `staticlib` 形式被链接脚本整体拉入，`panic_handler` 手写 `format_into` 后停机。构建零警告。
+
+> **2026-10-18 更正**：本段两处失实。① `Spinlock<T>` / `KBox<T>` **从未存在过**——Rust 三文件里
+> 没有任何同步原语或智能指针（自旋锁一直是 C 的 `include/sys/spinlock.h`；trampoline 共享数据是
+> volatile 手写），属夸大陈述，此处登记。② **Rust 组件已于 2026-10-18 整体移除**：`uart.rs` →
+> `kernel/drivers/uart.c`（`lnxrm_uart_*` ABI 不变）、`smp.rs` 并入 `kernel/smp.cpp`（复用
+> `sys/smp.h` 的 `struct trampoline_data`）、`lib.rs` 随 `panic_handler` 删除，构建不再需要
+> rustc。**现状**：C 主体（串口 + AHCI + SMP 均为 C）+ NASM 汇编，构建零警告、`make smoke` 两档 179/179。原文按历史理解。
+>
+> **2026-10-18 追记（同日晚）**：C++ 也已清零——`kernel/smp.cpp`（309 行）与 `include/cpp/smp.hpp`
+> 随 SMP 完整重写改为纯 C（`kernel/smp.c` 355 行），同批新增 ACPI MADT 枚举（`kernel/acpi.c`）
+> 与 x2APIC MSR 访问路径（`kernel/apic.c`），Makefile 的 `g++`/`CXXFLAGS`/`%.opp` 规则全删。
+> **现状**：C + NASM 两语言，零警告，`make smoke` 三档 179/179（`-smp 2` xAPIC / `-smp 1` /
+> `-smp 2` +x2apic——x2APIC 是真机修复的主路径，QEMU 里用 CPUID 门控强制走 MSR 验证）。
 
 #### 2.6 实测启动日志
 
@@ -270,7 +284,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 用户程序扩内存的路径，而且落地时**必须走 `cred_mem_quota()` 这同一道门**，否则配额就
 从"地址空间上限"退化成"堆上限"，`vmm_count_user_pages` 也就漏算了 mmap 出来的部分。
 
-**`mmap` 缺失的连锁后果**（这是文档里最容易被低估的一条）：用户态只能构建**静态、单一文件、ET_EXEC** 的程序（`Makefile:45-47` 的 `-static -no-pie -mcmodel=large` 就是这个约束的直接体现）。这意味着这个内核**只能运行它自己那一组 16 个程序**，上面跑不了任何第三方软件。这是能力天花板，不是 bug 列表能表达的。
+**`mmap` 缺失的连锁后果**（这是文档里最容易被低估的一条）：用户态只能构建**静态、单一文件、ET_EXEC** 的程序（`Makefile:39-40` 的 `-static -no-pie -mcmodel=large` 就是这个约束的直接体现）。这意味着这个内核**只能运行它自己那一组 16 个程序**，上面跑不了任何第三方软件。这是能力天花板，不是 bug 列表能表达的。
 
 **要建的东西**（按依赖顺序）：
 1. `mremap` 语义的 `mmap(NULL, len, prot, flags, fd, off)` —— 匿名映射先行（供 `brk` 迁移、共享内存、栈增长共用一条路径）
@@ -282,6 +296,12 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 成本：**mmap + munmap + mprotect + 页错误分发 ~600–1000 行**。这是单项最大投入。
 
 #### 4.5 身份与生命周期 —— 缺一整层机制
+
+> **2026-10-17 Step 6 已修复主体**（见第二部分 §28）：`parent` 不再是裸指针，
+> 改存 `(pid, 世代)` 并经 `task_parent()`/`find_task_gen()` 解析；`task_free_slot`
+> 回收时清扫指向本化身的 `parent`；`find_task`/`find_task_gen`/alloc/free 均在
+> `task_table_lock` 内（`task_iter` 为有据可查的例外）；`con_waiter` 改链表。
+> 以下保留的是当时的诊断原文（第一部分），供建档与回溯。
 
 `struct task` 是静态 64 槽数组里的裸槽位（`sched.c:23`）。`find_task(pid)` 线性扫描。`parent` 是指向**会被复用的槽位**的裸指针，无世代计数。
 
@@ -422,12 +442,22 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 #### 5.3 编码规约
 
+**「契约必须有测试」（T-041 规约，2026-10-17 建立）** —— D 类（契约漂移）的根因是"意图写进注释/ABI，实现漂移了却没有任何测试会失败"。要打断这个循环，任何对外可观察的承诺都必须有机器守着：
+
+1. **任何写进注释或 ABI 的行为，必须有一个断言或 smoke tag 守着。** 若某项确实无法自动测试，必须在注释里写明"为什么可以没有测试"。
+2. **"已定义但未实现"的 flag / 结构体字段，必须在 ABI 头里显式标注 `/* reserved, unimplemented */`**，而不是留一个空壳让人以为它生效。
+3. **修改 ABI 结构体的任何字段，必须同步改 `docs/` 里的 ABI 描述**（`CODEBASE.md` 的调用约定与结构表）。
+4. **能用编译期 `_Static_assert` 钉住的常量约定，就不要只写注释。** 例：`include/types.h` 对 `VGA_VMA`/`DEV_VMA`/`KHEAP_VMA` 的 PD 槽号加了 `LNXRM_STATIC_ASSERT`，槽号注释曾错写 98/97 却无人发现，现在改错会让构建直接失败。
+5. **行为契约配一个 ktest 用例；并发/时序契约配一个 smoke tag。** 改动注释里引用的缺陷编号（C*/T-*）时，编号保持稳定不重排。
+
+实例（Step 5 落地）：`fat32_journal` 重建为真日志且有 `ktest/t_journal.c` 守着；调度队列"push-front LIFO"契约由 `ktest/t_task.c: test_runqueue_is_push_front` 守着。
+
 `.clang-format` 已存在（好事），但缺少：
 
 - 改动前的静态检查（`clang-tidy` / `cppcheck`）
-- 关键不变量写成断言而非注释
+- 关键不变量写成断言而非注释（**上文第 1/4 条已把它变成强制规约**）
 - 头文件 include 图的自动检查（`include/sys/percpu.h` ↔ `include/sys/sched.h` 互相 include 靠 `#ifdef` 打破，脆弱）
-- ABI 结构体的静态断言与版本号（现在 `boot.h` 对 `struct vbe_lfb_info` 有 static_assert，是好起点）
+- ABI 结构体的静态断言与版本号（现在 `boot.h` 对 `struct vbe_lfb_info` 有 static_assert，`types.h` 对 PD 槽号有 static_assert，是好起点）
 
 ---
 
@@ -437,7 +467,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 > **编号 C1–C72 是稳定 ID，不是序号。** 已随死代码一起消失的条目（C2/C6，以及
 > 曾经的 C3）保留编号并标记为已删除，**不重排**——因为 C5/C13/C16/C28/C48/C57/C62/C65/C68/C69 等
-> 编号被 `docs/README.md` 和本文第三部分交叉引用，重排会让所有
+> 编号被 `README.md` 和本文第三部分交叉引用，重排会让所有
 > 引用失效。当前有效条目 **66 条**（已修复或判定误报的条目保留编号，就地标注
 > 状态——2026-10-01 第二轮处理了 C1/C8/C9/C63，见第二部分 §16）。C3 是唯一
 > 一条**重新生效**的：它曾随后缓冲一起被判死并从计数里去掉，又因为 23–27 五个
@@ -481,7 +511,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 | # | 问题 | 位置 |
 |---|---|---|
-| C13 | **`fat32_journal` 不是 journal**。存**后像**不是前像；`abort` 只清计数器，**无法回滚**；`commit` 只是把同样扇区**再写一遍**。无预留日志区、无落盘 superblock、无 replay/recovery。头注释"provides atomic operations"不成立 | `fat32_journal.c:1-2,51-64,67-94,97-102` |
+| C13 | ~~**`fat32_journal` 不是 journal**。存**后像**不是前像；`abort` 只清计数器，**无法回滚**；`commit` 只是把同样扇区**再写一遍**。无预留日志区、无落盘 superblock、无 replay/recovery。头注释"provides atomic operations"不成立~~ **已修复（2026-10-14）**：旧实现整体删除后**重建为真正的 on-disk redo 日志**（`kernel/fs/fat32/fat32_journal.c`）。日志落在 mkfs 的 reserved 空闲扇区 `[8, reserved_sectors)`（mkfs.vfat 因此加 `-R 1024`，日志 1016 扇区 / 上限 128 条记录，惰性分配约 66 KiB RAM）；布局 = 扇区 8 上的 superblock（magic `JRN1`/version/state/nrec/head/CRC32）+ 每条记录 2 扇区（meta：magic/seq/lba/data-CRC32；随后 512B 后像）。**事务 = 每个变更 op 一个**：`begin` 只开缓冲，此后 `fat_write_sector`/`fat_set_entry` 的后像只入 RAM（按 lba 去重覆盖），**不碰 home**；`commit` 顺序 = flush 文件数据（ordered 模式，数据字节不入日志）→ 写记录 → 写 superblock(**state=COMMIT 即唯一提交点**) → apply home（FAT 直写并镜像 FAT#2、目录扇区走缓存）→ flush → superblock(CLEAN)。**apply 失败保留 COMMIT**（否则把可恢复的半途变成永久丢失），下次 mount 由 `fat_journal_mount` 幂等 redo replay（含把重放的 FAT 扇区同步回 `m->fat`），再置 CLEAN；日志写失败则提交点未到 → 操作等于没发生。读己经写由 `fat_read_sector` → `fat_journal_read` 提供；记录缓冲满时**中途 checkpoint 而非静默丢弃**（正是 C14 的缺陷）。失败语义不变：abort/失败只可能泄漏簇、不交叉链接。测试 `ktest/t_journal.c` 3 例（用 `blk_inject_io()` 分别拒绝 home 写、拒绝日志写，验证「写前先行 / 拒绝 apply 后能 replay / 日志拒绝则无痕」）+ smoke marker `fat32 journal laid out`、`c13 journal write-ahead + replay verified`；`make smoke` **178/178**，`fsck.vfat -n` 干净 | `fat32_journal.c`（重建）；`fat32_priv.h:46-94,164-176`；`fat32.c`（`fat_set_entry`→`fat_journal_add`，6 个 locked wrapper 包 begin/commit，`fat_mount`→`fat_journal_mount`）；`fat32_file.c:200`（数据改 `fat_write_sector_raw`）；`ktest/t_journal.c` |
 | C14 | ~~journal 32 条上限溢出时 `add` 返回错误，而**全部 6 个调用点丢弃返回值**~~（原描述：1 MB 写要记 2048 扇区，2016 个静默丢弃；`begin` 返回值同样被 6 处忽略） | `fat32_journal.c`（**已删除**）；**已失效（2026-10-01 登记）**：journal 文件删除，写路径改走块缓存写回，编号保留 |
 | C15 | ~~**未检查 `dev->read` 返回值 + 未初始化缓冲区 → 未初始化的内核栈被写进磁盘目录项**~~ **已修复（2026-10-05）**：全内核只剩 `blk_io_read()`/`blk_io_write()`（`blk_cache.c`）一处调用 `dev->read/write`，分区层（`mbr.c`）也改走同一口子；块层提供故障注入 `blk_inject_io(dev, lba, ops)` 让指定 LBA 的传输一律回 `LNXRM_EIO`（与真驱动拒绝同路径）。契约自下而上：扇区层只答 0/`LNXRM_EIO`，扫描层改三态（`fat_scan_dir`/`fat_resolve_path`/`fat_dir_iter`：1/0/负），VFS 不再把 `EIO` 折成 `ENOENT`/`EACCES`/「目录是空的」；`fat_write_impl` 三种结局（读失败不落盘 / 中途失败返回短计数 / 元数据失败 `EIO`）。缓存读失败作废 victim 槽（CODEBASE 9.3 一并修）。测试：`ktest/t_ioerr.c` 4 例 + smoke marker `t-005 injected I/O error reported`，`make smoke` **150/150**（详见第三部分 T-005） | ~~`fat32_meta.c:58,107,116,294`；`fat32_file.c:160,183`~~ `blk_cache.c:47,54,137,198`；`fat32_file.c:194,200`；`vfs.c:195,473` |
 | C16 | **`alloc_chain` 簇数截断**：`u32 nclus = (need_bytes + cluster-1)/cluster`，`need_bytes` 是 u64（最大 4 GB，来自 `off + n`）→ 只分配少量簇 → 随后仍把 `filesize` 设成 `off+n`。文件**报称比实际数据大**，之后读该区间返回未初始化簇内容 | `fat32_file.c:88` |
@@ -567,7 +597,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 | C65 | **`EFER.NXE` / `CR0.WP` / `CR4.WP` / `SMEP` / `SMAP` 全部未置位**（详见 4.2） | `entry64.S:70,122,128,261`；`trampoline.S:41-76`；`smp.cpp:199-206` |
 | C66 | `boot_collect_e820` 把 `grub_params_pa` 强转后**无任何合理性校验**就解引用 | `main.c:60-67` |
 | C67 | `boot_read_cmdline` 在 QEMU 无 `-append` 时读物理 `0x20000`，靠"那区域是零"侥幸 | `main.c:199-204` |
-| C68 | GRUB `linux` 路径**没有自动化测试**（`make run` 与 `make smoke` 只走 QEMU 路径）。**半条（2026-10-06）**：已落地 **`make imageiso`**（`Makefile:174`，暂存树 `build/iso/`、产物 `build/lnxrm.iso`、`grub.cfg` 由 Makefile 生成），手工实测三条子路径全过——`gfxpayload=1280x720x32`（32 bpp / pitch 5120）、无 fb、以及错写法 `1280x720,32`（只给 24 bpp）分别 1546/1546、1530/1530、1546/1546 checks，无三重故障，且 `mode=0x0` 证明读的是 `boot_params.screen_info` 而非 `0x8C00`。**仍未做**：纳入 smoke。命令见 `BUILD.md` §8.2 | ~~`main.c:50-58`~~ → `main.c:57,97,199`；`Makefile:165-202` |
+| C68 | GRUB `linux` 路径**没有自动化测试**（`make run` 与 `make smoke` 只走 QEMU 路径）。**半条（2026-10-06）**：已落地 **`make imageiso`**（`Makefile:145`，暂存树 `build/iso/`、产物 `build/lnxrm.iso`、`grub.cfg` 由 Makefile 生成），手工实测三条子路径全过——`gfxpayload=1280x720x32`（32 bpp / pitch 5120）、无 fb、以及错写法 `1280x720,32`（只给 24 bpp）分别 1546/1546、1530/1530、1546/1546 checks，无三重故障，且 `mode=0x0` 证明读的是 `boot_params.screen_info` 而非 `0x8C00`。**仍未做**：纳入 smoke。命令见 `BUILD.md` §8.2 | ~~`main.c:50-58`~~ → `main.c:57,97,199`；`Makefile:134-161` |
 | C69 | `boot` 只用**单个最大** E820 区域，忽略其他 RAM 区域 → 多段/非连续内存布局下浪费巨大。**2026-10-06 起每个区域还要先按 1 GiB 窗口裁剪**（`hi = MIN(hi, PMM_WINDOW_TOP)`），裁完一个不剩就 panic | `pmm.c:95-109,122-124` |
 | C70 | 固定物理地址 0x50000–0x57000（PML4/PDPT/PD/PT）**硬编码且从不校验是否与 E820 冲突** | `entry64.S:4-10` |
 | C71 | 见 6.4（内存子系统） | — |
@@ -581,12 +611,12 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 | 承诺 | 位置 | 实际 |
 |---|---|---|
-| `fat32_journal` "provides atomic operations for FAT32 updates" | `fat32_journal.c:1-2` | 后像 + 无落盘 + 无法回滚的重复写回（见 C13） |
+| ~~`fat32_journal` "provides atomic operations for FAT32 updates"~~ | ~~`fat32_journal.c:1-2`~~ | ~~后像 + 无落盘 + 无法回滚的重复写回（见 C13）~~ **✅ 已消解（2026-10-14）**：文件重建为真日志，头注释现在逐条描述真实协议与崩溃窗口，声明与实现一致；并由 `ktest/t_journal.c` 守住（断言写前先行、拒绝 apply 后能 replay、日志拒绝则无痕） |
 | `struct cpu_info` 注释 "circular run queue" | `sched.c:3-5` | LIFO（见 C62） |
 | ✅ **已修复（2026-10-01）**：`DEV_VMA` 标为 "PD_HI[98]"、`FIXMAP_VA` 标为 "slot 97" | `types.h:37-38,41-42` | 实际是 **128** 和 **112**；`vmm.c` 跳过的 97 是死项。**处理**：`FIXMAP_VA` 整体删除、注释改为 128、`vmm.c` 不再跳 97/112 |
 | ✅ **已修复（2026-10-01）**：`mm.h` 重复 "slot 98" | `include/mm/mm.h:45` | 同上，随 `FIXMAP_VA` 删除一并清理，注释改为 PD slot 128 |
 | ✅ **已修复（2026-10-01）**：`mm.h` 注释 "remote PTE editing via the fixmap slot" | `include/mm/mm.h:42-43` | **全树零引用**——最后一个使用者（`signal.c` 的单页临时别名）已随信号 trampoline 一起删除。**处理**：注释与宏直接删除 |
-| `smp.rs:23` 字段名 `ap_main_phys` | `kernel/rust/smp.rs:23` | 存的是**虚拟**地址（`smp.cpp:75-80` 有注释说明） |
+| `smp.rs:23` 字段名 `ap_main_phys` | `kernel/rust/smp.rs:23` | 存的是**虚拟**地址（`smp.cpp:75-80` 有注释说明）。**2026-10-18**：契约随 `smp.rs` 删除移入 `include/sys/smp.h` 的 `struct trampoline_data`（`ap_main_va`）与 `kernel/smp.cpp`；旧行位置仅登记 |
 | 6 项硬编码容量常量无动态分配 | `NR_TASKS 64`、`NR_FDS 16`、`CACHE_ENTRIES 64`、`MAX_MOUNTS 4`、`MAX_CPUS 8`、`blk_list[8]` | 编译期固定；`task_alloc_slot` 返回 NULL 尚可，但 `blk_register` 有 off-by-one（C28） |
 
 **共同模式：意图写进注释，实现漂移了，然后没有任何东西会发现——因为没有测试会失败。** 所以 B 类（5.1）是 D 类的根因。**修完 D 类而不修 B 类，三个月后 D 类会重新长出来。**
@@ -600,7 +630,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 | 维度 | 现状 | 目标 | 主要差距 |
 |---|---|---|---|
 | 引导 / 启动 | **4** | 4 | GRUB 路径只有 2026-10-06 手工实测、未纳入 smoke（C68）；硬编码 phys addr（C70）；只用一个 E820 区（C69） |
-| 物理内存管理 | **3** | 4 | 无回收、无 swap、无 OOM killer；**按进程记账已有**（`task.mem_pages`/`mem_peak`，T-032）；位图位置是隐式依赖（C57）；**管理窗口只有 1 GiB，>1 GiB 的内存不参与分配**（C71 修复的代价） |
+| 物理内存管理 | **3** | 4 | 无回收、无 swap、无 OOM killer；**按进程记账已有**（`task.mem_pages`/`mem_peak`，T-032）；位图位置是隐式依赖（C57）；**管理窗口已扩到 2 GiB**（四.1，`PMM_WINDOW_TOP=0x80000000`；>2 GiB 会折回低半区，需分段别名） |
 | 虚拟内存 / 地址空间 | **3** | 4 | 三槽设计优雅；但无 `mmap`、无 WP 语义、隔离只有 1 bit 深、无 PTI |
 | 进程管理 | **3** | 4 | fork/exec/wait/brk/信号齐全；但无 pid 对象（4.5）；**内存配额已有**（4.3，T-032），CPU 时间限制仍无 |
 | 调度 | **3** | 4 | 实为 LIFO（C62）、无亲和性；**已有按空闲/队列长度的负载均衡与本地 `need_resched`**，每 CPU 本地 tick（4.6，2026-10-01 修） |
@@ -612,14 +642,14 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 | 文件系统 | **2** | 4 | 能挂载能读写；但非崩溃安全、缓存坏、无环检测、多处泄漏（6.2） |
 | 图形 / 显示 | **3** | 3 | 帧缓冲控制台 + 23–27 五个绘图系统调用（裁剪保护）；**绘图入口两道门**（`CAP_FB` 能力 + 单 pid 归属，T-033，2026-10-05）；VGA 文本回退正常 |
 | 用户态 | **2** | 3 | 16 个程序（`init`、`sh` + 14 个命令）；但无动态链接可能（受 `mmap` 缺失制约） |
-| **测试** | **0** | 3 | **完全缺失**。这是 B 类其余部分的根因 |
-| **可观测性** | **0** | 3 | **完全缺失**。无 debug syscall、无 `/proc`、无 backtrace、无 loglevel |
-| **安全模型** | **0** | 4 | **完全缺失**（2026-10-01 记）。此后特权（T-030/T-031 的 `CAP_*`）、NXE/WP/SMEP/SMAP、内存上限（T-032 的 64 MiB 配额）、**画屏归属**（T-033 的单 owner + 两道门，2026-10-05）陆续落地，**此格分数未随之重算** |
+| **测试** | **2** | 3 | **已建立**：ktest 80 用例（4,565 行）+ `make smoke` 179/179（含 `-m`/`-smp` 矩阵、故障注入）。**2026-10-18：ktest 85 用例 / 4,740 行**（journal/initramfs/pagefault 等新模块各带用例）。**仍缺**：CI（无 `.github/`）、host 侧单测、sanitizer |
+| **可观测性** | **1** | 3 | **部分**：ktest 计数、`ps` 的 MEM/PEAK 列、serial 日志。**仍缺**：debug syscall、`/proc`、backtrace、loglevel |
+| **安全模型** | **2** | 4 | **已建立**：`struct cred` + 三类 `CAP_*`（T-030/T-031）、NXE/WP/SMEP/SMAP（Step 3）、64 MiB 内存配额（T-032）、画屏单 owner 两道门（T-033）。**仍缺**：KASLR/KPTI（§10 明确不做）、栈保护、内核 W^X、文件权限位、`swapgs`、IST |
 | 硬件支持广度 | **2** | 3 | 仅 x86-64、QEMU/PC 中心、IDE 28 位、TSC 单次标定无校验 |
 
-**综合：39/85 ≈ 2.2**（现状，2026-10-01 第二轮后；此前 36/85）对 **67/85 ≈ 3.9**（L3 稳健级目标）。
+**综合：43/85 ≈ 2.5**（现状，重算于 Step 2–4 落地后：测试 0→2、可观测性 0→1、安全模型 0→2；旧基线 2026-10-01 为 39/85 ≈ 2.2）对 **67/85 ≈ 3.9**（L3 稳健级目标）。
 
-**注意权重的分布**：综合分 2.1 掩盖了一个极不均衡的分布——有 4 个维度是 3–4 分（三槽地址空间、信号、启动、图形内核侧），有 4 个维度是 **0 分**（测试、可观测性、安全模型，以及受其制约的并发正确性 1 分）。**提升空间的 80% 集中在 5 个维度上，而不是均匀分布在 17 个维度上。**
+**注意权重的分布**：综合分 2.5 仍掩盖一个不均衡分布——有 5 个维度是 3–4 分（三槽地址空间、信号、启动、图形内核侧、进程管理），**已无 0 分维度**（测试/可观测性/安全模型随 Step 2–4 抬到 1–2 分），但并发正确性、设备驱动、文件系统仍卡在 2 分。**提升空间的大头集中在并发模型、驱动中断化、文件系统硬化三块，而不是均匀分布在 17 个维度上。**
 
 ---
 
@@ -634,7 +664,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 | ~~C1~~ | ~~`console_write` 走 `print_lock`~~（**已做，2026-10-01**：`console_out_lock` 共用） | 1 行 |
 | C11 | FAT 链遍历加迭代上限 + 环检测（`fat_next_cluster` 加 `>= max_cluster` 校验，遍历加计数器上限） | ~20 行 |
 | ~~C12~~ | ~~`kmalloc` 失败返回 NULL（保留 `panic` 为可选项）并修正所有调用点~~（**已做，2026-10-03**：19 处调用点核对、补 9 处检查，同链路的 `ensure_table`/`vmm_new_user_aspace`/`signal_map_restorer` panic 与 `sys_brk` 泄漏一并修掉，见第三部分 T-004） | ~30 行 |
-| ~~C14~~ | ~~检查 journal `add`/`begin` 返回值~~（**已失效**：journal 已删除） | — |
+| ~~C14~~ | ~~检查 journal `add`/`begin` 返回值~~（原描述：6 个调用点丢弃返回值）**已消解（2026-10-14）**：新 journal 的 `begin` 契约恒返 0（不成立时降级为非日志路径，见文件头注释），`add` 的返回值由 `fat_set_entry` 显式检查并回滚内存项、`fat_write_sector` 原样上抛且各目录/文件调用点均已 `if (...)` 检查；`commit` 的返回值由 6 个 locked wrapper 全部纳入返回码 | — |
 | ~~C71~~ | ~~PMM 管理窗口 > 恒等映射范围 → 启动即三重故障复位~~（**已做，2026-10-06**：窗口钳到 `PMM_WINDOW_TOP` 1 GiB + IDT/GDT 提前到 `start_kernel` 头四步 + 无可用 RAM 改 panic；真机"闪几行就重启"的根因，见 `CODEBASE.md` §22.6） | ~30 行 |
 | ~~C72~~ | ~~`0x6F00` 哨兵按 `u64` 读但只写了 DWORD~~（**已做，2026-10-06**：三处读点改 `*(u32*)`；QEMU 下残留恰为 0，只有真机会踩） | 3 行 |
 | ~~C24~~ | ~~`blk_cache` 的 `used` 改成访问时清零~~（**已做，2026-10-05**：没按这个便宜办法做——清零只换来时钟轮转，还是没有"最近"信息；改成时间戳 LRU 并删掉 `used`，见第三部分 T-007） | ~50 行（含计数与内省） |
@@ -674,8 +704,8 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 - ✅ 修正 `types.h` / `mm.h` 的槽号（98→128、97→112）——**已随 FIXMAP_VA 清理完成（2026-10-01）**
 - ✅ 修正 `mm.h` 的 "remote PTE editing" 注释（`FIXMAP_VA` 已零引用）——**已选择直接删掉宏与 fixmap 概念（2026-10-01）**
 - 修正 `sched.c` 的 "circular" 注释
-- 修正 `fat32_journal` 的头注释，或直接重命名为 `fat32_writeback`
-- **文档同步**：`docs/README.md`、`docs/CODEBASE.md`、`docs/GAP_ANALYSIS.md`、
+- ~~修正 `fat32_journal` 的头注释，或直接重命名为 `fat32_writeback`~~ —— **已消解（2026-10-14）**：文件重建为真 journal，头注释如实描述协议，并由 `ktest/t_journal.c` 断言守着（正是下一条"建立规约"的实例）
+- **文档同步**：`README.md`、`docs/CODEBASE.md`、`docs/GAP_ANALYSIS.md`、
   本文第三部分中任何提到已删代码的句子都要改（本轮就是这么做的）
 - **建立规约**：任何写进注释和 ABI 的行为，必须有一个断言或测试守着（依赖阶段 2）
 
@@ -700,9 +730,10 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 - C30 `fat_dir_iter` 加游标（真正的 getdents 语义）
 - C40 修 vnode 泄漏；C41 强制访问模式
 - ~~C24/C25 重写块缓存（正确的 LRU + 读失败路径）~~（**已做，2026-10-05**：时间戳 LRU + 读失败作废 victim 槽，见第三部分 T-007；C26 同日一并修掉，见 T-008）
-- **要么真正实现日志（落盘 + replay），要么删掉 `fat32_journal` 并诚实命名为写回缓冲**
+- ~~**要么真正实现日志（落盘 + replay），要么删掉 `fat32_journal` 并诚实命名为写回缓冲**~~（**已做，2026-10-14**：选了前者——on-disk redo 日志 + mount replay，见第三部分 C13 与 `ktest/t_journal.c`）
 
 **验收**：FAT32 官方 `fsck.vfat` 报告干净；`dd` + 随机断电模拟后能恢复或至少不返回错误数据。
+> **2026-10-14 状态**：`fsck.vfat -n` 干净（smoke 固定检查项，178/178）。断电模拟已**机制化**为 `blk_inject_io()` 故障注入：`ktest/t_journal.c` 分别拒绝「apply 写 home」（= 提交点之后断电）与「写日志记录」（= 提交点之前断电），断言前者能 replay 补齐、后者等于操作没发生，都不返回错误数据。字面意义的 `dd` + kill-QEMU 未做成自动化用例——它不可确定性地停在某个扇区写之间，而故障注入能精确停在协议的每一个窗口上。
 
 #### 阶段 6：驱动（~10 人日）
 
@@ -794,7 +825,7 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 ---
 
-*文档版本 1.1 · 所有行号引用基于死代码删除后的代码状态 · 编号 C1–C70 是稳定 ID，失效条目留空不重排*
+*文档版本 1.2 · 所有行号引用基于当前工作树代码状态 · 编号 C1–C72 是稳定 ID，失效条目留空不重排*
 
 ---
 
@@ -830,11 +861,11 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 | 证据 | 结果 |
 |---|---|
-| `make -j4` | 零错误、零警告（`-Wall -Wextra`，C/C++/ASM/Rust 四语言） |
-| 产物 | `bzImage` 252,616 字节、text 段 249,760 字节（2026-10-01 起点）→ 253,448（第二轮 SMP 完善）→ 254,920（§16.4 启动消息扩展）→ 158,968（`--gc-sections`）→ 160,024（`.image` 157,824，T-033）→ 160,856（`.image` 158,656）**，2026-10-05 T-080 重编** → 161,944（FAT32 大小写修复）→ **162,200（`.image` 160,000），2026-10-06 C71/C72 重编** |
+| `make -j4` | 零错误、零警告（`-Wall -Wextra`，C/C++/ASM/Rust 四语言；**2026-10-18：Rust 已移除，现为 C/C++/ASM 三语言，依旧零警告**；**同日晚：C++ 亦随 SMP 纯 C 重写清零，现为 C/ASM 两语言，依旧零警告**） |
+| 产物 | `bzImage` 252,616 字节、text 段 249,760 字节（2026-10-01 起点）→ 253,448（第二轮 SMP 完善）→ 254,920（§16.4 启动消息扩展）→ 158,968（`--gc-sections`）→ 160,024（`.image` 157,824，T-033）→ 160,856（`.image` 158,656）**，2026-10-05 T-080 重编** → 161,944（FAT32 大小写修复）→ **162,200（`.image` 160,000），2026-10-06 C71/C72 重编** → **102,840（`.image` 100,640），2026-10-18 非 KTEST 重编**（Rust staticlib 删除 + 在库 WIP 交织，见 `CODEBASE.md` §33.4）→ **105,304（payload 103,256 = `.image` 103,104 + `.trampoline` 152），2026-10-18（晚）SMP 纯 C 重写 + ACPI/x2APIC 重编；（最终）干净构建复测同值 0 警告 → **105,688（payload 103,640 = `.image` 103,488 + `.trampoline` 152、`.bss` 436,000），2026-10-18（夜）ACPI 真机黑屏修复重编；`SOURCE_DATE_EPOCH=1767225600` 3× 同 SHA `699bcfe1dfd40f72b908fcd0b13470f8a74ac6130a464bc4c760c39e91d4f6d8`、0 警告** |
 | 启动 | QEMU `-m 256 -smp 2`：BSP + 1 个 AP 上线，串口 + framebuffer 双控制台，FAT32 挂载，pid 1 → shell |
 | `systest` | 文件系统错误码路径、`fb_*` 图形调用、未知 syscall 返回 `ENOSYS(-38)`，**故意访问未映射页 → SIGSEGV → 进程被杀（返回 -11），shell 与内核存活** |
-| 代码规模 | 内核（`kernel/ arch/ include/`，含 Rust/ASM 与 `ktest/` 自测）15,895 行；用户态 `init/`+`usr/` 1,768 行、16 个程序（2026-10-05 复测；T-080 后 +143）。**2026-10-06 再测：内核 16,029 行、合计 17,797 行**（+43 FAT32 修复、+91 真机三重故障修复，口径见 `CODEBASE.md` §35） |
+| 代码规模 | 内核（`kernel/ arch/ include/`，含 Rust/ASM 与 `ktest/` 自测）15,895 行；用户态 `init/`+`usr/` 1,768 行、16 个程序（2026-10-05 复测；T-080 后 +143）。**2026-10-06 再测：内核 16,029 行、合计 17,797 行**（+43 FAT32 修复、+91 真机三重故障修复，口径见 `CODEBASE.md` §35）。**2026-10-18 再测：内核 19,772 行（含 ktest 4,740）、合计 21,584 行、源文件 100**（Rust 组件 −297、两轮 C 化改写与在库 WIP 增量交织；逐语言/子系统见 §35 追加表）。**2026-10-18（晚）再测：内核 20,164 行（含 ktest 4,741）、合计 21,976 行、源文件 101**（SMP 纯 C 重写 + `acpi.c`/`smp.c`/`sys/acpi.h` 新增 − C++ 两文件 336 行；语言 ASM + C）。**2026-10-18（晚二）再测：内核 20,184 行（含 ktest 4,741）、合计 21,996 行、源文件 101**（q35+KVM 卡死修复使 `smp.c` 355→375，+20；语言 ASM + C）。**2026-10-18（夜）再测：内核 20,260 行（含 ktest 4,744）、合计 22,043 行、源文件 101**（ACPI 真机黑屏修复 +73：`acpi.c` +46、`main.c` +11、`mm/vmm.c` +4、`sys/acpi.h` +13；`init/` 239→210 为在库 WIP；语言 ASM + C） |
 | syscall | `lnxrm_syscalls.def` 32 项（0–31 连续无空洞，含 T-031 新增的 `setuid`），`syscall.c` 32 个 `case` 全部落地 |
 
 "故意段错误被隔离"是关键证据：它证明 **ring-0/ring-3 边界不是纸面存在**——
@@ -846,7 +877,8 @@ C 主体 / C++ 做 SMP+AHCI / Rust 做 16550 驱动、`Spinlock<T>`、`KBox<T>`�
 
 * 启动：自实现 real-mode setup、VBE 分辨率级联选型、符合 Linux boot protocol 2.08
 * 内存：buddy 物理页分配器、分离空闲链内核堆、三槽 PML4 用户地址空间
-* 多核：INIT-SIPI-SIPI 拉起 AP，每 CPU 独立 GDT/IDT/TSS/运行队列
+* 多核：INIT-SIPI-SIPI 拉起 AP，每 CPU 独立 GDT/IDT/TSS/运行队列；**AP 名单取自 ACPI MADT**
+  （无 ACPI 时回退顺序探测），LAPIC 支持 xAPIC（MMIO）/ x2APIC（MSR）双路访问
 * 进程：`fork / execve / wait4 / exit / brk / kill / ps`，64 槽任务表
 * 信号：`sigaction / sigprocmask / sigreturn`，**用户态信号处理器已实现并实测**
   （`systest` 捕获 SIGSEGV 成功）
@@ -1207,9 +1239,9 @@ C1/C9、以及第三部分的 T-001/T-052/T-097 一并落地；过程中逐层�
 
 | 位置 | 旧陈述 | 实测事实 | 状态 |
 |---|---|---|---|
-| `docs/README.md:7` | "约 10,100 行内核 + 760 行用户态" | 10,460 行 + 1,101 行（第一轮评审时，`find \| xargs cat \| wc -l`）；SMP + 启动消息改造后 10,592 + 1,333 | 已改 |
-| `docs/README.md` 实现范围 | "未实现：… `lseek`、`uname`、图形绘制系统调用" | 三者均已实现：`lseek(4)`、`uname(15)`、`fb_*(23–27)`，31/31 `case` 齐全，`systest` 实测通过。与同一文件开头"31 个全部已实现"自相矛盾 | 已改 |
-| `docs/README.md` 实现范围 | "32 个 POSIX 信号的默认处置…**无用户态信号处理器**" | `sigaction(16)`/`sigreturn(20)` 已实现，`kernel/signal.c` 有 `sig_handlers[]` 分发；`systest` 实测 handler 捕获 SIGSEGV 成功 | 已改 |
+| `README.md:7` | "约 10,100 行内核 + 760 行用户态" | 10,460 行 + 1,101 行（第一轮评审时，`find \| xargs cat \| wc -l`）；SMP + 启动消息改造后 10,592 + 1,333 | 已改 |
+| `README.md` 实现范围 | "未实现：… `lseek`、`uname`、图形绘制系统调用" | 三者均已实现：`lseek(4)`、`uname(15)`、`fb_*(23–27)`，31/31 `case` 齐全，`systest` 实测通过。与同一文件开头"31 个全部已实现"自相矛盾 | 已改 |
+| `README.md` 实现范围 | "32 个 POSIX 信号的默认处置…**无用户态信号处理器**" | `sigaction(16)`/`sigreturn(20)` 已实现，`kernel/signal.c` 有 `sig_handlers[]` 分发；`systest` 实测 handler 捕获 SIGSEGV 成功 | 已改 |
 | `docs/GAP_ANALYSIS.md` 第一部分 | "当前 23 个已实现的系统调用" | 32 个全部实现 | 仅登记 |
 | 第三部分 T-006 | "检查 `fat32_journal` 的返回值" | `kernel/fs/fat32/fat32_journal.c` 已于会话前删除，该任务失效 | 仅登记 |
 | `docs/CODEBASE.md` 等 | 文件表含 `usr/cpu.c`、`usr/fdisk.c`、引用 `fat32_journal.c` | 三者均已删除；`usr/` 实为 16 个程序（含 `systest.c`） | 仅登记 |
@@ -1218,7 +1250,7 @@ C1/C9、以及第三部分的 T-001/T-052/T-097 一并落地；过程中逐层�
 
 | 位置 | 旧陈述 | 实测事实 | 状态 |
 |---|---|---|---|
-| `docs/CODEBASE.md` / `docs/README.md` / `docs/GAP_ANALYSIS.md` | "31 个编号 0–30"、`LNXRM_SYSCALL_LAST 30`、"≥31 返回 ENOSYS" | `setuid` 追加为 31 → **32 个 0–31**、LAST 31、≥32 ENOSYS（追加不重排） | 已改 |
+| `docs/CODEBASE.md` / `README.md` / `docs/GAP_ANALYSIS.md` | "31 个编号 0–30"、`LNXRM_SYSCALL_LAST 30`、"≥31 返回 ENOSYS" | `setuid` 追加为 31 → **32 个 0–31**、LAST 31、≥32 ENOSYS（追加不重排） | 已改 |
 | `docs/CODEBASE.md` §6.2 | `struct lnxrm_ps_entry`（32 B） | **40 B**——T-030 加了 `kind`/`uid` 两个 `int32`，`_Static_assert` 守着 | 已改 |
 | `docs/CODEBASE.md` §12.1 | "ulib.h 26 个包装覆盖 31 个（`kill`/`getcpu`/`getkey`/`move` 直发编号）" | **32 个包装覆盖 32 个，全覆盖**；`getcpu`/`getkey`/`move` 早已随重排删除 | 已改 |
 | `docs/CODEBASE.md` §6.1 | "从现在起 `.def` 里的编号**不再改动**" | 表述过强：规则是**只追加不重命名**，setuid 就是追加的 | 已改 |
@@ -1255,9 +1287,44 @@ C1/C9、以及第三部分的 T-001/T-052/T-097 一并落地；过程中逐层�
 | `docs/CODEBASE.md` §3.1 ③ bring-up 次序 | `boot_collect_e820 → console_init → …`，`cpu_init()` 建 GDT/IDT 排在 `pmm_init` 之后 | **console/gdt/gs/idt 现在是头四步**（`main.c:221-224`），`pmm_reserve` 从 2 处变 5 处；§21.3 的行号清单整段重写 | 已改 |
 | `docs/CODEBASE.md` §4.1、§4.3、`docs/BUILD.md` §8.1 | "管理窗口钳在 4 GiB 以下（`pmm.c:93`）" | 实为 **`PMM_WINDOW_TOP` = 1 GiB**（`mm.h:20`、`pmm.c:105`）；4 GiB 口径会让复现者误以为大内存没问题 | 已改 |
 | `docs/CODEBASE.md` §4.3 | `vmm_translate_in` "识别 `ALIAS_BASE` 快捷路径" | 该路径 `ALIAS_BASE + 0x100000000UL` 溢出成 `0x80000000`，**一直是死代码**；2026-10-06 删除，改纯 PTE 行走 | 已改 |
-| `docs/BUILD.md` §8.2、`docs/CODEBASE.md` §21.1 | `grub-mkrescore -o build/core.img boot/grub/grub.cfg`（命令名错、`-o core.img` 不是 ISO、还得 `-bios` 才起得来）；"⚠️ GRUB 路径未经实测"；`gfxpayload=1280x720,32` | §8.2 重写为 **`make imageiso`**（`Makefile:174`）+ 可直接跑的 QEMU 命令 + 排错段；§21.1 同步。**并实测出新事实**：`gfxpayload` 的逗号写法是 GRUB 后备模式列表语法，只能拿到 **24 bpp**，必须写 `1280x720x32` 才是 32 bpp（pitch 5120） | 已改 |
+| `docs/BUILD.md` §8.2、`docs/CODEBASE.md` §21.1 | `grub-mkrescore -o build/core.img boot/grub/grub.cfg`（命令名错、`-o core.img` 不是 ISO、还得 `-bios` 才起得来）；"⚠️ GRUB 路径未经实测"；`gfxpayload=1280x720,32` | §8.2 重写为 **`make imageiso`**（`Makefile:145`）+ 可直接跑的 QEMU 命令 + 排错段；§21.1 同步。**并实测出新事实**：`gfxpayload` 的逗号写法是 GRUB 后备模式列表语法，只能拿到 **24 bpp**，必须写 `1280x720x32` 才是 32 bpp（pitch 5120） | 已改 |
 | `docs/GAP_ANALYSIS.md` C56/C57/C68/C69 | 递归无深度限制、4 GiB 窗口、GRUB 完全未测、`pmm.c:86-100` | C56 半修、C57 口径改 1 GiB、C68 改"手工实测未自动化"、C69 行号改 `95-109` 并补 1 GiB 裁剪 | 已改（新增 C71/C72，有效条目数仍 66） |
 | 四份文档的行数与产物大小 | CODEBASE §1.1/§1.2/§2/§9.4/§14/§18/§33.4/§35、BUILD §0 与 §14.4、`README.md:7` 记内核 **15,895** / 合计 **17,663** / `bzImage` **160,856** | 逐个 `wc -l`、`stat` 重算 → **16,029 / 17,797 / 162,200**（+43 FAT32 修复、+91 本次修复）；顺带修掉 `fat32_priv.h` 213→247、`fat32_dir.c` 251→258、`fat32_meta.c` 738→745 这类上一轮遗留漂移 | 已改（口径说明留在 `CODEBASE.md` §35） |
+
+**2026-10-18 追加**（两轮纯 C 化 + Rust 组件整体移除 + 在库 WIP 落地；方法仍是"登记不改写"——
+上表与 C 类各行里的 `kheap.cpp` / `ahci.cpp` / `kernel/rust/` 引用按旧文件理解，§18 复核命令
+里的同样路径同此）：
+
+| 位置 | 旧陈述 | 实测事实 | 状态 |
+|---|---|---|---|
+| `kheap.cpp` 全文（T-004/T-050 复核命令、C 类行、CODEBASE 四.2/§18） | C++ 实现、147–182 行、`operator new` 在 `:179` | **`kernel/mm/kheap.c` 211 行纯 C**（0 警告；ktest 85 例 1,633 检查全过、smoke 两档 179/179）；`operator new` 与中途垫片 `knew.cpp` 已删，`kmalloc_or_panic` **零调用者**（C12/T-004 口径保留为 bring-up 入口，非死代码） | 已改（两份文档现行陈述同步；旧行/命令仅登记） |
+| `ahci.cpp` 全文（C7/C48–C52 行、T-080 复核命令、CODEBASE §10.3/§18） | C++ 实现、398 行（2026-10-06 实测；重写前已增至 942） | **`kernel/drivers/ahci.c` 971 行纯 C**：constexpr / `[[gnu::packed]]` / `new` / 默认参数换 C 等价物，寄存器编程、探测序列、超时全部不变；两处 `new` → `kmalloc`+NULL 检查并完整回收（兑现本卡注释"分配失败跳过该 port"的承诺） | 已改（现行陈述同步；旧行、`:NNN`、命令仅登记） |
+| `kernel/rust/` 三文件 296–297 行（§2.5、§15 死代码表、CODEBASE §13/§18/§12） | Rust 做 16550 + trampoline 共享数据 + `panic_handler`；死代码表结果列"仅余 lib.rs/smp.rs/uart.rs" | **组件整体移除**：`uart.rs` → `kernel/drivers/uart.c`（`lnxrm_uart_*` 四函数 ABI 不变，`write_str` 随 Rust panic 消失）、`smp.rs` 并入 `kernel/smp.cpp`（复用 `sys/smp.h` 的 `struct trampoline_data`，volatile+SeqCst fence 保留）、`lib.rs` 删除；Makefile 去 `RUSTC`/`RUSTFLAGS`/staticlib/`rust` 目标，smoke 预检去 rustc，README 文本去 "+ Rust" | 已改 |
+| 四份文档规模数字 | 内核 **16,029** / 合计 **17,797** / 源文件 97（2026-10-06） | 2026-10-18 实测：内核 **19,772**（含 ktest 4,740）/ 合计 **21,584** / 源文件 **100**（`.rs` 0 个）——增量大头 ktest +1,443、Rust −297，其余为在库 WIP 与 C 化改写交织（登记不逐项对账） | 已改（CODEBASE §35 2026-10-18 追加表、README 同步） |
+| §2.5 "Rust 做 `Spinlock<T>`、`KBox<T>`" | 如字面 | 两个类型**从未存在**——Rust 三文件中无同步原语、无智能指针（自旋锁一直是 C 的 `include/sys/spinlock.h`），属夸大陈述 | §2.5 已追加更正框 |
+| `README` 镜像文本契约（`ktest/t_vfs.c:README_TEXT`、`scripts/smoke_test.py:README_LINE`、Makefile `build/README.md`） | "…ASM + C + C++ + Rust!"（48 字节） | 随 Rust 移除改为 "…ASM + C + C++!"（41 字节）——三处钉点靠 `make smoke` 失败自动暴露、同轮同步（T-041 活例）。**补记**：中途 Makefile echo 曾漏掉原文的 "tiny"（变 37 字节）而契约仍是 41 字节——改 recipe 不会触发 `build/README.md` 重建，冒烟在陈旧盘镜像上"假绿"，直到最终 `make clean` 干净构建才暴露并修正（教训：动钉住工件后要 clean 再验一轮）。**2026-10-18（晚）再改**：C++ 清零后三处同步改为 `…ASM + C!`（41 → 35 字节），README.md:4 的中文宣传句同步去掉 "C++"（用户拍板：沿用 Rust 移除先例），`make clean` 后重钉 | 已改 |
+| CODEBASE §18 全文件清单 | "上表 32 个文件 = 8,855 行"（实际逐行相加 10,190，`print.c`/`sched.c` 各有一对历史合并残留的重复行，页脚与表头均失实） | 逐行 `wc -l` 重算 + 去重 + 补登 `initramfs.c`/`pagefault.c`/`selftest.c` 与 `font8x16.h`/`mm/pagefault.h` → 表 31 文件 = 10,747，全节 51 文件 = 15,525 | 已改 |
+
+**2026-10-18 追加（二）**（SMP 完整修——纯 C 重写 + 真机单核三根因；沿用"登记不改写"，
+C 类各行、T-050/T-092 复核命令与 CODEBASE 里的 `smp.cpp` / `smp.hpp` / `include/cpp/` 引用按旧文件理解）：
+
+| 位置 | 旧陈述 | 实测事实 | 状态 |
+|---|---|---|---|
+| `kernel/smp.cpp`（309 行）+ `include/cpp/smp.hpp`（27 行）——§4.2 C65、T-050/T-092 复核命令、CODEBASE §7.5/§12.3/§14/§18/§23.5 | C++ 的 `smp::Manager` 类壳；AP 按 APIC ID 1..N 顺序探测 | **`kernel/smp.c` 355 行纯 C**（0 警告）：① AP 枚举改走 ACPI MADT（新增 `kernel/acpi.c` 240 行 + `include/sys/acpi.h`：RSDP→RSDT/XSDT→MADT，type 0/9 条目、去重、BSP 跳过），无 ACPI 时回退原探测；② 失败 AP 先补 INIT 复位 + 清共享块，超时等待纳入 `smp_lock`；③ `cpu_table` 改 `ap_main` 单点初始化；④ trampoline 共享块契约 / `ap_startup` `copy_trampoline` `trampoline_*` ABI / 函数名全部不变；`smp.hpp` 的 `AP_STARTUP_TIMEOUT_MS` 并入 `sys/smp.h` | 已改（现行陈述同步；旧行/`:NNN` 仅登记） |
+| 真机单核三根因（用户实机 `[smp] 1 CPUs online`，此前各表均无此项） | —— | ① **x2APIC**：`kernel/apic.c` 双路访问——固件 EXTD 已置或 CPUID.1:ECX[21] 门控自置（同 Linux `early_enable_x2apic`），寄存器 MSR `0x800+(reg>>4)`，ICR 单次 64 位写、无 ICR_HIGH；只懂 MMIO 的旧驱动把 INIT/SIPI 写进黑洞。② **MADT**：真机 APIC ID 带拓扑空洞，"连败 2 次即停"探测提前放弃。③ **失败重试状态残留**：慢醒 AP 会吃下一轮 `ap_id`。QEMU 三档验证：`-smp 2`（xAPIC）、`-smp 1`、`--qemu-args "-cpu qemu64,+smep,+smap,+x2apic"`（x2APIC 全路径）各 179/179，串口 `[apic] x2APIC MSR base=... ID=0` | 已改（CODEBASE §7.4/§23.5、README 同步） |
+| Makefile C++ 工具链（§15 死代码表、CODEBASE §15.1/§33.1） | `CXX`/`CXXFLAGS`/`KSRC_CXX`/`KOBJ_CXX`/`%.opp` 规则/`-Iinclude/cpp` 存在 | 全部拆除（零 `.cpp`/`.hpp` 源文件）；`do_global_ctors` 仍被 `main.c:364` 调用但已无构造函数可跑（登记为后续清理候选，本轮不动）；`MAX_CPUS` 三处重复定义收敛到 `types.h:77` 唯一 | 已改 |
+| 四份文档规模数字（续） | 内核 19,772 / 合计 21,584 / 源文件 100（当日早些口径） | 2026-10-18（晚）实测：内核 **20,164**（kernel 11,157 + arch 1,723 + include 2,543 + ktest 4,741）/ 合计 **21,976** / 源文件 **101**（`.cpp`/`.hpp` 归零、`sys/acpi.h` 入表）；`usr/systest.c` 859→903 为在库 WIP 增长，随本次实测一并登记 | 已改（CODEBASE §0/§1.1/§12.2/§14/§18/§20/§35、README 规模行同步） |
+| CODEBASE §7.2 "NXE / CR0.WP / CR4.WP / SMEP / SMAP 全部未置位" | 如字面（早期观察，与 §4.2 已修结论矛盾） | 已全部置位并有 smoke 钉点（BSP `cpu_init` 与 AP `ap_main` 均走 `cpu_protect_init()`，AP 侧回读被有序 marker 钉死） | 已改（同步为 ✅ 行） |
+
+**2026-10-18 追加（三）**（q35+KVM 启动卡死的定位与修复；沿用"登记不改写"）：
+
+| 位置 | 旧陈述 | 实测事实 | 状态 |
+|---|---|---|---|
+| `ap_main` 的 ready 信号时机（`kernel/smp.c`，用户贴日志卡死在 `[lapic] timer vec=32 … (AP)`） | 完整修首批版本：`ap_main` 先打 `[cpu] AP…`、`[lapic] timer…` 两行日志，**之后**才 `started=true` + `trampoline_signal_ready()` | **q35+KVM（`make run` 现行默认 `MACHINE ?= q35` + 自动 `--enable-kvm`）必现卡死**：LFB/VGA 为 UC 映射，KVM 下每字符 = 数百次 VM-exit（2–3 ms/字、滚屏秒级），慢控制台吃光 BSP 的 100 ms `AP_STARTUP_TIMEOUT_MS` 预算 → BSP 判失败后发恢复 INIT，**把正持 `print_lock` 做 kprintf 的 AP 复位**（gdb 双线程现场：BSP 卡 `spin_lock_irqsave(&print_lock)`←`kvprintf("[smp] %u CPUs online")`；AP 停 BIOS 复位向量 `0xfff0`；串口字节流止于 `(AP)` 无 `\r\n`；`-d cpu_reset` 四条 reset 记录佐证）→ 锁永不释放，全机死锁。**修复**：`ap_main` 改为 idle 建完、`started=true` 后**立即** `signal_ready()`，`[cpu]`/`[lapic]` 日志与 AP 本地定时器武装全部后置（`smp.c` 355→375 行）——控制台慢只可能让日志慢，不可能拖垮启动；真机 UC LFB 滚屏同理，该竞态裸机同样成立 | 已改（CODEBASE §7.5 ⑤ / §18 `smp.c` 行、本文件 §12.1/§17 规模同步） |
+| smoke 验证矩阵（smoke 本身跑在 TCG+`pc` 上，从不带 `-machine`/`--enable-kvm`，q35+KVM 此前从未进过矩阵） | "三档 smoke 全绿"即视为 SMP 验证充分 | 复现与修复均以 `make run` 原样配置（q35+KVM）为金标准：修复前 25 s 超时卡死于同一行 → 修复后正常到 `root@lnxrm$`；随后矩阵全绿：smoke 默认（`-smp 2`）179/179、`--smp 1` 179/179、`+x2apic` 179/179、KTEST=1+`+x2apic` 金丝雀 179/179（0 panic）、q35+TCG 与 q35+TCG+`+x2apic` 均到 shell；`make -j8` 0 警告 | 已改（登记为验证矩阵盲区：q35+KVM 需人跑 `make run`，smoke 无法覆盖） |
+| `/bin/sh` 一次性 `#UD (6) rip=3`（KTEST=1+`+x2apic` 首跑，task pid=2） | —— | 同配置随后重跑 6 次（含金丝雀 179/179）均未复现；崩溃现场串口转录已留档。怀疑面在库内 fs/sh WIP（用户并行开发中）而非本次 `ap_main` 改动（仅日志/信号时序，不触用户态路径）；**登记为待观察项，未定位** | 登记（观察） |
+| 四份文档规模数字（晚二） | 内核 20,164 / 合计 21,976（当日"晚"口径） | 2026-10-18（晚二）实测：内核 **20,184**（kernel 11,177 + arch 1,723 + include 2,543 + ktest 4,741）/ 合计 **21,996** / 源文件 **101**（`smp.c` +20）；产物已登记：`bzImage` **105,304** / `vmlinux.bin` 103,256 / `vmlinux.elf` 603,840 / `.bss` 411,424（最终干净构建 0 警告，见 CODEBASE §1.2 与 §33.4 的 2026-10-18（最终）行） | 已改（CODEBASE masthead/§1.1/§7.5/§18/§20/§33.4/§35、本文件 masthead/§12.1、README 规模行同步） |
+| 契约重钉首跑 `blkcache.test_write_readback_is_coherent` 偶发失败（宣传语四处改 `…ASM + C!` 后的 `make clean && make smoke`） | 重钉后 smoke 应直接全绿 | 首跑 3 断言挂（`fat_write_impl` 拒写 `bad=-2`、readback 0 字节）并伴 FAT/dir `I/O error`；**内核源码与同日绿跑逐字节相同**（本日 14:10 后内核零改动，改动仅 `README_TEXT`/`README_LINE`/Makefile echo 三处 35 字节字符串）。全新镜像复跑 **179/179** 未复现——该 179 即重钉实证（含 `cat /README.md`、ktest `t_vfs` README 检查、宿主 `fsck.vfat`）；中间一跑因首跑残留脏镜像（1 unused cluster）在宿主侧 fsck 提前退出、未启动 QEMU。与上一行 `#UD` 同区（在库 fs/ide WIP × TCG 时序），**登记为待观察** | 登记（观察）；契约三处已重钉（见 README 契约登记行） |
 
 ### 18. 如何复核本文件的结论
 
@@ -1276,8 +1343,8 @@ grep -rniE '\bRLIMIT\b' kernel/ include/                # 仍为空：机制不�
 
 # T-004 · OOM 是错误返回，不是 panic（19 处调用点逐个核对过）
 grep -rn 'kmalloc(\|cluster_buf_alloc(' kernel/ arch/ --include=*.c --include=*.cpp \
-  | grep -vcE 'ktest|kheap.c|SlabAllocator'             # 19：每处后面都有 NULL 检查
-grep -c 'panic("kmalloc' kernel/mm/kheap.c              # 1：只在 kmalloc_or_panic 里
+  | grep -vcE 'ktest|kheap.cpp'                       # 19：每处后面都有 NULL 检查
+grep -c 'panic("kmalloc' kernel/mm/kheap.cpp           # 1：只在 kmalloc_or_panic 里
 grep -rn 'panic("vmm: out of frames"\|panic("vmm: no frame for aspace"\|panic("signal:' \
   kernel/                                                # 空：同链路三处 panic 已删
 grep -c 'pmm_inject_oom' ktest/t_oom.c            # 9：4 例的注入点（+文件头注释）
@@ -1432,7 +1499,7 @@ grep -cF 'no all-ones disk capacity' scripts/smoke_test.py                # 1：
 
 # 运行时
 make smoke                                                 # PASS 176/176 checks（174 + 2 条，连跑两次）
-python3 scripts/smoke_smp1.py                              # tags: 81 checked, 0 failed（systest 没动，tag 数不变）
+make smoke SMOKE_FLAGS="--smp 1"                           # 单 CPU 同一套判据（原独立的 smoke_smp1.py，2026-10-14 并入）
 grep 'stage early\|stage mm\|stage late' build/smoke/serial.log
     # 23/334、15/429 未变（测试加在 suite vfs / LATE）
     # late 33 cases/779 checks → 34 cases/783 checks
@@ -1535,19 +1602,20 @@ Step 3  硬安全边界 NXE/WP/SMEP（1 天）★★ 最高性价比
    ▼
 Step 4  特权模型 + 资源限制（2 周）
    │
-   ├──► Step 5  契约对齐（1 天）
-   ├──► Step 6  身份与生命周期（1 周）
-   │      │
-   │      ▼
-   └──► Step 7  文件系统硬化（2 周）
+   ├──► Step 5  契约对齐（1 天）          ← 从 4 扇出，可与 7 并行（不在关键路径）
+   ├──► Step 6  身份与生命周期（1 周）    ← 从 4 扇出，可与 7 并行（不在关键路径）
+   │
+   └──► Step 7  文件系统硬化（2 周）      ← 关键路径继续
           │
-          ├──► Step 8  驱动（1.5 周）
+          ├──► Step 8  驱动（1.5 周）     ← 可与 7 并行
           │
           ▼
 Step 9  地址空间能力 mmap/COW/缺页（4 周）
 ```
 
-**关键路径**：`0 → 1 → 2 → 3 → 4 → 7 → 9`。Step 5/6/8 可与 4/7 并行。
+**关键路径**：`0 → 1 → 2 → 3 → 4 → 7 → 9`。Step 5/6/8 可与 4/7 并行——它们都
+从 Step 4 扇出，**不是** Step 7 的前置（图中 Step 6 与 Step 7 是并列的两条
+4 的出边，早期版本的缩进曾把 Step 6 画成 Step 7 的上游，特此更正）。
 
 ---
 
@@ -1652,10 +1720,18 @@ long console_write(struct file *f, const void *buf, size_t n)
 
 #### T-002 · `panic` 绕过 `print_lock`
 
-- **触发**：`print.c:346-356` 调三次 `kprintf`，而 `kvprintf` 要拿 `print_lock` —— **从已持锁的上下文 panic 就是永久自旋而不是停下**
-- **成本**：~10 行
-- **做法**：`panic` 内部 `cli` 后走一个不持锁的裸写路径（或直接用 `lnxrm_uart_putc`）
-- **验收**：从 `console_putc` 内部触发 `panic`，系统停机而不是死锁
+> **✅ 已完成（2026-10-17）**：`print.c` 新增 `kvprintf_unlocked`/`kprintf_unlocked`
+> —— 走 `vsnprintf` + `console_putc`（本身无锁），**完全不碰 `print_lock`**；
+> `panic` 改为 `cli` 后用该路径输出，并加 `s_panicking` 重入闩（嵌套 fault 直接
+> `hlt` 而非递归），导出 `in_panic()` 供测试观察。
+> 验收（契约由 `ktest/t_lib.c: test_unlocked_print_survives_held_lock` 守住，
+> 正是 §5.3 规约第 1 条的实例）：**手动持有 `print_lock` 再走无锁路径，能返回不死锁**；
+> 若有人把它改回加锁，测试会永久自旋，`make smoke` 超时报警而非静默通过。
+> 验证：`make smoke` `-smp 2` 与 `-smp 1` 均 179/179。
+> - **触发**：`print.c` 旧 `panic` 调三次 `kprintf`/`kvprintf`，而 `kvprintf` 要拿 `print_lock` —— **从已持锁的上下文 panic 就是永久自旋而不是停下**
+> - **成本**：~10 行
+> - **做法**：`panic` 内部 `cli` 后走一个不持锁的裸写路径（或直接用 `lnxrm_uart_putc`）
+> - **验收**：从 `console_putc` 内部触发 `panic`，系统停机而不是死锁
 
 #### T-003 · FAT 簇链加迭代上限与环检测 【最高数据风险】
 
@@ -1711,6 +1787,14 @@ long console_write(struct file *f, const void *buf, size_t n)
 > 与 `operator new`——都够不到用户态，且没有有意义的错误分支。
 > **未做**：块设备 I/O 返回值（T-005）是另一条独立的链，本次没动。
 > `brk` 配额与内存记账曾是 T-032，**已于 2026-10-05 完成**（见 T-032 卡片）。
+>
+> **2026-10-18 补**：`operator new` 与它的转发垫片 `kernel/mm/knew.cpp` 已随
+> `ahci.cpp` → `ahci.c` 删除（此后内核再无 `new`），本卡顶行"当前唯一调用者是
+> C++ `operator new`"随之变为 **`kmalloc_or_panic` 零调用者**——仍按本卡口径
+> 保留为 bring-up 入口，不按死代码清除。`ahci.c` 原 `new` 的两处（port 对象、
+> `blkdev`）改为 `kmalloc`+NULL 检查并完整回收，顶行注释"AHCI 分配失败就跳过
+> 该 port"的承诺自此由代码兑现（此前注释与 panic 并存）。本卡与 §18 复核命令
+> 中的 `ahci.cpp`/`kheap.cpp` 路径按 `ahci.c`/`kheap.c` 理解。
 
 - **触发**：C12 —— 用户态程序能让内核永久 panic
 - **现状风险**：`kheap.c:54,70` panic ⇒ FS 层 7 处 `if (!kmalloc(...)) return ENOMEM` 全是死代码（`vfs.c:187,201,210,617`；`fat32.c:197`；`fat32_meta.c:97,182`；`mbr.c:97`）。配合无上限的 `brk`，一个 `while(1) brk(1<<30);` 就能停机
@@ -1805,6 +1889,15 @@ long console_write(struct file *f, const void *buf, size_t n)
 > **❌ 任务已失效（2026-10-01 登记）**：`kernel/fs/fat32/fat32_journal.c`
 > 已删除，写路径改走块缓存写回（`fat_write_sector` → `blk_cache_write`），
 > 本卡描述的 32 条上限与 `begin`/`add` 不复存在。C14 一并作废。
+>
+> **→ 2026-10-14 起形态改变**：journal 已按 C13 重建，本卡描述的对象回来了，
+> 但**本卡要修的病没回来**——新实现的返回值契约从一开始就被接住：
+> `begin` 恒返 0（失败即降级为非日志路径，见其头注释，不存在"嵌套搞乱外层账目"
+> 的问题，因为压根没有嵌套）；`add` 溢出时**中途 checkpoint 再续**而不是丢弃
+> （正是 C14 当年的静默丢弃），仍失败则由 `fat_set_entry` 回滚内存项后上抛；
+> `commit` 由 6 个 locked wrapper 全部纳入返回码。缓冲上限为 128 条并按 lba
+> 去重，"记 2048 个扇区"的场景在元数据-only 下不会出现。由 `ktest/t_journal.c`
+> 与 smoke 178/178 覆盖。**本卡保持失效，不重开。**
 
 - **触发**：C14 —— 32 条上限静默溢出
 - **现状风险**：`add` 溢出返回错误，但**全部 6 个调用点丢弃返回值**（`fat32_file.c:135,164,194`；`fat32_meta.c:54,74,109,118,314,338,456,485,593`）。一次 1 MB 写要记 2048 个扇区，2016 个静默丢弃。`begin` 返回值同样被忽略，嵌套失败会去操作**外层**事务并提前清 `active`，把外层账目搞乱
@@ -1857,7 +1950,7 @@ long console_write(struct file *f, const void *buf, size_t n)
 > **结果**：`make smoke` **155/155 PASS**；`[ktest] selftest PASS (68 cases, 1508 checks)
 > [2 skipped]`（基线 63/1046，0 failed）；`[selftest] 1508/1508 pass [1 warn]`；
 > `scripts/smoke_smp1.py` 62 tags / 0 failed。
-> smoke 侧新增的 5 条判据放在 `LATE_REPORTS`（`smoke_test.py:97`，在整段日志里搜）而不是
+> smoke 侧新增的 5 条判据放在 `LATE_REPORTS`（`smoke_test.py:123`，在整段日志里搜）而不是
 > `BOOT_MARKERS` 里顺序等：`.ktest` 段内的先后是编译器的事（本机实测 `t_cache.c` 的 5 例
 > **倒序**打印），拿它当 boot 时序会假红。
 
@@ -1919,10 +2012,10 @@ long console_write(struct file *f, const void *buf, size_t n)
 
 #### Step 1 完成定义
 
-- [ ] T-001 ~ T-008 全部完成
-- [ ] `make smoke` 在 `-smp 1` 和 `-smp 2` 下都通过
-- [ ] 故障注入测试存在：能验证 I/O 错误、OOM、坏簇三条路径
-- [ ] 每个修复是一个可独立撤销的改动单元，说明里引用缺陷编号（C1/C11/C12/...）
+- [x] T-001 ~ T-008 全部完成（2026-10-17：T-002 `panic` 无锁路径 + `t_lib.c` 契约测试收尾，补上最后一项；T-003 簇链上限 `FAT_CHAIN_MAX_STEPS`、T-006 已被 journal 重建消解，其余此前已完成）
+- [x] `make smoke` 在 `-smp 1` 和 `-smp 2` 下都通过（2026-10-17 实测：两档均 **179/179**）
+- [x] 故障注入测试存在：能验证 I/O 错误、OOM、坏簇三条路径（`ktest/t_ioerr.c` 4 例 I/O 错误、`ktest/t_oom.c` 4 例 OOM；坏簇由 smoke 的 forged-FAT 阶段覆盖——self-loop 与 out-of-volume 两条，即 T-003 的验收现场）
+- [x] 每个修复是一个可独立撤销的改动单元，说明里引用缺陷编号（C1/C11/C12/...）
 
 ---
 
@@ -1952,7 +2045,7 @@ long console_write(struct file *f, const void *buf, size_t n)
 | `bin_of` | `kheap.c:29-34` | 边界：1, 8, 16, 17, 4096, 4097 |
 | `fb_pack` / `fb_rgb_px` | `framebuffer.c:157-196` | 真彩色往返：对若干 `0x00RRGGBB`，`fb_rgb_px` 在每种位域布局 × 每种 bpp 下都还原同一颜色（8bpp 量化到 6×6×6 立方） |
 | `fbc_esc_process` | `framebuffer.c:295-346` | 越界行/列被钳制、`ESC[2J` 复位光标、未终止序列不越界 |
-| `ansi_feed` 状态机 | `ansi.c` | 全部支持的序列 + 截断 + 未终止序列 |
+| `ansi_feed` 状态机 | `print.c`（原 `ansi.c`，2026-10-18 并入） | 全部支持的序列 + 截断 + 未终止序列 |
 | `fat_short_to_name` | `fat32_dir.c:5-14` | 8.3 → 显示名的边界（11 字符、含 `.`、全空格） |
 | `abs_path` | `vfs.c:106` | 相对/绝对/超长（**✅ 2026-10-03 已覆盖**：`t_fs.c` 的 `test_abs_path` 钉住 29 字符边界与超长拒绝，`t_vfs.c` 的 `test_path_too_long` 钉住调用点回 `ENAMETOOLONG`；C46 已修，见第一部分 C46）。**另注**：同处提到的"截断到 1024 而 `dir_getdent` 要求 `len>=72`"是 **C44**（`sys_getdent`），不是 C46，仍未修 |
 | `fat_name_eq_short` | `fat32_dir.c:16-23` | 大小写不敏感 |
@@ -1998,7 +2091,7 @@ long console_write(struct file *f, const void *buf, size_t n)
 
 - [x] `make smoke` 会检查 `[selftest] N/N pass` 且 N == 总数
 - [x] 故意注入 3 个不同类型的 bug（位运算错误、边界 off-by-one、NULL 未检查），测试**全部能抓到**
-- [ ] 属性测试跑 10000 次无 panic
+- [x] 属性测试跑 10000 次无 panic（2026-10-17 实测：`t_prop.c` `ITER_TOTAL = 10000`（3000 usercopy + 2000 pagetbl + 2000 path + 1500 fatname + 1500 elf），固定种子可复现，串口日志 `[prop] T-013 property tests, seed=... 10000 iterations` 各子套 `violations=0`，canary 无破坏——此前是文档漏勾）
 - [x] 自测覆盖至少 9 个模块（表 T-011/T-012 中的全部对象）
 
 **注入证据**（每条都让 `make smoke` 打红，注入已还原、最终 97/97、自测 1072/1072）：
@@ -2346,31 +2439,28 @@ long console_write(struct file *f, const void *buf, size_t n)
 
 | 项 | 动作 | 成本 |
 |---|---|---|
-| `fat32_journal` 头注释声称原子性 | 改注释为"写回缓冲，非日志"；或重命名为 `fat32_writeback.c`（**推荐后者，去掉误导**） | 20 行 |
-| `sched.c` 注释说 circular queue | 改为"push-front 链表（实为 LIFO）"，或 Step 8 之后改成真循环队列 | 3 行 |
-| `types.h:42,43` 槽号 98/97 | **✅ 已完成（2026-10-01）**：改为 128，`FIXMAP_VA` 整体删除 | — |
+| ~~`fat32_journal` 头注释声称原子性~~ | ~~改注释为"写回缓冲，非日志"；或重命名为 `fat32_writeback.c`（**推荐后者，去掉误导**）~~ **已按更强的方式解决（2026-10-14）**：重建为真日志，声明成立且有 `ktest/t_journal.c` 断言守着 | 见 C13 |
+| `sched.c` 注释说 circular queue | **✅ 已完成（2026-10-17）**：改为"push-front 链表（实为 LIFO）"并注明仅在哨兵闭环意义上是 circular；同时由 `ktest/t_task.c: test_runqueue_is_push_front` 守住 push-front 语义 | 3 行 |
+| `types.h:42,43` 槽号 98/97 | **✅ 已完成（2026-10-01）**：改为 128，`FIXMAP_VA` 整体删除；**2026-10-17 补**：`types.h` 加 `LNXRM_STATIC_ASSERT` 钉住 96/128/256 三个槽号，改错即构建失败 | — |
 | `mm.h:45` 重复"slot 98" | **✅ 已完成（2026-10-01）**：随 `FIXMAP_VA` 删除一并清理，注释改为 PD slot 128 | — |
 | `mm.h:42-43` "fixmap used to touch other ASes" | **✅ 已完成（2026-10-01）**：选了「直接删掉 `FIXMAP_VA`」，连同 `vmm.c` 对 slot 97/112 的死跳过 | — |
-| `smp.rs:23` 字段名 `ap_main_phys` | 改名 `ap_main_va` | 2 行 |
-| `struct task.next` 是死字段 | 删除，或加注释说明是为将来准备 | 3 行 |
+| `smp.rs:23` 字段名 `ap_main_phys` | **✅ 已完成（2026-10-17）**：改为 `ap_main_va`（Rust `smp.rs` + C `smp.h` + `smp.cpp` 原型同步），注释说明存的是虚地址、AP 在开分页后才跳转（`trampoline.S:10` 本就写 virtual） | 8 处 |
+| `struct task.next` 是死字段 | **✅ 已消解（2026-10-17 核实）**：该裸 `next` 字段已不存在，`struct task` 现只有 `rq_next`（运行队列链）与 `parent` | — |
 | `cpu_info.{kstack_top,idle_ctx,idle_stack}` 死字段 | **✅ 已删除（2026-10-01）**，顺带发现 `task_lock` 只初始化从不加锁，一并删除 | 10 行 |
 
 - **验收**：`grep -rniE "circular|atomic|remote PTE" include/ kernel/ docs/ usr/` 的每一处命中都指向真实行为
 
 #### T-041 · 建立"契约必须有测试"的过程规约
 
-- **成本**：半天
-- **做法**（写进 `docs/` 或 README）：
-  - 任何写进注释或 ABI 的行为，必须有一个断言或测试守着
-  - 任何"已定义但未实现"的 flag/结构体字段，必须在 ABI 头里显式标注 `/* reserved, unimplemented */`
-  - 修改 ABI 结构的任何字段，必须同步改 `docs/` 里的 ABI 描述
-- **验收**：这条规约存在于文档里，且 T-040 的每一项都有对应测试（若某项确实无测试，说明为什么可以没有）
+- **✅ 已完成（2026-10-17）**：规约写入 `docs/GAP_ANALYSIS.md §5.3 编码规约`（5 条），核心是——写进注释/ABI 的行为必须有断言或 smoke tag 守着；能用编译期 `_Static_assert` 钉住的常量约定不要只写注释；改 ABI 字段必须同步改 docs。
+- 实例：`fat32_journal`→`ktest/t_journal.c`；调度队列 push-front→`t_task.c: test_runqueue_is_push_front`；PD 槽号→`types.h` 静态断言。
+- **验收**：✅ 规约存在于 §5.3，且 T-040 每一项都有对应测试或说明（无测试项：`struct task.next` 已不存在、6 项容量常量属已知设计边界）。
 
 #### Step 5 完成定义
 
-- [ ] 第一部分 §7 的 8 条全部处理
-- [ ] `docs/` 里有一条明确的"契约必须有测试"规约
-- [ ] 至少 3 条原本无测试的行为现在有测试（从 T-040 里挑：`fat_short_to_name`、`sched.c` 的队列语义、`types.h` 槽号断言）
+- [x] 第一部分 §7 的 8 条全部处理（2026-10-17：`sched.c` LIFO 注释、`ap_main_va` 改名、`struct task.next` 已消解，其余 5 条此前已完成）
+- [x] `docs/` 里有一条明确的"契约必须有测试"规约（§5.3，5 条）
+- [x] 至少 3 条原本无测试的行为现在有测试（`fat_short_to_name` 早已有 `t_fs.c`/`t_prop.c`；新增 `sched.c` 队列语义 `test_runqueue_is_push_front`、`types.h` 槽号 `LNXRM_STATIC_ASSERT`）
 
 ---
 
@@ -2381,6 +2471,17 @@ long console_write(struct file *f, const void *buf, size_t n)
 **触发**：差距分析 4.5 节。`task_free_slot` 把槽置 `T_UNUSED` 但**从不清理指向它的 `parent` 指针**；`kill(42)` 可能命中完全不相干的进程。
 
 #### T-050 · `struct pid` 或世代号（二选一）
+
+> **✅ 已完成（2026-10-17，世代号方案）**：`struct task` 增 `u32 generation`
+> —— `task_alloc_slot` 在表锁内发一个**全局单调**计数器（不是每槽各自的，
+> 这样两个存活槽的初代也不会同号）。`parent` 不再是裸指针，改存
+> `(parent_pid, parent_gen)`，所有解引用走 `task_parent()` / `find_task_gen()`：
+> 槽位一旦被下一代占用，旧引用解析成 NULL 而不是"一个戴着旧 pid 的陌生人"。
+> 因此按卡片提示，`ps_dump` 与 `sys_waitpid` 同步改成 pid 比对（不再解引用）。
+> 附带修掉一个隐患：`kernel_spawn` 从不设 `parent`，靠 `task_alloc_slot`
+> 清零兜底，否则回收槽会把上任的 parent 交给 init。验收测试
+> `test_generation_names_one_incarnation`、`test_parent_link_dies_with_incarnation`
+> 覆盖"回收后同 pid 再分配也不误认"。
 
 - **成本**：3 天（世代号方案）/ 5 天（pid 对象方案）
 - **推荐**：先做**世代号**（成本低，解决 80% 问题），把 `struct pid` 列为将来项
@@ -2393,6 +2494,11 @@ long console_write(struct file *f, const void *buf, size_t n)
   - [ ] PID 复用不会导致误杀（构造测试：fork 到耗尽槽位，确认 `kill` 不会命中错误进程）
 
 #### T-051 · 回收时清理 `parent` 指针
+
+> **✅ 已完成（2026-10-17）**：`task_free_slot` 在表锁内遍历 64 槽，把
+> `(parent_pid, parent_gen)` 指向本化身的子进程重挂到 init（无 pid-1 时置 0）。
+> 注：T-050 把 parent 改成 pid+世代后，"悬垂裸指针"这类问题已从结构上消除
+> ——本清扫是第二道保险，把"每个调用方都记得先 reparent"变成 free 本身的性质。
 
 - **成本**：1 天
 - **位置**：`kernel/sched.c:340-356`（`task_free_slot`）
@@ -2419,6 +2525,11 @@ long console_write(struct file *f, const void *buf, size_t n)
 > **❌ 已取消（2026-10-01 判定为误报）**：进程是单线程的——`sys_fork`
 > 执行期间父进程没有第二条执行流能并发 `close`，fd 条目也持引用计数。
 > C8 保留编号、不修（第一部分 §6.1、第二部分 §16.1）。
+>
+> **（2026-10-17 复核维持取消）**：核实全仓无 `clone`/线程入口；fd 表按进程
+> 隔离，跨进程共享的文件对象持 `refcnt`（fork 里用 `__sync_fetch_and_add`
+> 递增）；信号只在返回用户态时派发，不在 syscall 中途插队——父进程在
+> `sys_fork` 里确实没有第二条执行流能并发 `close`。误报成立。
 
 - **触发**：C8 —— 先 `memcpy` 父 fds，再加引用计数
 - **位置**：`kernel/task.c:70-72`
@@ -2427,6 +2538,14 @@ long console_write(struct file *f, const void *buf, size_t n)
 - **验收**：并发 fork+close 压测，用故障注入验证无 use-after-free
 
 #### T-054 · `con_waiter` 改链表
+
+> **✅ 已完成（2026-10-17）**：`con_waiter` 单槽改为经 `task.con_next` 的
+> 链表，由 `con_lock`（irqsave）保护——`arm`/`disarm` 在进程上下文跑、
+> `input_push` 在 UART ISR 里跑，且两个 CPU 可同时 `console_read`。
+> `input_push` 摘下整条链表唤醒**全部**等待者（先摘后唤醒，`con_lock`
+> 不跨越 `runqueue_add`）。旧代码里被顶替的等待者只能靠 1 jiffy 超时复活，
+> 现在按键即醒。验收测试 `test_multi_console_waiters_all_woken` 验证一个
+> 字节唤醒两个等待者（旧单槽实现下该测试必然失败）。
 
 - **触发**：C5 —— 单槽全局，第二个进程阻塞会覆盖第一个的等待者
 - **位置**：`kernel/isr.c:96,112`
@@ -2437,11 +2556,11 @@ long console_write(struct file *f, const void *buf, size_t n)
 
 #### Step 6 完成定义
 
-- [ ] PID 复用不会导致误杀
-- [ ] 进程树 parent 关系在压力测试下始终正确
-- [ ] `task_table` 所有访问有锁
-- [ ] `fork`/`close` 并发无 use-after-free
-- [ ] 多等待者阻塞场景正确
+- [x] PID 复用不会导致误杀（T-050 世代号：`find_task_gen` 只认 pid+世代都吻合的化身；`test_generation_names_one_incarnation` 构造"同 pid 再分配"验证旧引用落空）
+- [x] 进程树 parent 关系在压力测试下始终正确（`parent` 存 pid+世代 + free 时清扫；`test_parent_link_dies_with_incarnation` 验证；smoke 的 systest fork/exit/waitpid 压测全绿）
+- [x] `task_table` 所有访问有锁（`find_task`/`find_task_gen`/`task_alloc_slot`/`task_free_slot` 均在 `task_table_lock` 内；`task_iter` 是**有据可查的例外**——返回表内裸指针、调用方为单线程进程模型路径，论证见 T-052 与第二部分 §16.1）
+- [x] `fork`/`close` 并发无 use-after-free（T-053 判定为**误报**：单线程进程模型下 `sys_fork` 期间无第二执行流能并发 `close`，fd 持 `refcnt`；2026-10-17 复核维持取消，故无代码改动）
+- [x] 多等待者阻塞场景正确（T-054 链表 + `con_lock`；`test_multi_console_waiters_all_woken` 验证一键唤醒两个等待者）
 
 ---
 
@@ -2467,21 +2586,21 @@ long console_write(struct file *f, const void *buf, size_t n)
 | T-069 | 统一磁盘 `bytes_per_sector` 不变量 | C29 的根因：守在错误的层 | 半天 | 校验在驱动层而非 FAT 层 |
 | T-070 | MBR 范围校验 + 扩展分区 | C36/C37：MBR 条目不校验、静态名缓冲共享 | 1 天 | 畸形 MBR 不越界；分区名正确 |
 | T-071 | PCI 桥递归深度限制 | C56：桥成环会爆栈 | 1 小时 | 构造桥环不爆栈 |
-| T-072 | **`fat32_journal` 二选一** | C13：journal 名不符实 | 1–3 天 | **见下** |
+| T-072 | ~~**`fat32_journal` 二选一**~~ **已完成（2026-10-14，走路线 B）** | C13：journal 名不符实 | 实际 1 天 | **见下** |
 
-#### T-072 的决策点
+#### T-072 的决策点 → 已决策：路线 B（真 journal）
 
-`fat32_journal` 现在承诺原子性但提供的是"改后像 + 无落盘 + 无法回滚的重复写回"。两条路：
+`fat32_journal` 当时承诺原子性但提供的是"改后像 + 无落盘 + 无法回滚的重复写回"。两条路：
 
-- **路线 A（推荐，3 天）**：**删掉它**，重命名为 `fat32_writeback.c`，诚实描述为"去重回写缓冲"。FAT32 的实际崩溃一致性靠 Step 1 的 T-005/006 + T-066（镜 FAT）保证。诚实的功能边界优于假装的原子性。
-- **路线 B（3–5 天）**：**真正实现日志** —— 预留日志区、落盘前像、写日志 superblock、mount 时 replay。工程量大很多，但这才让"journal"这个名字成立。
+- ~~**路线 A（推荐，3 天）**：**删掉它**，重命名为 `fat32_writeback.c`，诚实描述为"去重回写缓冲"~~ —— 曾在 2026-10-01 执行（文件删除），后按 C13 验收要求**重建**。
+- ~~**路线 B（3–5 天）**：**真正实现日志** —— 预留日志区、落盘前像、写日志 superblock、mount 时 replay** —— **已实现（2026-10-14）**。
 
-**建议先走 A**（把名字和注释改对），把 B 作为独立项目评估。理由：崩溃一致性对当前使用场景（单机玩具系统）价值有限，而路线 A 顺带消除了一个误导源。
+**决策记录**：走 B。理由是 C13 的验收标准（阶段 5）明确要求"能恢复"，路线 A 只做到诚实、不提供恢复；且 reserved 区本就是 FAT 规范留给 OS 私用的，日志放进去不侵入数据区。最终形态：reserved `[8, reserved_sectors)` 为日志区（mkfs 加 `-R 1024`）、redo/后像 + CRC32、单扇区 superblock 为提交点、mount 幂等 replay、元数据 only（ordered，数据字节不入日志）。完整协议见 C13 条目与 `kernel/fs/fat32/fat32_journal.c` 文件头。代价是每次变更 op 多约 5–7 次 512B 写（日志 + 提交点 + 清除），对 IDE PIO 可忽略。
 
 #### Step 7 完成定义
 
-- [ ] 写入后 `fsck.vfat` 干净
-- [ ] 随机断电模拟（QEMU `-device` 或直接 kill QEMU）后，重启要么恢复要么不返回错误数据
+- [x] 写入后 `fsck.vfat` 干净（smoke 固定检查，178/178）
+- [x] 随机断电模拟（QEMU `-device` 或直接 kill QEMU）后，重启要么恢复要么不返回错误数据 —— **以 `blk_inject_io()` 故障注入实现**：`ktest/t_journal.c` 覆盖提交点前后两个窗口（拒绝 apply → replay 补齐；拒绝日志 → 无痕），字面 kill-QEMU 未自动化（理由见阶段 5 验收注）
 - [ ] 长时间循环（开 10000 文件 / 写 100 MB / 建删 10000 文件）无泄漏
 - [ ] 畸形磁盘镜像（坏簇、坏 MBR、4 KB 扇区）不 panic 不挂死不越界
 - [ ] 目录操作是 O(n) 而非 O(n²)
@@ -2853,4 +2972,4 @@ Step 0 → Step 8（跳过 Step 9）
 
 ---
 
-*文档版本 1.1 · 缺陷编号（C1–C70，稳定 ID 不重排）引用自本文第一部分 §6 · 行号基于死代码删除后*
+*文档版本 1.2 · 缺陷编号（C1–C72，稳定 ID 不重排）引用自本文第一部分 §6 · 行号基于当前工作树*

@@ -314,6 +314,16 @@ bool cpu_has_smap(void)
     return (r[1] >> 20) & 1; /* CPUID.(EAX=7,ECX=0):EBX[20] */
 }
 
+bool cpu_has_x2apic(void)
+{
+    u32 r[4];
+
+    __asm__ volatile("cpuid"
+                     : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+                     : "a"(1), "c"(0));
+    return (r[2] >> 21) & 1; /* CPUID.(EAX=1,ECX=0):ECX[21] */
+}
+
 /* Published by cpu_protect_init(): g_smap must be true exactly when
  * CR4.SMAP is set on this CPU, because STAC/CLAC #UD while CR4.SMAP=0.
  * cpu_protect_init runs with interrupts off, so the CR4 write and this

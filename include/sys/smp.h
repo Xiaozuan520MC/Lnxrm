@@ -1,5 +1,6 @@
 /* SMP initialization: AP startup via INIT-SIPI-SIPI.
- * C-compatible header — includes smp.hpp when compiled as C++. */
+ * C-compatible header — the former include/cpp/smp.hpp wrapper was folded
+ * in with the 2026-10-18 pure-C rewrite (kernel/smp.c). */
 #pragma once
 #include <types.h>
 
@@ -9,9 +10,14 @@
 #endif
 
 #ifdef __cplusplus
-#include "cpp/smp.hpp"
 extern "C" {
 #endif
+
+/* How long to wait for an AP to signal ready. QEMU APs respond within
+ * ~20 ms; a dead APIC ID probe burns this full budget (twice on the
+ * fallback probe path), so keep it tight — 100 ms is still 5x the
+ * observed time.  (Lived in include/cpp/smp.hpp until the C rewrite.) */
+#define AP_STARTUP_TIMEOUT_MS 100
 
 /* AP trampoline code (must be at physical address < 1 MiB). */
 extern u8 trampoline_start[];
@@ -31,7 +37,8 @@ extern u8 trampoline_end[];
  * 0x18      8   ap_id           logical CPU id assigned by BSP
  * 0x20      8   gdt_packed      bits [15:0] = GDT limit for lgdt
  *                               bits [63:16] = GDT physical base (>> 16)
- * 0x28      8   ap_main_phys    physical address of ap_main()
+ * 0x28      8   ap_main_va      VIRTUAL address of ap_main() (the AP jumps here
+ *                               after paging is enabled -- see trampoline.S:10)
  * 0x30      8   (reserved)
  * 0x38      8   (reserved)
  */
@@ -41,13 +48,16 @@ struct trampoline_data {
     volatile u64 ready;        /* 0x10 */
     volatile u64 ap_id;        /* 0x18 */
     volatile u64 gdt_packed;   /* 0x20 */
-    volatile u64 ap_main_phys; /* 0x28 */
+    volatile u64 ap_main_va;   /* 0x28 */
     volatile u64 _rsvd0;       /* 0x30 */
     volatile u64 _rsvd1;       /* 0x38 */
 };
 
 /* Located at a fixed physical address for trampoline access. */
 #define TRAMPOLINE_CODE_PHYS 0x8000UL
+/* Shared data block the trampoline reads (layout of struct trampoline_data
+ * above; identity-mapped).  Was rust/smp.rs's TRAMPOLINE_DATA_PHYS. */
+#define TRAMPOLINE_DATA_PHYS 0x9000UL
 
 /* AP GDT placed right after trampoline code (physical, below 1 MiB).
  * Layout:

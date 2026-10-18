@@ -80,6 +80,15 @@ long sys_open(const char *path, int flags);
 
 void vfs_init(void);
 int vfs_try_mount_disk(void); /* FAT32 from first block dev -> / */
+/* Mount the initramfs that `make INITRAMFS=` linked into the kernel image
+ * at "/", as a read-only root.  Returns LNXRM_ENOENT when the build carried
+ * no archive or the bytes there are not a newc cpio archive -- a build
+ * without INITRAMFS= behaves exactly as it did before this existed. */
+int vfs_mount_initramfs(void);
+/* Does `path` name a file that can be opened for reading?  Telling "the
+ * disk mounted" apart from "the disk can boot": a FAT32 data disk with no
+ * /bin/init on it mounts perfectly and still cannot start anything. */
+bool vfs_file_exists(const char *path);
 bool vfs_root_ready(void);    /* a filesystem answers at "/" (boot self-test) */
 /* prefix a relative path with '/', returning `path` itself when it is
  * already absolute; NULL when the normalised path would not fit `buf` --
@@ -127,7 +136,7 @@ static inline u64 ata_total_sectors(const u16 *id)
     return l28;
 }
 
-/* block devices (drivers/ide.c + drivers/ahci.cpp register; fs/fat32.c consumes) */
+/* block devices (drivers/ide.c + drivers/ahci.c register; fs/fat32.c consumes) */
 struct blkdev {
     const char *name;
     u32 sector_size; /* bytes */

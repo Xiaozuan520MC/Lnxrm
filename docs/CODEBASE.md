@@ -1,7 +1,7 @@
 # lnxrm 代码库导览与功能总览
 
 > 面向：想读懂 / 接手 / 扩展这个内核的人
-> 代码库规模：16,029 行内核 + 1,768 行用户态（2026-10-06 实测；内核 = `kernel/` 12,190（含 `ktest/` 3,297 行自测）+ `arch/` 1,670 + `include/` 2,169。2026-10-05 口径为 15,895，差 +134 = FAT32 修复 +43 与真机三重故障修复 +91，见 §35）
+> 代码库规模：**20,260 行内核 + 1,783 行用户态（2026-10-18 夜实测**；内核 = `kernel/` 11,237 + `ktest/` 4,744 自测 + `arch/` 1,723 + `include/` 2,556。2026-10-06 口径为 16,029 + 1,768，见 §35 的 2026-10-18 追加表）
 > 本文两部分：**第一部分 代码导览**（每个文件是什么、怎么组织，§0–§19） · **第二部分 功能总览**（能干什么、实测出处，§20–§36）
 > 配套文档：[BUILD.md](BUILD.md)（构建与调试） · [GAP_ANALYSIS.md](GAP_ANALYSIS.md)（差距 · 评审 · 计划）
 
@@ -12,7 +12,7 @@
 
 ### 0. 一句话概括
 
-**lnxrm 是一个 x86-64 单体内核**：C 为主体，C++ 负责 SMP 与 AHCI，Rust 负责串口驱动与同步原语，启动/中断/上下文切换用 NASM 汇编。产出符合 Linux x86 boot protocol 2.08 的 `bzImage`，在 QEMU 下挂载 FAT32 并运行自带 shell。
+**lnxrm 是一个 x86-64 单体内核**：C 为主体（串口、AHCI、SMP、ACPI 均为 C），启动/中断/上下文切换用 NASM 汇编。产出符合 Linux x86 boot protocol 2.08 的 `bzImage`，在 QEMU 下挂载 FAT32 并运行自带 shell。（Rust 组件已于 2026-10-18 整体移除；C++ 组件同日随 SMP 纯 C 重写清零，见 §13。）
 
 本文按"**每个文件是什么、它依赖谁、谁依赖它**"组织，不是按重要性。
 
@@ -24,29 +24,30 @@
 
 | 语言 | 文件数 | 行数 | 占比 | 主要用途 |
 |---|---|---|---|---|
-| C | 62 | 13,236 | 74% | 内核主体 + `ktest/` 自测 + 用户态程序 |
-| C 头文件 `.h` | 22 | 2,218 | 12% | 接口定义 |
-| NASM `.S` | 3 | 650 | 4% | 入口、AP trampoline、`crt0` |
+| C | 70 | 17,993 | 82% | 内核主体（含串口/AHCI/SMP/ACPI 驱动）+ `ktest/` 自测 + 用户态程序 |
+| C 头文件 `.h` | 25 | 2,619 | 12% | 接口定义 |
+| NASM `.S` | 3 | 678 | 3% | 入口、AP trampoline、`crt0` |
 | NASM `.asm` | 1 | 572 | 3% | 实模式 setup + VBE 选型 |
-| C++ | 3 | 679 | 4% | SMP 管理、AHCI 驱动、C++ 全局 `new/delete` |
-| Rust | 3 | 296 | 2% | UART、AP trampoline 共享数据 |
-| 链接脚本 `.ld` | 1 | 65 | — | 内核布局 |
-| C++ 头文件 `.hpp` | 1 | 27 | — | `cpp/smp.hpp` |
+| 链接脚本 `.ld` | 1 | 80 | — | 内核布局 |
 | 系统调用定义 `.def` | 1 | 54 | — | 32 个系统调用编号（0–31 连续）+ 编号规则说明 |
-| **代码合计** | **97** | **17,797** | **100%** | |
-| Python 脚本 | 4 | 967 | | 构建补丁（2 个）+ 冒烟测试（`smoke_test.py` 762 行、`smoke_smp1.py` 49 行） |
-| **总计** | **101** | **18,764** | | |
+| **代码合计** | **101** | **22,043** | **100%** | |
+| Python 脚本 | 4 | 1,148 | | 构建补丁（2 个）+ 内存盘 + 冒烟测试（`smoke_test.py` 862 行，带 `--smp N`，单 CPU 模式已并入） |
+| **总计** | **105** | **23,144** | | |
 
-目录分布：`kernel/` 12,190 + `arch/` 1,670 + `include/` 2,169 = **16,029（内核）**，
-`init/` 239 + `usr/` 1,529 = **1,768（用户态，16 个程序）**，`scripts/` 967。
+（`.rs` 一行已删：Rust 组件 3 文件 296 行，2026-10-18 整体移除。C++ 两行同日删除：`smp.cpp`
+309 行 + `cpp/smp.hpp` 27 行随 SMP 纯 C 重写（`kernel/smp.c` + MADT 枚举 + x2APIC 支持）整体
+移除，Makefile 的 g++/CXXFLAGS/`.opp` 规则亦同日拆除——旧口径见 §35。）
+
+目录分布：`kernel/` 11,237 + `arch/` 1,723 + `include/` 2,556 + `ktest/` 4,744 = **20,260（内核，含自测）**，
+`init/` 210 + `usr/` 1,573 = **1,783（用户态，16 个程序）**，`scripts/` 1,148。
 
 #### 1.2 产出物
 
 | 项 | 值 |
 |---|---|
-| `bzImage` | 162,200 字节（158 KB），2026-10-06 真机三重故障修复重编后（`--gc-sections` 使 254,920 → 158,968，T-033 → 160,024，T-080 → 160,856，FAT32 修复 → 161,944，C71/C72 → 162,200） |
-| 内核 `.image` 段（代码+rodata+data） | 160,000 字节（LMA `0x100000`） |
-| `.bss` 段 | 405,520 字节（≈396 KB，大头是 64×1,024 B 的 `task_table`） |
+| `bzImage` | **105,688 字节（103 KB）——2026-10-18（夜）ACPI 黑屏修复后非 KTEST 干净构建、`SOURCE_DATE_EPOCH` 3× 同 SHA**（链条：10-06 记载 162,200：`--gc-sections` 使 254,920 → 158,968，T-033 → 160,024，T-080 → 160,856，FAT32 修复 → 161,944，C71/C72 → 162,200；Rust staticlib 删除 → 102,840（当日早些），SMP 卡死修复交织 → 105,304（同日"最终"口径，保留作历史），ACPI 真机黑屏修复 +384 → **105,688**） |
+| 内核 `.image` 段（代码+rodata+data） | 103,488 字节（LMA `0x100000`，2026-10-18 夜实测；另有 `.trampoline` 152 B 同段，两者合计 = `vmlinux.bin` 103,640；同日早些口径 103,104 / 103,256 保留作历史） |
+| `.bss` 段 | 436,000 字节（≈426 KB，2026-10-18 夜实测；比同日早些 +24,576 = ACPI 表 bounce 缓冲 `s_dir` 8 KiB + `s_madt` 16 KiB；大头 `ap_stacks` 256 KB + `task_table` 65 KB，构成见 BUILD §14.1） |
 | 入口点 | `_start64` @ `0xffffffff8010010e` |
 | 段属性 | `.image` 是 **RWE**（单一连续段的设计副作用，见 §3.3） |
 | 系统调用 | 0–31 连续定义 32 个、全部有实现；32 及以上返回 ENOSYS（`include/abi/lnxrm_syscalls.def`）。其中 `ps`/`diskinfo`/`fb_*`/`kill` 带 T-031 权限检查点，4 个绘图调用再带 T-033 的画屏归属门 |
@@ -59,10 +60,9 @@
 usr/*.c  ──gcc(static)──►  build/usr/<name>        16 个静态 ELF64
                                         │
 arch/*.S ──nasm──► *.o ─┐                  │
-kernel/rust/lib.rs ──rustc──► liblnxrm.a ─┤
 arch/setup.asm ──nasm──► setup.bin ─┐      ├──ld -T arch/kernel.ld──► vmlinux.elf
                           (pad 512) │      │                              │
-kernel/*.c|cpp ──gcc/g++──► *.o ───┴──────┤                              ├─objcopy -O binary─► vmlinux.bin
+kernel/*.c ──gcc──► *.o ───┴──────┤                              ├─objcopy -O binary─► vmlinux.bin
                                      │      │                              │
                     patch_setup_jmp.py ◄──┘                              │  (按 LMA 导出)
                           │                                              │
@@ -84,23 +84,23 @@ kernel/*.c|cpp ──gcc/g++──► *.o ───┴──────┤     
 ### 2. 目录地图
 
 ```
-arch/          架构相关：启动、CPU 状态、上下文切换     1,670 行
-include/       全部头文件（23 个）                      2,169 行
+arch/          架构相关：启动、CPU 状态、上下文切换     1,723 行
+include/       全部头文件（25 个）                      2,543 行
   abi/         内核↔用户态 ABI（结构体 + 系统调用编号）   278 行
-  cpp/         C++ 包装类（smp）                          27 行
-  sys/         核心子系统接口（sched/vfs/cred/ktest/...） 850 行
-kernel/        内核主体                                 12,190 行
-  mm/          物理页 / 内核堆 / 虚拟内存                822 行
-  fs/          VFS + FAT32 + 块缓存 + MBR              2,797 行
-    fat32/     FAT32 的 4 个模块                        1,586 行
-  drivers/     PCI / IDE / AHCI                          673 行
-  rust/        Rust 组件                                 296 行
+  sys/         核心子系统接口（sched/vfs/cred/ktest/...） 930 行
+kernel/        内核主体                                 11,177 行
+  mm/          物理页 / 内核堆 / 虚拟内存                1,070 行
+  fs/          VFS + FAT32 + 块缓存 + MBR              3,672 行
+    fat32/     FAT32 的 4 个模块                        2,058 行
+  drivers/     PCI / IDE / AHCI / UART                  1,359 行
   lib/         内存与字符串                              90 行
-  ktest/       启动自测套件（17 个文件，T-007）         3,297 行
+ktest/         启动自测套件（19 个文件，T-007）         4,741 行
 init/          用户态 C 运行时（crt0 + ulib）              239 行
-usr/           16 个用户态程序                         1,529 行
-scripts/       构建补丁 + 冒烟测试                        967 行
+usr/           16 个用户态程序                         1,573 行
+scripts/       构建补丁 + 冒烟测试                      1,148 行
 ```
+
+（`ktest/` 实际在仓库根，不在 `kernel/` 下——旧行把它缩进在 `kernel/` 里是排版错误，2026-10-18 拉正；规模口径仍按 §35 把它计入"内核"。原 `kernel/rust/` 296 行已随组件删除。）
 
 #### 各目录职责一句话
 
@@ -109,7 +109,7 @@ scripts/       构建补丁 + 冒烟测试                        967 行
 | `arch/` | 一切必须用汇编或直接操作 CPU 状态的东西：实模式 setup、64 位入口、中断桩、GDT/IDT/TSS、上下文切换、AP trampoline |
 | `include/` | 全部接口。**没有实现文件**。ABI 定义集中在 `include/abi/` |
 | `include/abi/` | 内核和用户态**共同**包含的头文件，`lnxrm_syscalls.def` 用 X-macro 同时生成 C 枚举 |
-| `kernel/` | 内核 C/C++/Rust 实现 |
+| `kernel/` | 内核 C 实现（Rust 与 C++ 均已于 2026-10-18 移除） |
 | `init/` | 链接进**每个**用户态程序的运行库（不是 `/init` 那个程序） |
 | `usr/` | 用户态程序源码，一个 `.c` 一个二进制 |
 | `scripts/` | 构建期对已生成二进制打补丁 |
@@ -182,7 +182,7 @@ scripts/       构建补丁 + 冒烟测试                        967 行
    ├─ serial_irq_init()        IOAPIC IRQ4→向量 36
    ├─ vfs_init() + vfs_try_mount_disk()
    │   └─ ide_init() → ahci_init() → 挂载 FAT32
-   ├─ do_global_ctors()        遍历 __init_array（C++ 全局构造）
+   ├─ do_global_ctors()        遍历 __init_array（现为空转：零 C++ 全局构造）
    ├─ sched_init()             task_table 清零 + BSP idle 任务
    ├─ kernel_spawn("/bin/init")  第一个用户进程（pid 1）
    ├─ lapic_timer_calibrate()  BSP 一次性标定 LAPIC period + TSC 速率（缓存供 AP 用）
@@ -245,8 +245,8 @@ GRUB
 | `MAX_ORDER 11` | 最大 4 MiB 块 | `:10` |
 | `buddy_of` = `pa ^ size` | 伙伴地址就是异或块大小 | `:77-81` |
 | MMIO 保留区 | `pmm_reserve(lo,hi)` 把 LFB 等排除，播种时逐块收缩。**`RESV_MAX 8`**（2026-10-06 由 4 扩到 8：LFB、FB_PD、VGA、DEV、KHEAP 五类之后只剩 3 槽） | `:37-51` |
-| 位图放在物理 `0x10000` | **隐式依赖**：只因 `pmm.c:105` 把管理窗口钳在 `PMM_WINDOW_TOP`（**1 GiB**，`include/mm/mm.h:20`）以下才不会撞上 0x100000 的镜像 | `:23,119-125` |
-| **管理窗口 = 1 GiB** | `hi = MIN(hi, PMM_WINDOW_TOP)`（`:105`）+ `lo >= hi` 整段跳过（`:106`）。**这是硬上限，不是省事**：恒等映射/高半区别名在 `entry64.S` 里只有 1 GiB，超过就拿不到恒等地址（详见 §22.6） | `mm.h:20`、`pmm.c:105` |
+| 位图放在物理 `0x10000` | **隐式依赖**：只因 `pmm.c:105` 把管理窗口钳在 `PMM_WINDOW_TOP`（**2 GiB**，`include/mm/mm.h:22`）以下才不会撞上 0x100000 的镜像 | `:23,119-125` |
+| **管理窗口 = 2 GiB** | `hi = MIN(hi, PMM_WINDOW_TOP)`（`:106`）+ `lo >= hi` 整段跳过（`:107`）。**这是硬上限，不是省事**：恒等映射/高半区别名在 `entry64.S` 里现铺 0..2 GiB（`PD_M`+`PD_M2`、`PD_HI`+`PD_HI2`），超过 2 GiB 线性公式回绕低半区就拿不到恒等地址（详见 §22.6） | `mm.h:22`、`pmm.c:105` |
 | 无可用 RAM 时 panic | `best_end < kern_end + 18 MiB` → `panic(...)`（`:122-124`）。**2026-10-06 新增**：原来这条路径会去 `memset` 从 `kern_end` 起的"空闲"内存，把 `0x50000` 的页表本身抹掉 | `:122-124` |
 
 **API**：`pmm_init` / `pmm_reserve` / `pmm_alloc_order` / `pmm_free_order`，以及 `pmm_alloc()` / `pmm_free(pa)` 宏；另有 `pmm_inject_oom(n)`——**ktest 专用故障注入**（T-004），让接下来 n 次分配像空 buddy 一样失败，好在内存充裕的机器上确定性地测 OOM 分支。
@@ -255,7 +255,10 @@ GRUB
 多段内存布局下会浪费；裁剪后若一个区域都不剩，`pmm_init` 直接 `panic` 而不是继续跑
 （C69 + 2026-10-06 的守卫）。
 
-#### 4.2 `kernel/mm/kheap.c`（141 行）— 内核堆
+#### 4.2 `kernel/mm/kheap.c`（211 行）— 内核堆
+
+> **文件名已变**：`kheap.c` → `kheap.cpp`（为并入 `operator new` 改用 C++）。
+> **2026-10-18 再变**：`kheap.cpp` → `kheap.c`（纯 C 重写：构建零警告、ktest 85 例 1,633 检查全过、`make smoke` 两档 179/179）。`operator new` 不再存在（见四.4）；本文凡 `kheap.cpp` 与旧行号均按旧文件理解。
 
 **职责**：`kmalloc` / `kfree`。
 
@@ -285,9 +288,10 @@ n + 8 > 4096  →  直接 pmm_alloc_order(order)，header 记 0x80|order
 | **255** | 每进程用户空间 `[0x7f8000000000, 0x7ffffffff000]` | **每进程独立** | `vmm_map_user` |
 | **511** | 高半别名（内核镜像/堆/VGA/设备/LFB） | 全部 AS 共享 | `entry64.S:181` |
 
-⚠️ **槽 0 / 511 都只铺了 1 GiB**（`PDPT_M[0]`、`PDPT_HI[510]`），这就是
-`PMM_WINDOW_TOP = 0x40000000` 的由来——**物理内存管理窗口不能超过恒等映射的范围**，
+⚠️ **槽 0 / 511 现各铺 2 GiB**（`PDPT_M[0..1]`、`PDPT_HI[510..511]`），这就是
+`PMM_WINDOW_TOP = 0x80000000` 的当前上界——**物理内存管理窗口不能超过恒等映射的范围**，
 否则 `pmm_init` 播种时按恒等地址解引用就会 #PF，而在 IDT 建好之前 = 三重故障（见 §22.6）。
+越过 2 GiB 则线性公式回绕低半区，需要分段别名（`mm.h` 注释），尚未做。
 
 **核心机制**：
 ```c
@@ -325,13 +329,19 @@ u64 vmm_new_user_aspace(void) {
 两次 —— 空闲链表被毒化之后，下一次 `pmm_alloc()` 就是 `#GP pmm_alloc+0x4b`。
 `test_vmm_count_user_pages` 的收尾注释守着这条。
 
-#### 4.4 `kernel/mm/SlabAllocator.cpp`（19 行）
+#### 4.4 ~~`kernel/mm/SlabAllocator.cpp`（19 行）~~ → 已并入 `kheap.cpp:179`
+
+> **文件已删除**：全局 `operator new` 现在是 `kernel/mm/kheap.cpp:179`（内核从不 `delete`，故无 delete 重载）。
+> **2026-10-18：`operator new` 已彻底删除**——中途短暂存在的转发垫片 `kernel/mm/knew.cpp`
+> 随 `ahci.cpp` → `ahci.c` 一并移除（`smp.cpp` 从不使用 `new`）。下面"职责 / 为什么需要 /
+> 不可删"整节按历史理解；`kmalloc_or_panic` 现**零调用者**，仍按 C12/T-004 口径保留为
+> bring-up 入口。（同日稍后 `smp.cpp` 亦随 SMP 纯 C 重写删除——**C++ 在本内核中已不存在**。）
 
 **职责**：提供全局 `operator new` / `operator delete`。
 
 **为什么需要**：`-nostdinc++` 的 freestanding C++ 构建里没有 libc++，内核里每一个 `new` 都需要自己提供。这里把它们路由到 `kmalloc_or_panic`/`kfree`——`new` 没有异常可抛、契约又要求非 NULL，所以它是全内核唯一保留 OOM panic 的分配入口（T-004）。
 
-**这是 19 行但不可删的文件** —— `ahci.cpp` 和 `smp.cpp` 里的 C++ 代码依赖它。
+**这是 19 行但不可删的文件** —— `ahci.cpp` 和 `smp.cpp` 里的 C++ 代码依赖它。（历史：2026-10-18 起 `operator new` 已删除，`ahci.cpp` 纯 C 化后**无任何使用者**。）
 
 ---
 
@@ -672,7 +682,7 @@ r15 r14 r13 r12 rbp rbx rip
 **`idt_init` 的坑**（`arch/cpu.c:112`）：向量 49–255 全指向 `isr19` 作 catch-all，所以 IPI 必须显式覆盖（`:115-117`）。注释记了这个历史 bug：
 > "IPI vectors 0xF0..0xF2 — must push the real vector number, not 19. (idt_init used to alias 49..255 onto isr19, so a reschedule IPI was delivered as #XM and panicked the idle CPU.)"
 
-#### 7.2 `arch/cpu.c`（342 行）— CPU 状态
+#### 7.2 `arch/cpu.c`（422 行）— CPU 状态
 
 | 职责 | 关键点 |
 |---|---|
@@ -688,7 +698,9 @@ r15 r14 r13 r12 rbp rbx rip
 | **MSR/TSC** | `rdmsr` / `wrmsr` / `rdtsc` |
 | `cpu_init` | GDT → **重设 GS 基址**（因为 `gdt_reload` 的 `mov gs,ax` 在 QEMU TCG 下会清掉隐藏基址，`:231-233`）→ IDT → APIC → IOAPIC → 清 EM/TS，置 MP/NE/OSFXSR/OSXMMEXCPT |
 
-⚠️ **NXE / CR0.WP / CR4.WP / SMEP / SMAP 全部未置位**（见 GAP_ANALYSIS 4.2）。
+✅ **NXE（EFER）、CR0.WP、CR4.SMEP、CR4.SMAP 已全部置位**（BSP `cpu_init` 与 AP `ap_main`
+都走 `cpu_protect_init()`；smoke 的有序钉点会检查 AP 侧回读值。历史见 GAP_ANALYSIS 4.2 的
+2026-10-18 追加。）
 
 #### 7.3 `kernel/isr.c`（210 行）— 中断分发
 
@@ -716,69 +728,107 @@ r15 r14 r13 r12 rbp rbx rip
 **EOI 顺序的注释值得读**（`:193-197`）：
 > "EOI BEFORE the handler: handlers such as the PIT tick may call schedule() and switch away; a delayed EOI would leave the LAPIC ISR bit set and stall this vector until the interrupted task resumes (losing ticks / hanging idle's hlt)."
 
-#### 7.4 `kernel/apic.c`（139 行）— LAPIC + IOAPIC
+#### 7.4 `kernel/apic.c`（219 行，C）— LAPIC + IOAPIC（xAPIC / x2APIC 双路）
 
-两者都 MMIO 映射到 `DEV_VMA` 窗口的两个相邻 4 KiB 页：
-```
-LAPIC  DEV_VMA + 0x0000   （物理地址从 MSR 0x1B 读）
-IOAPIC DEV_VMA + 0x1000   （物理固定 0xFEC00000）
-```
-都带 `PG_PCD`（不可缓存）—— **比 AHCI 做对了**。
+**两种寄存器访问路径**，由 `apic_enable()` 在**每个核上各自定型**（`s_x2apic` 从不跨核继承）：
+
+- **xAPIC（MMIO）**：LAPIC/IOAPIC 映射进 `DEV_VMA` 窗口的两个相邻 4 KiB 页：
+  ```
+  LAPIC  DEV_VMA + 0x0000   （物理地址从 MSR 0x1B 读）
+  IOAPIC DEV_VMA + 0x1000   （物理地址优先取 MADT，缺省 0xFEC00000）
+  ```
+  都带 `PG_PCD`（不可缓存）—— **比 AHCI 做对了**。
+- **x2APIC（MSR）**：固件原生 x2APIC（`IA32_APIC_BASE.EXTD=1`，近十年真机常见）或
+  CPUID.1:ECX[21] 宣告支持时由内核自己置 EXTD（与 Linux `early_enable_x2apic` 同做法）。
+  此模式下 MMIO 窗口整体失效——只懂 MMIO 的驱动会把 INIT/SIPI 写进黑洞，AP 永远起不来
+  （这正是本内核曾在真机上单核启动的头号原因，见 GAP §17 登记）。寄存器走 MSR
+  `0x800 + (reg >> 4)`；ICR 是一次 64 位写（目的核在 bits 63:32；xAPIC 的 ICR_HIGH
+  在 x2APIC 下是保留寄存器，写它即 #GP）。
 
 | API | 用途 |
 |---|---|
-| `apic_init` / `apic_enable` | 从 MSR 定位、映射、屏蔽 8259（`outb(0x21/0xA1, 0xFF)`）、使能、屏蔽除 LINT0/1 外的所有 LVT |
-| `apic_send_ipi(dst, vec, delivery, level)` | 通用 IPI，等 send queue 空 |
-| `apic_send_init_ipi` | INIT，level assert |
+| `apic_init` | 定型访问模式（`apic_mode_settle`，可能切 x2APIC）→ 仅 xAPIC 时映射 MMIO 页 → 屏蔽 8259、TPR=0、全 LVT 掩蔽 |
+| `apic_enable` | 每核幂等：定型模式 + 写 SPURIOUS（BSP 在 `apic_init` 内、AP 在 `ap_main` 开头调用） |
+| `apic_get_id` | x2APIC 读 MSR 0x802 全 32 位；xAPIC 读 MMIO ID 寄存器 [31:24] |
+| `apic_send_ipi(dst, vec, delivery, level)` | 通用 IPI，等 Delivery Status 空（`icr_send` 按模式分路） |
+| `apic_send_init_ipi` | INIT，level assert + level-triggered（两种模式同一 bit 布局） |
 | `apic_send_sipi` | SIPI，vector 0x08 → 物理 `0x8000`（trampoline 起始） |
-| `apic_eoi` | 写 EOI |
-| `ioapic_set_irq/mask_irq/unmask_irq` | 重定向表项操作 |
+| `apic_eoi` | 写 EOI（统一走 `apic_write`，x2APIC 自动落 MSR 0x80B） |
+| `ioapic_set_irq/mask_irq/unmask_irq` | 重定向表项操作（目的核 ID 在 [31:24]，<256 核够用） |
 
 **没有中断使能**（`P_IE`/`HBA_GHC`）：当前只用于 INIT-SIPI-SIPI 和 IPI，不接收设备中断。
+冒烟可分别验证两条路径：默认 `qemu64,+smep,+smap` 走 xAPIC；再加 `+x2apic` 的
+`--qemu-args "-cpu qemu64,+smep,+smap,+x2apic"` 同样 179/179（串口行为
+`[apic] x2APIC MSR base=0x... ID=0`，AP 拉起/定时器/EOI 全走 MSR）。
 
-#### 7.5 `kernel/smp.cpp`（241 行，C++）— AP 拉起
+#### 7.5 `kernel/smp.c`（375 行，C）— AP 拉起
 
-**流程**（`Manager::init`）：
+> 2026-10-18：本节原为 `kernel/smp.cpp`（C++，309 行）+ `include/cpp/smp.hpp` 的
+> `smp::Manager` 类壳；随"完整修"重写为纯 C，两文件删除。同批落地四个真机向修复：
+> ① **AP 枚举改走 ACPI MADT**（`kernel/acpi.c`；无 ACPI 时保留顺序探测回退）——真机
+> APIC ID 带拓扑空洞，旧的"连败 2 次即停"探测会在试到第二颗核心真实 ID 之前就放弃；
+> ② **失败 AP 先补一发 INIT 复位再清共享块**，慢醒的 AP 不可能吃到下一轮的 `ap_id`；
+> ③ 超时等待纳入 `smp_lock` 作用域；④ `cpu_table` 槽位改为 `ap_main` **单点初始化**
+> （BSP 不再预填）。
+>
+> 同日补修 **⑤ ready 信号前移到一切控制台输出之前**（q35+KVM 实机复现的卡死）：
+> UC 映射下 KVM 每个字符都是几百次 VM-exit（2–3 ms/字、滚屏秒级），`ap_main` 原先
+> 先打 `[cpu]`/`[lapic]` 两行日志才发 `ready`——慢控制台吃光 BSP 的 100 ms 预算，
+> BSP 判定失败后发恢复 INIT，**把正在 kprintf、手持 `print_lock` 的 AP 复位**（gdb
+> 现场：AP 停在 BIOS 复位向量 `0xfff0`），锁永不释放，全机卡死在
+> `[smp] N CPUs online`。修后：`started=true` + idle 建完即 `signal_ready()`，日志与
+> 定时器武装全部后置——控制台慢只可能让日志慢，不可能拖垮启动。真机 UC LFB 滚屏
+> 同样慢，该竞态在裸机上同样成立。
+
+**流程**（`smp_init`）：
 ```
 1. copy_trampoline()
      ├─ memcpy(物理 0x8000, trampoline_start, len)     // arch/trampoline.S
-     ├─ trampoline_clear()                               // Rust 侧清共享数据
+     ├─ trampoline_clear()                               // 清共享数据块
      └─ setup_ap_gdt()  在物理 0x8800 建 4 段 GDT（供 trampoline 过渡）
 2. 注册 IPI handler：0xF0 reschedule（设 need_resched）、0xF2 stop（cli;hlt）
-3. 循环 try_id = 1 .. MAX_CPUS-1，连续失败 2 次就停
-   ap_startup(apic_id, cpu_id, pml4):
+3. 枚举 AP：acpi_collect_ap_ids()（MADT 名单，BSP 自身 ID 跳过）非空则按名单
+   逐个启动；否则回退 try_id = 1 .. MAX_CPUS-1 顺序探测（连败 2 次停）
+   ap_startup(apic_id, cpu_id, pml4)（全程持 smp_lock）：
      ├─ trampoline_setup(pml4, ap_stacks[cpu_id] 顶, cpu_id, gdt_packed,
      │                  ap_main 的【虚拟地址】)
      │   ← 注释强调：传 VA 而非 PA，因为 ap_main 的代码用高半 RIP 相对寻址访问全局
      ├─ apic_send_init_ipi + mdelay(10)
      ├─ apic_send_sipi(0x08) + mdelay(2)   ×最多 3 次
-     └─ 轮询 trampoline_is_ready()，AP_STARTUP_TIMEOUT_MS 超时
+     ├─ 轮询 trampoline_is_ready()，AP_STARTUP_TIMEOUT_MS（100ms）超时
+     └─ 失败路径：再复查一次 ready；仍失败则补 INIT 复位 + trampoline_clear()
 ```
 
-**`ap_main(ap_id)`（见 `smp.cpp`）的顺序很讲究**：
+**`ap_main(ap_id)`（见 `kernel/smp.c`）的顺序很讲究**：
 ```
-1. c->started = false              ← 必须在建 idle 之前，preferred_cpu 会检查
+0. c->id/bsp/need_resched + started=false  ← cpu_table 槽位的唯一初始化点（BSP 不预填）
+1. apic_enable() + c->apic_id = apic_get_id()
+                                    ← 必须最先！定型本核的 LAPIC 访问模式
+                                      （x2APIC 下 MSR 0x800+ 在 xAPIC 态访问会 #GP）
 2. gdt_init_cpu(ap_id)             ← 装本 CPU 的 GDT
 3. cpu_set_gs_base(&cpu_table[ap_id])
                                     ← 必须在 GDT 之后！注释解释：QEMU TCG 下
                                       gdt_reload 的 mov gs,ax 会清掉隐藏基址
 4. idt_init()                      ← 本 CPU 独立 IDT
 5. 修 CR0（清 EM/TS，置 MP/NE）、CR4（置 OSFXSR/OSXMMEXCPT）
+   + cpu_protect_init()            ← CR0.WP + CPUID 门控的 CR4.SMEP/SMAP
 6. 建 runq_head 环                 （原 spin_init(task_lock) 已随死字段删除）
-7. apic_enable() + LAPIC_TPR=0
-8. lapic_timer_start(32, HZ)       ← AP 本地周期 tick：用 BSP 在 main.c 缓存的
-                                     period，不碰 PIT；jiffies 仍归 BSP（cpu.c）
-9. 屏蔽 8259（outb 0xFF）
-10. sched_create_idle() → c->idle = idle; c->_current = idle
-11. c->started = true
-12. trampoline_signal_ready()      ← BSP 的 ap_startup 轮询的就是这个
-13. for(;;) { schedule(); sti; hlt; }
+7. LAPIC_TPR=0
+8. 屏蔽 8259（outb 0xFF）
+9. sched_create_idle() → c->idle = idle; c->_current = idle
+10. c->started = true
+11. trampoline_signal_ready()   ← BSP 的 ap_startup 轮询的就是这个；
+                                   **先于一切 kprintf**（⑤：慢控制台不得吃启动预算）
+12. 打 `[cpu] AP…CR0/CR4` 回执（原第 5 步后移到此）
+13. lapic_timer_start(32, HZ)   ← AP 本地周期 tick：用 BSP 在 main.c 缓存的
+                                   period，不碰 PIT；jiffies 仍归 BSP（cpu.c）
+14. 打 `[smp] AP…online` 行
+15. for(;;) { schedule(); sti; hlt; }
 ```
 
-⚠️ `mdelay` 已移至 `arch/cpu.c`（`smp.cpp` 原先硬编码 ~2 GHz TSC 假设的本地
-版本已删除），用标定得到的 `s_tsc_per_ms` 换算（`GAP_ANALYSIS.md` §16.1）。
+⚠️ `mdelay` 在 `arch/cpu.c`，用标定得到的 `s_tsc_per_ms` 换算（`GAP_ANALYSIS.md` §16.1）。
 
-#### 7.6 `arch/trampoline.S`（105 行）
+#### 7.6 `arch/trampoline.S`（108 行）
 
 AP 侧的极简入口。用 **VGA 段寄存器技巧**在 16 位实模式下拿到运行地址：
 
@@ -791,13 +841,15 @@ AP 侧的极简入口。用 **VGA 段寄存器技巧**在 16 位实模式下拿�
     lgdt [ds:0x0E]
 ```
 
-共享数据在物理 `0x9000`，字段偏移 `0x00/0x08/0x10/0x18/0x20/0x28`（与 `kernel/rust/smp.rs:4-10` 的 `TrampolineData` 精确对应）。
+共享数据在物理 `0x9000`，字段偏移 `0x00/0x08/0x10/0x18/0x20/0x28`（与 `include/sys/smp.h` 的 `struct trampoline_data` 精确对应；原 `kernel/rust/smp.rs` 的 `TrampolineData`，2026-10-18 并入 `kernel/smp.cpp`，同日随 SMP 纯 C 重写迁至 `kernel/smp.c`）。
 
 ---
 
 ### 8. 同步原语
 
-#### 8.1 `include/sys/spinlock.h` + `kernel/spinlock.c`（30 + 21 行）
+#### 8.1 `include/sys/spinlock.h`（30 行）+ 定义在 `kernel/sched.c:36-50`
+
+> **文件已删除**：`kernel/spinlock.c` 的 `spin_lock_irqsave`/`irqrestore` 已并入 `kernel/sched.c`；只剩头文件里的类型与声明。
 
 ```c
 typedef struct { volatile u32 locked; u32 pad; } spinlock_t;
@@ -817,13 +869,13 @@ typedef struct { volatile u32 locked; u32 pad; } spinlock_t;
 | `runq_lock` | `sched.c:26` | 所有 per-CPU 运行队列 | 总是 irqsave |
 | `task_table_lock` | `sched.c:28` | 任务槽分配状态 | |
 | `pmm_lock` | `pmm.c:28` | buddy 空闲链 + 位图 | |
-| `kheap_lock` | `kheap.c:18` | 内核堆 bin | |
+| `kheap_lock` | `kheap.c` | 内核堆 bin | |
 | `cache_lock` | `blk_cache.c:8` | 块缓存 | ⚠️ **跨越设备 I/O** |
 | `fat_fs_lock` | `fat32_priv.h:20` | 全部 FAT32 操作 | ⚠️ 与 `cache_lock` 嵌套 |
 | `pid_lock` | `task.c:20` | pid 计数器 | |
 | `console_out_lock`（内部 `print_lock`） | `print.c` | `kvprintf` 与 `console_write` 的控制台输出 | irqsave；2026-10-01 起两者共用（C1 已修） |
 
-#### 8.2 `kernel/spinlock.c` 之外的一个隐式锁
+#### 8.2 同步原语之外的一个隐式锁
 
 `fat_fs_lock` 的模式值得注意：**一个全局锁串行化整个文件系统**，所有 FAT32 操作都 `irqsave` 它。简单正确但完全无并发度 —— 这是双核下文件系统性能的根本瓶颈。
 
@@ -888,7 +940,7 @@ LBA 都不在缓存里，谁把一次 FAT 扇区读改成走缓存，这条立�
 | `struct dir_iter` | `{node, ops, cookie, mnt_data, err}` | `V_DIR` 的 `file->priv`；`err` 记住这次扫描已因 I/O 错误终止（T-005），下次 `getdent` 继续报错而不是"到头了" |
 | `struct fs_ops` | 10 个函数指针的 vtable | 每文件系统一份 |
 | `struct file_ops` | 4 个函数指针（read/write/getdent/close） | VFS 层的薄封装。**没有 `lseek`** |
-| `ata_total_sectors()`（`vfs.h:121`） | 从 IDENTIFY 数据块算容量（512 B 扇区数） | **T-080**：`static inline`，`ide.c` 与 `ahci.cpp` 共用。words 100-103 非 0 即权威；words 60-61 == `FFFFFFFFh`（ATA 的"改用 48 位"哨兵，也是 ≥2 TiB 时该 32 位字段的饱和值）→ 返回 **0**，调用方据此**拒绝 `blk_register`**。`num_sectors` 从此不可能等于 `0xFFFFFFFF` |
+| `ata_total_sectors()`（`vfs.h:129`） | 从 IDENTIFY 数据块算容量（512 B 扇区数） | **T-080**：`static inline`，`ide.c` 与 `ahci.c` 共用。words 100-103 非 0 即权威；words 60-61 == `FFFFFFFFh`（ATA 的"改用 48 位"哨兵，也是 ≥2 TiB 时该 32 位字段的饱和值）→ 返回 **0**，调用方据此**拒绝 `blk_register`**。`num_sectors` 从此不可能等于 `0xFFFFFFFF` |
 
 `file->priv` 按类型解释：`V_REG` → vnode 的堆拷贝；`V_DIR` → `struct dir_iter`；`V_CHR` → NULL。
 
@@ -1008,14 +1060,38 @@ static inline int fat_read_cluster(struct fat_mount*, u64 clba, void*);
 - `fat_lfn_count` / `lfn_fill`：**只有 rename 会写 LFN 记录**，create/mkdir 不会
 - `name_to_short`：长名 → 8.3 别名
 
-**写路径的持久化**（原 `fat32_journal.c` 已删除）：数据与目录的写入经
-`fat_write_sector` → `blk_cache_write` 进入 64 项**写回块缓存**，由
-`blk_cache_flush` 落盘。读路径（`fat_read_sector`/`fat_read_cluster`）刻意走同一缓存——绕过
+**写路径的持久化**（元数据走**真日志**，数据字节走写回缓存）：目录项 / FAT /
+FSInfo 这三类元数据经 `fat_write_sector`（或 `fat_set_entry`）→ `fat_journal_add`，
+文件数据经 `fat_write_sector_raw` 直接 `blk_cache_write`。两者都进 64 项
+**写回块缓存**（数据）或日志事务缓冲（元数据），由 `blk_cache_flush` /
+`fat_journal_commit` 落盘。读路径（`fat_read_sector`/`fat_read_cluster`）刻意走同一缓存——绕过
 它会让刚创建、还在缓存里的目录项对 `ls`/路径解析不可见（`fat32_priv.h`
 注释记录了这个历史 bug：mkdir/touch 曾"成功"却永不出现）。
 **FAT 区是另一条路**：读 `m->fat`（挂载时整表读进内存，`fat32.c:310`）、写
-`fat_set_entry` → `blk_io_write` 直写（`:114,126`，FAT 项要立刻生效）；挂载时的 BPB/FAT 表
+`fat_set_entry` → `fat_journal_add`：事务开启时只入缓冲，否则 `jrn_write_home`
+直写 `blk_io_write` 并镜像 FAT#2（`:114` 起）。挂载时的 BPB/FAT 表
 读取也直读。三类 LBA 各走各的、互不重叠——这就是 9.1.1 的**路径不变式**（T-008）。
+
+**C13 重建的 journal**（`kernel/fs/fat32/fat32_journal.c`，2026-10-14）：元数据的
+redo/WAL 日志，落在 mkfs 的 reserved 空闲扇区 `[8, reserved_sectors)`——Makefile 因此给
+`mkfs.vfat` 加 `-R 1024`（日志 1016 扇区；32 扇区的默认值只够 11 条记录，太小）。
+盘上布局：扇区 8 为 superblock（magic `JRN1`、version、state、nrec、head、CRC32），
+其后每条记录占 2 扇区（meta：magic/seq/lba/后像的 CRC32，随后 512B 后像）；`head` 是
+**相对 `j_start` 的偏移**，不是绝对 LBA（写入端与 replay 端必须一致，曾经错过一次）。
+
+每个变更 op 一个事务，由 `fat32.c` 的 6 个 locked wrapper 包住：
+`fat_journal_begin` → `*_impl` → `fat_journal_commit`（**失败路径也 commit**——impl
+可能已分配簇或改了半截，把这些留在 RAM 而磁盘看不见正是交叉链接的来源）。
+`commit` 的顺序是协议的全部：① flush 文件数据（ordered：数据字节不入日志）② 写记录
+③ 写 superblock 置 **COMMIT——这就是唯一提交点** ④ `jrn_write_home` 逐条 apply
+home（FAT 直写 + 镜像 FAT#2，目录扇区走缓存）⑤ flush ⑥ superblock 置 CLEAN。
+**④ 失败必须保留 COMMIT**：清掉它等于把"可恢复的半途"变成永久丢失。
+事务期间后像只在 RAM（按 lba 去重覆盖），读己经写由 `fat_read_sector` →
+`fat_journal_read` 提供；缓冲满时**中途 checkpoint 再续**而不是静默丢弃（C14 当年的病）。
+`fat_journal_mount`（`fat_mount` 里加载 FAT 之后调用）负责布局与 replay：superblock
+过期/损坏则重建，state==COMMIT 则幂等 redo 全部记录（并把重放的 FAT 扇区同步回
+`m->fat`，否则挂载会把刚提交的簇再发一遍），完成后置 CLEAN。失败语义与驱动一致：
+只可能泄漏簇、不交叉链接。
 
 **守着这套契约的测试**：`ktest/t_ioerr.c`（234 行，4 例，suite `blkio`，
 `KTEST_LATE`）用 `blk_inject_io()` 造一个"特定 LBA 必死"的磁盘，断言
@@ -1025,10 +1101,17 @@ lookup/unlink/rmdir/readdir 在 **impl 层与 VFS 层**都是 `EIO`（不是 `EN
 `scripts/smoke_test.py` 另有 marker `t-005 injected I/O error reported` 盯着
 串口必须真的打出 `[fat32] I/O error`。
 
+`ktest/t_journal.c`（3 例，suite `jrn`，`KTEST_LATE`）守 journal：①**写前先行**——
+事务开着时目录扇区在盘上必须还没变，随后拒绝 apply（=提交点后断电）→ `commit` 回
+`EIO`、superblock 保持 COMMIT、重跑 `fat_journal_mount` 补齐并置 CLEAN ②**拒绝日志
+记录**（=提交点前断电）→ superblock 仍是 CLEAN、replay 找不到事、目录扇区无痕
+③正常 commit 落盘 + 再跑一次 recovery 是空操作。marker
+`c13 journal write-ahead + replay verified` 与 `fat32 journal laid out`（每次挂载必打）。
+
 `ktest/t_cache.c`（342 行，5 例，suite `blkcache`，`KTEST_LATE`）守另一半：
 淘汰顺序必须是 LRU、热集不被冷流冲掉、200 扇区文件不会被写回两次、写后读回（含 1000 次
 往返与 purge 之后）字节不变、FAT 区 2018 个扇区一个都不许进缓存。`LATE_REPORTS`
-（`smoke_test.py:97`）在整段日志里搜这 5 条报告行，而不是把它们塞进 `BOOT_MARKERS`
+（`smoke_test.py:123`）在整段日志里搜这 5 条报告行，而不是把它们塞进 `BOOT_MARKERS`
 顺序等——`.ktest` 段内的先后是编译器的事（本机实测 `t_cache.c` 的 5 例**倒序**打印）。
 
 #### 9.5 `kernel/fs/mbr.c`（155 行）
@@ -1042,8 +1125,8 @@ lookup/unlink/rmdir/readdir 在 **impl 层与 VFS 层**都是 `EIO`（不是 `EN
 #### 9.6 `include/disk.h`（157 行）
 
 ```c
-/* struct blkdev 实际定义在 include/sys/vfs.h:132（disk.h 一并 include 它）；容量取值
-   ata_total_sectors() 在同文件 :121，T-080 起由 ide.c 与 ahci.cpp 共用 */
+/* struct blkdev 实际定义在 include/sys/vfs.h:140（disk.h 一并 include 它）；容量取值
+   ata_total_sectors() 在同文件 :129，T-080 起由 ide.c 与 ahci.c 共用 */
 struct blkdev {
     const char *name;  u32 sector_size;  u64 num_sectors;
     int (*read) (struct blkdev*, u64 lba, u32 count, void *buf);
@@ -1101,7 +1184,12 @@ int  blk_cache_purge (struct blkdev *dev);            /* 写回+丢弃（dev=NUL
 
 ⚠️ **无 LBA48 命令**（仍只编程 28 位寄存器；但容量取值已改走 `ata_total_sectors()`，words 100-103 会读、哨兵不再被当 2 TiB，C53 保持部分开放）；写后 "flush" 忽略返回值且不发 `0xE7` CACHE FLUSH（C55）。`ide_init` 的 DRQ/错误轮询问题（C54）已于 T-080 修复。
 
-#### 10.3 `kernel/drivers/ahci.cpp`（398 行，C++）
+#### 10.3 `kernel/drivers/ahci.c`（971 行，C）
+
+> **2026-10-18 重写**：由 `ahci.cpp`（重写前已在库增至 942 行）纯 C 化——constexpr /
+> `[[gnu::packed]]` / `new` / 默认参数四类 C++ 特性换 C 等价写法，寄存器编程、探测序列、
+> 超时语义不变，实测 971 行。⚠️ 本节表格与行号是更早的快照（如 `ahciPortInit`、
+> `ahci_hba_reset` 等函数名在重写前就已不存在），按历史理解，现行结构以源码与 §18 表为准。
 
 **这是最复杂的驱动，也是问题最集中的文件。**
 
@@ -1127,7 +1215,9 @@ int  blk_cache_purge (struct blkdev *dev);            /* 写回+丢弃（dev=NUL
 
 ---
 
-### 11. 图形与控制台（`kernel/framebuffer.c` + `kernel/print.c` + `kernel/ansi.c`，1,106 行）
+### 11. 图形与控制台（`kernel/framebuffer.c` + `kernel/print.c`，1,149 行）
+
+> **文件已删除**：`kernel/ansi.c` 的 `ansi_feed()` 已并入 `kernel/print.c`。
 
 #### 11.1 `include/framebuffer.h`（114 行）
 
@@ -1203,7 +1293,7 @@ int  blk_cache_purge (struct blkdev *dev);            /* 写回+丢弃（dev=NUL
 console_putc(c)
    ├─ fbc_putc(c)          ← 帧缓冲控制台（先喂，ANSI 序列才能被识别）
    ├─ vga_putc(c)          ← VGA 文本 80×25（硬件光标）
-   ├─ lnxrm_uart_putc(c)   ← Rust 16550
+   ├─ lnxrm_uart_putc(c)   ← drivers/uart.c（16550）
    └─ ring_putc(c)         ← 4096 字节环形缓冲（fb_console_init 用它回放）
 ```
 
@@ -1222,7 +1312,9 @@ console_putc(c)
 **VGA 文本后端仍然完整保留**：`fb_init` 因模式数据非法而提前返回时，`fbc_*`
 全程不激活，输出落在 `vga_putc` 上 —— 这就是"帧缓冲回退到 VGA 文本"的路径。
 
-#### 11.4 `kernel/ansi.c`（31 行）— ANSI 解析器
+#### 11.4 ~~`kernel/ansi.c`（31 行）~~ → `ansi_feed` 在 `kernel/print.c` — ANSI 解析器
+
+> **文件已删除**：ANSI 三状态机现位于 `kernel/print.c`。
 
 极简三状态机：
 ```c
@@ -1292,11 +1384,11 @@ static inline long sys_call3(long n, long a, long b, long c)
 没有 `xstrcpy` / `xmemcpy` / `kgetkey` ——它们对应的内核侧不存在。
 `kfb_*` 5 个图形包装见 §11.5。输出走 `xprintf`（不是 `printf`）。
 
-#### 12.2 `usr/`（16 个程序，1,481 行）
+#### 12.2 `usr/`（16 个程序，1,573 行）
 
 | 程序 | 行 | 职责 |
 |---|---|---|
-| `systest.c` | 859 | **全量系统调用测试**：错误码路径、信号/等待、`fb_*`、故意段错误隔离，外加 T-031 的降权子进程段（`setuid(1000)` 后逐个撞权限检查点）与 C46 的超长路径段（相对路径正常通过、`path.toolong.*` 5 条回 `-36`），**T-032 的记账/配额段**（父进程量 `mem.*`、子进程撞墙报 `quota.*`，全部在 `systest.done=1` 之前）与 **T-033 的归属段**（三层 `kfork`：首绘抢屏 `fb.owner.grab=0` → 第二个绘图被拒 `fb.owner.denied=-13` → 持有者退出 `fb.owner.released=0`，输家的 `held=0` 证明它没抢到），输出 `systest.done=1` |
+| `systest.c` | 903 | **全量系统调用测试**：错误码路径、信号/等待、`fb_*`、故意段错误隔离，外加 T-031 的降权子进程段（`setuid(1000)` 后逐个撞权限检查点）与 C46 的超长路径段（相对路径正常通过、`path.toolong.*` 5 条回 `-36`），**T-032 的记账/配额段**（父进程量 `mem.*`、子进程撞墙报 `quota.*`，全部在 `systest.done=1` 之前）与 **T-033 的归属段**（三层 `kfork`：首绘抢屏 `fb.owner.grab=0` → 第二个绘图被拒 `fb.owner.denied=-13` → 持有者退出 `fb.owner.released=0`，输家的 `held=0` 证明它没抢到），输出 `systest.done=1` |
 | `sh.c` | 111 | 交互式 shell：读命令 → 解析 → 内建或 `fork+execve` |
 | `rm.c` | 91 | 删除文件；`-p <dir>` **递归**删目录 |
 | `mv.c` | 90 | 移动/改名：路径拼接在用户态完成，内核只见 `SYS_rename` |
@@ -1317,7 +1409,11 @@ static inline long sys_call3(long n, long a, long b, long c)
 -mcmodel=large -Wl,-Ttext=0x7f8000400000`。**必须是 ET_EXEC 静态单文件**
 （内核的 `elf_load` 不支持 PIE/ET_DYN，见 §18 的 `elf.c`）。
 
-#### 12.3 `include/cpp/`（27 行）— C++ 包装类
+#### 12.3 ~~`include/cpp/`（27 行）— C++ 包装类~~
+
+> **✅ 已删除（2026-10-18）**：`smp.hpp`（`smp::Manager` 类声明）随 SMP 纯 C 重写
+> （`kernel/smp.cpp` → `kernel/smp.c`）一并删除，`include/cpp/` 目录不复存在，
+> `-Iinclude/cpp` 与 Makefile 的全部 C++ 规则同批拆除。下面按历史理解。
 
 | 文件 | 内容 |
 |---|---|
@@ -1328,6 +1424,15 @@ static inline long sys_call3(long n, long a, long b, long c)
 ---
 
 ### 13. Rust 组件（`kernel/rust/`，296 行）
+
+> **✅ 已整体移除（2026-10-18）**：`uart.rs` → `kernel/drivers/uart.c`（`lnxrm_uart_*`
+> 四函数 ABI 不变，`write_str` 随唯一消费者 panic handler 一起去掉）；`smp.rs` → 并入
+> `kernel/smp.cpp`（直接用 `sys/smp.h` 的 `struct trampoline_data`，两处 SeqCst fence
+> 保留）；`lib.rs` 删除（`#[panic_handler]` 只为 Rust 而存在）。Makefile 的
+> `RUSTC`/`RUSTFLAGS`/staticlib 链接与 `rust` 目标全部移除，构建不再需要 rustc。
+> 下面本节内容按历史理解。
+>
+> 原文（历史）：
 
 一个 staticlib，由链接脚本的 `*(.text .text.*)` 通配整体拉入。
 
@@ -1352,31 +1457,35 @@ static inline long sys_call3(long n, long a, long b, long c)
 
 ---
 
-### 14. 头文件地图（`include/`，2,169 行，23 个文件）
+### 14. 头文件地图（`include/`，2,543 行，25 个文件）
 
 | 文件 | 行 | 内容 | 关键定义 |
 |---|---|---|---|
-| `types.h` | 67 | **基础类型 + 地址空间常量** | `u8..u64` `ALIGN_UP/DOWN` `PHYS_TO_VIRT` `VIRT_TO_PHYS` `VGA_VMA` `DEV_VMA` `KHEAP_VMA` `USER_BASE` `USER_STACK_TOP` `PAGE_SIZE` `NR_*` `CONFIG_SMP 1` |
-| `boot.h` | 107 | 引导期数据结构 | `struct e820_entry` `struct boot_params` `struct vbe_lfb_info` `struct screen_lfb` `struct fb_info` `struct boot_info` + **4 个 `_Static_assert` 校验偏移** |
-| `mm/mm.h` | 102 | 内存子系统接口 + 页表标志 | `PG_P/W/U/PWT/PCD/PS` `PTE_PA_MASK` **`PMM_WINDOW_TOP`**（2026-10-06，物理内存窗口上界）`pmm_*`（`pmm_free_bytes`、`pmm_inject_oom` 故障注入；`pmm_total_bytes` 零引用已删）`kheap_*`（含 `kmalloc_or_panic`）`vmm_*`（含 **`vmm_count_user_pages`**，T-032 记账的唯一真相） |
-| `sys/sched.h` | 167 | **任务与调度的核心头** | `struct intr_frame` `struct cpu_ctx` `enum task_state` `struct task`（含信号字段与 T-032 的 **`mem_pages`/`mem_peak`**）信号号/常量 `current` 宏 `runqueue_add_local` |
+| `types.h` | 82 | **基础类型 + 地址空间常量** | `u8..u64` `ALIGN_UP/DOWN` `PHYS_TO_VIRT` `VIRT_TO_PHYS` `VGA_VMA` `DEV_VMA` `KHEAP_VMA` `USER_BASE` `USER_STACK_TOP` `PAGE_SIZE` `NR_*` `CONFIG_SMP 1` `MAX_CPUS 8`（唯一定义处，`apic.h`/`percpu.h` 的重复定义已收敛） |
+| `boot.h` | 114 | 引导期数据结构 | `struct e820_entry` `struct boot_params` `struct vbe_lfb_info` `struct screen_lfb` `struct fb_info` `struct boot_info` + **4 个 `_Static_assert` 校验偏移** |
+| `mm/mm.h` | 151 | 内存子系统接口 + 页表标志 | `PG_P/W/U/PWT/PCD/PS` `PTE_PA_MASK` **`PMM_WINDOW_TOP`**（2026-10-06，物理内存窗口上界）`pmm_*`（`pmm_free_bytes`、`pmm_inject_oom` 故障注入；`pmm_total_bytes` 零引用已删）`kheap_*`（含 `kmalloc_or_panic`）`vmm_*`（含 **`vmm_count_user_pages`**，T-032 记账的唯一真相） |
+| `mm/pagefault.h` | 22 | #PF 分发 + 懒惰栈增长接口（T-090/T-094） | `page_fault_try_fix(f, cr2)`：用户态 #PF 先试修复再报告/杀，内核 #PF 不走它 |
+| `sys/sched.h` | 194 | **任务与调度的核心头** | `struct intr_frame` `struct cpu_ctx` `enum task_state` `struct task`（含信号字段与 T-032 的 **`mem_pages`/`mem_peak`**）信号号/常量 `current` 宏 `runqueue_add_local` |
 | `sys/cred.h` | 72 | **特权档与能力**（T-030/T-031/T-032） | `enum cred_kind` `struct cred` `CAP_KILL/SYS_ADMIN/FB` `cred_capable()` `cred_setuid()` **`cred_mem_quota()`** + `CRED_USER_MEM_QUOTA_PAGES`（64 MiB，T-032 配额的唯一来源） |
-| `sys/vfs.h` | 144 | VFS 接口 | `struct vnode` `struct fs_ops` `struct file_ops` `struct file` `struct dir_iter`（含 `err`：readdir 已死则继续报错）`struct blkdev` **`ata_total_sectors()`**（T-080：IDENTIFY 容量取值）错误码 |
-| `sys/cpu.h` | 127 | CPU 状态接口 + GDT/TSS | `HZ 100` 选择子常量 `struct gdtr` `gdt_init_cpu` `idt_init` `lapic_timer_start` `lapic_timer_calibrate` `mdelay` `rdmsr`/`wrmsr`/`rdtsc` `tsc_per_ms` |
-| `sys/apic.h` | 62 | LAPIC/IOAPIC 寄存器与接口 | `LAPIC_*` 寄存器偏移 `IOAPIC_*` `apic_send_*` `ioapic_*` |
-| `sys/smp.h` | 71 | SMP 接口 | `smp_init` `ap_main` `ipi_handler_install` `trampoline_start/end` |
-| `sys/percpu.h` | 42 | per-CPU 数据（GS 相对） | `struct cpu_info` `CPU_DATA_SIZE 4096` `this_cpu_data()` `this_cpu` 宏 `cpu_table[]` |
+| `sys/protect.h` | 36 | kxld 保护层接口（T-031） | `kxld_protect_kill()` `cap_gate()` `cred_setuid()`——纯函数规则，不读 `current` |
+| `sys/vfs.h` | 152 | VFS 接口 | `struct vnode` `struct fs_ops` `struct file_ops` `struct file` `struct dir_iter`（含 `err`：readdir 已死则继续报错）`struct blkdev` **`ata_total_sectors()`**（T-080：IDENTIFY 容量取值）错误码 |
+| `sys/cpu.h` | 128 | CPU 状态接口 + GDT/TSS | `HZ 100` 选择子常量 `struct gdtr` `gdt_init_cpu` `idt_init` `lapic_timer_start` `lapic_timer_calibrate` `mdelay` `rdmsr`/`wrmsr`/`rdtsc` `tsc_per_ms` `cpu_has_smep/smap/x2apic` `ipi_handler_install` |
+| `sys/apic.h` | 59 | LAPIC/IOAPIC 寄存器与接口 | `LAPIC_*` 寄存器偏移 `IOAPIC_*` `apic_send_*` `ioapic_*`（`MAX_CPUS` 重复定义已收敛到 `types.h`） |
+| `sys/smp.h` | 81 | SMP 接口 | `smp_init` `ap_main` `AP_STARTUP_TIMEOUT_MS` `ipi_handler_install` `trampoline_start/end` `struct trampoline_data` `TRAMPOLINE_CODE_PHYS`/`TRAMPOLINE_DATA_PHYS`（共享数据契约；原 Rust `smp.rs` 于 2026-10-18 并入 `smp.cpp`，同日 `smp.cpp`/`smp.hpp` 随纯 C 重写删除） |
+| `sys/acpi.h` | 43 | ACPI 发现（AP 枚举 + IOAPIC 定址；表读取经 `ACPI_SCRATCH_VA` bounce 窗口） | `acpi_init` `acpi_collect_ap_ids` `acpi_ioapic_base` `ACPI_SCRATCH_VA`（2026-10-18 新增；夜：+bounce 窗口） |
+| `sys/percpu.h` | 49 | per-CPU 数据（GS 相对） | `struct cpu_info` `CPU_DATA_SIZE 4096` `this_cpu_data()` `this_cpu` 宏 `cpu_table[]`（`MAX_CPUS` 已收敛到 `types.h:77` 唯一定义） |
 | `sys/spinlock.h` | 30 | 自旋锁 | `spinlock_t` `SPINLOCK_INIT` 2 个函数（irqsave 对；裸版本零引用已删） |
-| `fat32_priv.h` | 247 | FAT32 私有结构 | `struct fat_mount` `fat_fs_lock` `fat_read_sector`/`fat_write_sector`（走块缓存，**只答 0 或 `LNXRM_EIO`**）`fat_scan_dir`/`fat_resolve_path`/`fat_dir_iter` 三态契约 |
+| `sys/ktest.h` | 99 | 自测框架接口 | `enum ktest_stage` `struct ktest_case` `KTEST()` 注册宏、`ktest_summary()` 报告 |
+| `fat32_priv.h` | 349 | FAT32 私有结构 | `struct fat_mount` `fat_fs_lock` `fat_read_sector`/`fat_write_sector`（走块缓存，**只答 0 或 `LNXRM_EIO`**）`fat_scan_dir`/`fat_resolve_path`/`fat_dir_iter` 三态契约 |
 | `disk.h` | 157 | 块设备 + 缓存 | `struct cache_entry`（`valid`/`dirty`/`stamp`，**`used` 已删**）`struct mbr_entry` `CACHE_ENTRIES 64` `blk_io_read`/`blk_io_write`（唯一驱动调用点）`blk_inject_io` 故障注入 `blk_cache_stats_*` `blk_cache_lookup` `blk_cache_purge`（T-007/T-008） |
 | `elf.h` | 43 | ELF64 结构 | `Elf64_Ehdr` `Elf64_Phdr` `PT_LOAD` `PF_W` |
 | `framebuffer.h` | 114 | 图形接口 | `FB_VMA` `FB_PD_*` `FB_CELL_*` `fb_init` `fb_clear` `fb_fill_rect` `fb_draw_char` `fb_puts` `fb_console_*` `fb_owner_get` `fb_claim` `fb_disown`（T-033 归属）`fb_layout_*` `fb_pack` `fb_read_px`/`fb_write_px`（ktest） |
-| `console.h` | 111 | 控制台 + 打印 | `kprintf` `panic` `console_putc` `console_out_lock/unlock`（`kvprintf` 与 `console_write` 共用） |
+| `font8x16.h` | 111 | VGA 8×16 位图字体（CP437，可打印 ASCII 0x20..0x7E） | `font8x16[]` 纯数据表（`static const`，每个包含者各持一份） |
+| `console.h` | 126 | 控制台 + 打印 | `kprintf` `panic` `console_putc` `console_out_lock/unlock`（`kvprintf` 与 `console_write` 共用） |
 | `io.h` | 40 | 端口 I/O | `inb` `outb` `inw` `outw` `inl` `outl` |
 | `pci.h` | 26 | PCI 配置空间 | `pci_scan` `pci_read` `pci_write` |
 | `abi/lnxrm_abi.h` | 224 | **内核↔用户态共享 ABI** | `LNXRM_SYS_*` 错误码 `LNXRM_SYS_*` 编号 `lnxrm_fb_*` `lnxrm_dirent` `lnxrm_sigaction` **`lnxrm_ps_entry`（48 B，含 `mem_kib`/`peak_kib`）** 信号号 |
 | `abi/lnxrm_syscalls.def` | 54 | 系统调用编号（X-macro） | 32 个编号 0–31 连续，全部实现 |
-| `cpp/smp.hpp` | 27 | C++ 包装 | `smp::Manager` |
 
 ✅ **槽号注释已修正（2026-10-01）**：`FIXMAP_VA` 整个宏（连同 `mm.h` 里的重复定义、fixmap 概念、`vmm.c` 对 slot 97/112 的跳过）已删除；`DEV_VMA` 注释由错的 "PD_HI[98]" 改为实际的 **PD_HI[128]**，地址空间列表补上了 framebuffer 窗口 [104,112)。
 
@@ -1384,24 +1493,23 @@ static inline long sys_call3(long n, long a, long b, long c)
 
 ### 15. 构建系统
 
-#### 15.1 `Makefile`（162 行）
+#### 15.1 `Makefile`（241 行）
 
-**四个工具链变量**：`gcc`（C）、`g++`（C++）、`nasm`（汇编）、`rustc`（Rust）、`ld`（链接）、`objcopy`、`python3`。
+**工具链变量**：`gcc`（C）、`nasm`（汇编）、`ld`（链接）、`objcopy`、`python3`。2026-10-18 起不再有 `rustc`；同日 `g++` 与全部 C++ 编译规则（`CXXFLAGS`、`KSRC_CXX`、`KOBJ_CXX`、`%.opp` 模式规则、`-Iinclude/cpp`）随 `smp.cpp`/`smp.hpp` 删除——现在是零 C++ 源文件的纯 C 工程。
 
 **四组编译标志**：
 
 | 组 | 标志 | 理由 |
 |---|---|---|
 | `KERNFLAGS` | `-ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -O2 -std=gnu11` + `-ffunction-sections -fdata-sections` | 无 libc、无栈保护、非 PIC（`mcmodel=kernel` 让代码假设在 `0xffffffff8xxxxxxx`）、**禁 SSE**（省下保存/恢复）；两个 `-sections` 让每个符号独占段，配合链接 `--gc-sections` 裁掉不可达代码（见 §15.1 关键规则） |
-| `CXXFLAGS` | 同上 + `-std=c++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit -nostdinc++` | 无异常无 RTTI，**`__init_array` 手动调**（`main.c:21-24`） |
-| `RUSTFLAGS` | `--crate-type staticlib -C panic=abort -C relocation-model=static -C code-model=kernel -C target-feature=-sse --target x86_64-unknown-none` | `no_std` 等价（`-C panic=abort` + 自定义 panic_handler） |
+| ~~`CXXFLAGS`~~ | ~~同上 + `-std=c++20 -fno-exceptions -fno-rtti ...`~~ | **已删除（2026-10-18）**：零 C++ 源文件后整行拆除；`do_global_ctors` 仍被调用但已无构造函数可跑（见 §35 登记） |
 | `USRFLAGS` | `-ffreestanding -nostdlib -nostartfiles -static -no-pie -mcmodel=large -Iinit -Iinclude` | 用户态同样无 libc |
 
 **关键规则**：
 ```make
-$(BUILD)/vmlinux.elf: $(KOBJ) arch/kernel.ld $(BUILD)/liblnxrm.a
+$(BUILD)/vmlinux.elf: $(KOBJ) arch/kernel.ld
 	$(LD) -T arch/kernel.ld --gc-sections -o $@ $(KOBJ) \
-	      $(BUILD)/liblnxrm.a -Map build/vmlinux.map \
+	      -Map build/vmlinux.map \
 	      --no-warn-rwx-segments
 
 $(BUILD)/vmlinux.bin: build/vmlinux.elf
@@ -1413,15 +1521,15 @@ $(BUILD)/trampoline.o: arch/trampoline.S
 		--redefine-sym _binary_build_trampoline_bin_start=trampoline_start ...
 ```
 
-**`--gc-sections` + `-ffunction-sections`/`-fdata-sections`（2026-10-01 加）**：Rust staticlib 的 `core`（编译器内建、unicode 表、浮点格式化）原先整个被拖进 `.image`，**约 155 KB（占镜像 70%）是永远不会执行的代码**。编译期按符号分段 + 链接期垃圾回收后，`.image` 从 253,472 缩到 ~77,000 字节。`.text.prologue` 必须 `KEEP`（`patch_setup_jmp.py` 要按 `_start32`/`_start64` 符号算跳转，见 §15.2），`entry64.S` 里的绝对地址引用（`isr_stub_table`、trampoline 符号）会自然锚定住对应段。
+**`--gc-sections` + `-ffunction-sections`/`-fdata-sections`（2026-10-01 加）**：Rust staticlib 的 `core`（编译器内建、unicode 表、浮点格式化）原先整个被拖进 `.image`，**约 155 KB（占镜像 70%）是永远不会执行的代码**。编译期按符号分段 + 链接期垃圾回收后，`.image` 从 253,472 缩到 ~77,000 字节（该 staticlib 已于 2026-10-18 随 Rust 组件移除，规则本身保留——C/C++ 同样受益）。`.text.prologue` 必须 `KEEP`（`patch_setup_jmp.py` 要按 `_start32`/`_start64` 符号算跳转，见 §15.2），`entry64.S` 里的绝对地址引用（`isr_stub_table`、trampoline 符号）会自然锚定住对应段。
 
 **trampoline 的两段式处理很有意思**：AP trampoline 要被 `memcpy` 到物理 `0x8000`，所以先编成 `bin`，再 objcpy 成 ELF 对象（带 `.trampoline` 段），才能参与链接。
 
-**`build/disk.img` 目标**（`:204-212`）：`dd` 64 MiB → `mkfs.vfat -F 32` → `mcopy` 拷 `README.md` → `mmd ::bin` → 循环 `mcopy` 拷所有用户态 ELF 到 `::bin/`。**用宿主机的 mtools 构建 FAT32 镜像** —— 聪明，避免了"内核挂载自己生成的镜像"的鸡生蛋问题。
+**`build/disk.img` 目标**（`:223-233`）：`dd` 64 MiB → `mkfs.vfat -F 32` → `mcopy` 拷 `README.md` → `mmd ::bin` → 循环 `mcopy` 拷所有用户态 ELF 到 `::bin/`。**用宿主机的 mtools 构建 FAT32 镜像** —— 聪明，避免了"内核挂载自己生成的镜像"的鸡生蛋问题。
 
-**目标**：`all`（bzImage）/ `usr` / `rust` / `clean` / `run`（QEMU `-m 256 -smp 2`）/ `smoke`（跑 `scripts/smoke_test.py`）/ `imageiso`（`build/lnxrm.iso`，见 §33.1）。
+**目标**：`all`（bzImage）/ `usr` / `clean` / `run`（QEMU `-m 256 -smp 2`）/ `smoke`（跑 `scripts/smoke_test.py`）/ `imageiso`（`build/lnxrm.iso`，见 §33.1）。（`rust` 目标已随 Rust 组件于 2026-10-18 移除；C++ 目标/规则同日随 `smp.cpp` 移除。）
 
-⚠️ `run` 的 QEMU 参数是 `-drive ...,if=ide`（走 IDE 驱动），机器上**没有 SATA 控制器** —— 所以 `ahci.cpp` 虽然链接进镜像、`ahci_init()` 也每轮启动都执行 `pci_scan`，但 class 过滤对所有设备都失败，**AHCI 的实际读写路径在 `make run` 下零执行、完全没被测过**（详见 §10.3）。同理 `mbr.c` 是 `vfs_try_mount_disk` 的第 2 步 fallback，整盘 FAT 挂载总能先成功，标准镜像下也走不到（§9.5）。
+⚠️ `run` 的 QEMU 参数是 `-drive ...,if=ide`（走 IDE 驱动），机器上**没有 SATA 控制器** —— 所以 `ahci.c` 虽然链接进镜像、`ahci_init()` 也每轮启动都执行 `pci_scan`，但 class 过滤对所有设备都失败，**AHCI 的实际读写路径在 `make run` 下零执行、完全没被测过**（详见 §10.3）。同理 `mbr.c` 是 `vfs_try_mount_disk` 的第 2 步 fallback，整盘 FAT 挂载总能先成功，标准镜像下也走不到（§9.5）。
 
 #### 15.2 `scripts/patch_setup_jmp.py`（69 行）
 
@@ -1537,7 +1645,7 @@ struct blkdev {
 
 #### 第一遍：搞清"它能做什么"（约 1 小时）
 
-1. `docs/README.md` —— 功能列表
+1. `README.md` —— 项目概览（能干什么、快速开始、文档地图）
 2. `make run` 看一次实际输出
 3. `include/abi/lnxrm_syscalls.def` —— 32 个编号（0–31，连续无空洞），**这是内核对外的全部接口**
 4. `include/sys/sched.h` —— `struct task` / `struct intr_frame` / `current` 宏，**这是最核心的头文件**
@@ -1566,7 +1674,7 @@ struct blkdev {
 15. `arch/entry64.S` 的 `PUSHALL`/`POPALL` 宏和 `isr_stub_table`
 16. `arch/cpu.c` 的 `idt_init` + `gdt_fill_one`
 17. `kernel/isr.c` 的 `isr_common`
-18. `kernel/smp.cpp` 的 `ap_main`（顺序很讲究，逐行都有注释解释为什么）
+18. `kernel/smp.c` 的 `ap_main`（顺序很讲究，逐行都有注释解释为什么）
 
 #### 第六遍：搞清存储（3 小时）
 
@@ -1578,7 +1686,7 @@ struct blkdev {
 #### 第七遍：按需
 
 23. 图形：`kernel/framebuffer.c` 的分层表（§11.2）
-24. 硬件：`kernel/drivers/ahci.cpp`
+24. 硬件：`kernel/drivers/ahci.c`
 25. 构建：`Makefile` + 两个 patch 脚本
 
 #### 不要一开始就读
@@ -1591,71 +1699,72 @@ struct blkdev {
 
 ### 18. 全文件清单
 
-#### `arch/`（1,670 行，5 个文件）
+#### `arch/`（1,723 行，5 个文件）
 
 | 文件 | 行 | 职责 |
 |---|---|---|
 | `setup.asm` | 572 | 实模式 setup：E820 采集、VBE 4 遍级联选型、建临时页表、进长模式 |
-| `entry64.S` | 513 | `_start32`（GRUB 入口）、`_start64`、中断桩宏与表、`swtch`/`glue_first`/`load_cr3` |
+| `entry64.S` | 541 | `_start32`（GRUB 入口）、`_start64`、中断桩宏与表、`swtch`/`glue_first`/`load_cr3` |
 | `trampoline.S` | 108 | AP 侧极简入口，VGA 段技巧取运行地址，操作物理 `0x9000` 共享数据 |
-| `cpu.c` | 412 | GDT/TSS（每 CPU 一套）、IDT、IRQ/IPI 表、PIT 编程（模式 2）、LAPIC 定时器标定 + BSP-only `jiffies` + `mdelay`/`tsc_per_ms`、CPUID 型号打印、MSR/TSC |
-| `kernel.ld` | 65 | 单一连续 `.image` 段（VMA `0xffffffff80100000` / LMA `0x100000`）+ `.bss` + 启动栈 |
+| `cpu.c` | 422 | GDT/TSS（每 CPU 一套）、IDT、IRQ/IPI 表、PIT 编程（模式 2）、LAPIC 定时器标定 + BSP-only `jiffies` + `mdelay`/`tsc_per_ms`、CPUID 型号/特性打印（SMEP/SMAP/x2APIC）、MSR/TSC |
+| `kernel.ld` | 80 | 单一连续 `.image` 段（VMA `0xffffffff80100000` / LMA `0x100000`）+ `.bss` + 启动栈 |
 
-#### `kernel/`（12,190 行，50 个文件）
+#### `kernel/`（15,917 行，52 个文件）
 
 | 文件 | 行 | 职责 |
 |---|---|---|
-| `syscall.c` | 448 | 32 槽分发表（全部有实现），`int 0x80`，rax/rdi/rsi/r10；`ps`/`diskinfo`/`fb_*` 在此过 `cap_gate` |
-| `fs/vfs.c` | 735 | VFS：vnode/file/fs_ops、fd 表、路径解析、挂载（`vfs_try_mount_one` 逐盘尝试，T-081）、设备节点、read/write/close/dup2、`console_write`（共享打印锁） |
-| `framebuffer.c` | 702 | 图形核心：像素格式抽象、CP437 字体、ANSI 控制台、4 个裁剪绘图原语（无双缓冲） |
-| `fs/fat32/fat32_meta.c` | 745 | FAT32 目录项增删改 + mkdir/rmdir/unlink/rename/move（错误码一路上传） |
-| `print.c` | 373 | 串口 + VGA 文本双后端 + 环形缓冲回放 + `kvprintf` + `console_out_lock` |
-| `task.c` | 619 | pid、fork/execve/exit/waitpid、USERCOPY helpers、`kernel_spawn` |
-| `sched.c` | 516 | 任务表、per-CPU 运行队列、负载均衡、抢占调度、idle、`switch_to`、`nanosleep` |
-| `mm/vmm.c` | 409 | 三槽地址空间、页表 map/unmap/walk、`fork` 深拷贝、MMIO 映射 |
-| `smp.cpp` | 262 | AP 拉起（INIT-SIPI-SIPI）、trampoline 部署、`ap_main`（AP 武装本地 tick） |
-| `isr.c` | 267 | 中断分发、异常报告、键盘（scancode→ASCII）、1 个输入队列 |
-| `signal.c` | 292 | 信号投递、默认处置、`sigaction`/`sigprocmask`/`sigreturn` 链路 |
-| `fs/fat32/fat32.c` | 323 | BPB 解析、挂载、FAT 链读写、空闲簇查找、限流 I/O 告警 |
-| `mm/pmm.c` | 253 | buddy 物理页分配器 + 逐 order 位图 + MMIO 保留 + 可用量统计接口（`pmm_total_bytes` 零引用已删） |
-| `fs/fat32/fat32_dir.c` | 258 | 目录扫描、LFN 长文件名重建、路径解析（三态返回） |
-| `fs/fat32/fat32_file.c` | 260 | 文件读写、簇链分配（读写失败回 EIO / 短计数） |
+| `syscall.c` | 449 | 32 槽分发表（全部有实现），`int 0x80`，rax/rdi/rsi/r10；`ps`/`diskinfo`/`fb_*` 在此过 `cap_gate` |
+| `fs/vfs.c` | 794 | VFS：vnode/file/fs_ops、fd 表、路径解析、挂载（`vfs_try_mount_one` 逐盘尝试，T-081）、设备节点、read/write/close/dup2、`console_write`（共享打印锁） |
+| `framebuffer.c` | 741 | 图形核心：像素格式抽象、CP437 字体、ANSI 控制台、4 个裁剪绘图原语（无双缓冲） |
+| `fs/fat32/fat32_meta.c` | 763 | FAT32 目录项增删改 + mkdir/rmdir/unlink/rename/move（错误码一路上传） |
+| `print.c` | 454 | 串口 + VGA 文本双后端 + 环形缓冲回放 + `kvprintf` + `console_out_lock` + **ANSI 转义三状态机（`ansi_feed`，原 `ansi.c` 已并入）** |
+| `task.c` | 642 | pid、fork/execve/exit/waitpid、USERCOPY helpers、`kernel_spawn` |
+| `sched.c` | 619 | 任务表、per-CPU 运行队列、负载均衡、抢占调度、idle、`switch_to`、`nanosleep`、**自旋锁 `spin_lock_irqsave`/`irqrestore`（原 `spinlock.c` 已并入；声明在 `include/sys/spinlock.h`）** |
+| `mm/vmm.c` | 449 | 三槽地址空间、页表 map/unmap/walk、`fork` 深拷贝、MMIO 映射 |
+| `smp.c` | 375 | AP 拉起（INIT-SIPI-SIPI）、trampoline 部署、`ap_main`（AP 武装本地 tick；ready 信号先于一切控制台输出，见 §7.5 ⑤）；MADT 枚举 + 失败 AP INIT 复位 + `cpu_table` 单点初始化（2026-10-18 由 `smp.cpp` C 化） |
+| `isr.c` | 314 | 中断分发、异常报告、键盘（scancode→ASCII）、1 个输入队列 |
+| `signal.c` | 290 | 信号投递、默认处置、`sigaction`/`sigprocmask`/`sigreturn` 链路 |
+| `fs/fat32/fat32.c` | 401 | BPB 解析、挂载、FAT 链读写、空闲簇查找、限流 I/O 告警 |
+| `mm/pmm.c` | 319 | buddy 物理页分配器 + 逐 order 位图 + MMIO 保留 + 可用量统计接口（`pmm_total_bytes` 零引用已删） |
+| `fs/fat32/fat32_dir.c` | 262 | 目录扫描、LFN 长文件名重建、路径解析（三态返回） |
+| `fs/fat32/fat32_file.c` | 265 | 文件读写、簇链分配（读写失败回 EIO / 短计数） |
 | `fs/blk_cache.c` | 321 | 64 项时间戳 LRU 扇区缓存（`used` 已删）+ `blk_io_*`（唯一驱动调用点）+ 故障注入 + `blk_cache_stats/lookup/purge` |
-| `drivers/ide.c` | 194 | IDE PIO 驱动（28 位 LBA 命令 + 48 位容量取值，T-080） |
-| `fs/mbr.c` | 155 | MBR 分区表解析（**标准镜像下运行时不可达**：整盘 FAT 挂载先成功，见 §9.5） |
-| `apic.c` | 139 | LAPIC + IOAPIC 驱动、IPI 发送 |
-| `mm/kheap.c` | 141 | 内核堆（分离空闲链，>4 KiB 走 buddy） |
-| `drivers/ahci.cpp` | 398 | AHCI 驱动（H2D FIS、命令表、PRD、DMA；完成判定含 `PxTFD.ERR`，T-080） |
-| `fs/fat32/fat32_journal.c` | — | **已删除**：写路径改走块缓存写回（见 §9.4） |
+| `drivers/ide.c` | 233 | IDE PIO 驱动（28 位 LBA 命令 + 48 位容量取值，T-080） |
+| `fs/mbr.c` | 161 | MBR 分区表解析（**标准镜像下运行时不可达**：整盘 FAT 挂载先成功，见 §9.5） |
+| `apic.c` | 219 | LAPIC + IOAPIC 驱动、IPI 发送；xAPIC（MMIO）/ x2APIC（MSR）双路访问（2026-10-18 加） |
+| `acpi.c` | 286 | RSDP 扫描（EBDA + BIOS 区）→ RSDT/XSDT → MADT 解析：APIC 名单 + IOAPIC 定址；表经 bounce 窗口逐页拷出（真机固件多把 ACPI 表放在恒等窗口外，直读即 #PF——真机黑屏根因，见 `GAP_ANALYSIS.md` §17 追加（四））（2026-10-18 新增；夜：+bounce） |
+| `mm/kheap.c` | 211 | 内核堆（分离空闲链，>4 KiB 走 buddy）+ `kmalloc` 尺寸上限 + `kfree` bin/对齐校验 + 静态断言钉常量（四.2；2026-10-18 由 `kheap.cpp` 纯 C 重写，全局 `operator new` 已删除） |
+| `drivers/ahci.c` | 971 | AHCI 驱动（H2D FIS、命令表、PRD、DMA；完成判定含 `PxTFD.ERR`，T-080；2026-10-18 由 `ahci.cpp` 纯 C 重写） |
+| `fs/fat32/fat32_journal.c` | 367 | **C13 重建的真日志**（2026-10-14，原实现已删除）：reserved 区 `[8,reserved)` 上的 redo 日志、CRC32、单扇区 superblock 提交点、begin/commit/apply、mount 幂等 replay（见 §9.4） |
+| `fs/initramfs.c` | 338 | initramfs（newc cpio）只读根：无盘时充当 `/` 供出 `/bin/init`（`make INITRAMFS=` 链进内核镜像）；不整包解压，lookup/getdent/read 直接寻址归档字节，每条目仅一张索引记录 |
 | `elf.c` | 100 | 静态 ELF64 装载器（ET_EXEC only） |
+| `mm/pagefault.c` | 95 | #PF 分发 + 懒惰用户栈增长（T-090/T-094）：`isr_common` 的"先试着修复"步骤，`sys_execve` 的 16 KiB 栈按需下扩；分发点留给后续 demand paging/COW 修复器 |
 | `drivers/pci.c` | 81 | PCI 配置空间枚举（2026-10-06 起带桥递归 visited + 深度上限） |
-| `ansi.c` | 31 | ANSI 转义序列三状态机 |
 | `percpu.c` | 39 | per-CPU 数据初始化、GS 基址读写 |
+| `selftest.c` | 64 | 断言基础设施（T-010）：`ASSERT()`/`WARN()`/`BUG_ON()` 喂的计数与 note 函数——放 `kernel/` 而非 `ktest/`，因为生产构建的 `BUG_ON`（如 `syscall.c`）也必须记录 |
 | `lib/string.c` | 90 | `memcpy` `memset` `strcmp` `strcpy` `strlen` |
-| `spinlock.c` | 21 | 自旋锁 2 个函数（irqsave 对；裸 `spin_lock/spin_unlock/spin_init` 零引用已删） |
-| `mm/SlabAllocator.cpp` | 19 | 全局 `operator new` → kmalloc（内核从不 `delete`，故无 delete 重载） |
-| `main.c` | 368 | **bring-up 顺序**（console/GDT/IDT 在最前，见 §22.6）、E820 表/汇总打印、内核镜像范围、VBE/cmdline 采集、`lapic_timer_calibrate`、`kernel_spawn("/bin/init")`、启动汇总（可用内存 + ready 耗时） |
-| `rust/uart.rs` | 106 | 16550 UART 驱动（Rust） |
-| `rust/lib.rs` | 57 | crate 根、`#[panic_handler]` |
-| `rust/smp.rs` | 133 | `TrampolineData` + 四个访问器 |
+| `main.c` | 412 | **bring-up 顺序**（console/GDT/IDT 在最前，见 §22.6）、E820 表/汇总打印、内核镜像范围、VBE/cmdline 采集、`pmm_reserve`（含 slot108 ACPI bounce）、`acpi_init`、`lapic_timer_calibrate`、`kernel_spawn("/bin/init")`、启动汇总（可用内存 + ready 耗时） |
+| `drivers/uart.c` | 74 | 16550 UART 驱动（2026-10-18 由 `rust/uart.rs` 移植，`lnxrm_uart_*` 四函数 ABI 不变；`rust/lib.rs`、`rust/smp.rs` 同日删除——`TrampolineData` 访问器并入 `smp.cpp`） |
 
-**上表 32 个文件 = 8,855 行**；另有 `kernel/protect.c`（38 行）与
-`ktest/`（17 个文件、3,297 行）—— 32 + 1 + 17 = **50 个文件、12,190 行**，
-与上面的小标题一致（`grep` 实测，逐行 `wc -l` 对齐）。
+**上表 32 个文件 = 11,199 行**（`find kernel -name '*.c' | xargs wc -l` ≈ 吻合；
+在库 WIP 实时增长，差 1–2 行登记不逐项对账）。另有 `kernel/protect.c`（38 行）与
+`ktest/`（19 个文件、4,741 行）—— 32 + 1 + 19 = **52 个文件、15,917 行**，
+与上面的小标题一致（2026-10-18 逐行 `wc -l` 实测；含 `print.c`/`sched.c` 历史合并的
+重复行去重与 `initramfs.c`/`pagefault.c`/`selftest.c` 三个新文件补登）。
 `ktest/` 是启动自测套件，用 `KTEST(suite, stage, fn)` 注册进 `.ktest` 段，
 分 early/mm/late 三阶段在 `start_kernel` 里跑，各章"守着它的测试"指的就是它们；
-`scripts/smoke_test.py`（762 行）再把用户态那半接上。
+`scripts/smoke_test.py`（862 行）再把用户态那半接上。
 
-#### `include/`（2,169 行，23 个文件）
+#### `include/`（2,543 行，25 个文件）
 
-`sys/sched.h` 167 · `sys/cpu.h` 127 · `sys/vfs.h` 144 · `sys/ktest.h` 99 ·
-`sys/cred.h` 72 · `mm/mm.h` 102 · `fat32_priv.h` 247 · `abi/lnxrm_abi.h` 224 ·
-`boot.h` 107 · `console.h` 111 · `framebuffer.h` 114 · `sys/smp.h` 71 ·
-`sys/apic.h` 62 · `types.h` 67 · `io.h` 40 · `elf.h` 43 · `sys/percpu.h` 42 ·
+`sys/sched.h` 194 · `sys/cpu.h` 128 · `sys/vfs.h` 152 · `sys/ktest.h` 99 ·
+`sys/cred.h` 72 · `mm/mm.h` 151 · `fat32_priv.h` 349 · `abi/lnxrm_abi.h` 224 ·
+`boot.h` 114 · `console.h` 126 · `framebuffer.h` 114 · `sys/smp.h` 81 ·
+`sys/acpi.h` 43 · `sys/apic.h` 59 · `types.h` 82 · `io.h` 40 · `elf.h` 43 · `sys/percpu.h` 49 ·
 `abi/lnxrm_syscalls.def` 54 · `disk.h` 157 · `sys/spinlock.h` 30 · `sys/protect.h` 36 ·
-`pci.h` 26 · `cpp/smp.hpp` 27
+`pci.h` 26 · `font8x16.h` 111 · `mm/pagefault.h` 22
 
-#### `init/`（239 行）· `usr/`（1,529 行，16 个程序）· `scripts/`（967 行，4 个脚本）
+#### `init/`（239 行）· `usr/`（1,573 行，16 个程序）· `scripts/`（1,148 行，4 个脚本）
 
 见 §12 和 §15。
 
@@ -1671,7 +1780,7 @@ struct blkdev {
 | **`FIXMAP_VA` 已整体删除** | 曾经头文件声称"用于远程编辑其他 AS 的 PTE"但全树零引用（最后的使用者 `signal.c` 临时别名已随信号 trampoline 删除）。2026-10-01 连同 `mm.h` 重复定义、fixmap 概念、`vmm.c` 对 slot 97/112 的跳过一起删掉 |
 | **`vmm_map_user` 的 `writable` 无效** | 因为 `CR0.WP`/`CR4.WP` 未置位，只读页实际可写（见 GAP_ANALYSIS 4.2） |
 | **运行队列不是环形** | 注释说 circular，实际 push-front 无尾指针 ⇒ LIFO；`schedule()` 重排 current 走 `runqueue_add_local()` 防跨核双跑（2026-10-01） |
-| **写路径是块缓存写回，不是 journal** | 原 `fat32_journal` 已删除；写经 `blk_cache_write`，无日志、崩溃不一致 |
+| ~~**写路径是块缓存写回，不是 journal**~~ | ~~原 `fat32_journal` 已删除；写经 `blk_cache_write`，无日志、崩溃不一致~~ **已消解（2026-10-14）**：文件按 C13 重建为真日志，名字现在成立。**残留的诚实边界**：只记元数据（redo/WAL，目录项+FAT+FSInfo），文件**数据字节不入日志**——ordered 模式靠 commit 先 flush 数据保证顺序；崩溃可能留下文件里是旧字节，但不会留下半截 FAT、悬空目录项或两个文件抢一个簇 |
 | **`vnode` 不是 inode** | 每次 open 一份拷贝，无 link count，两 fd 状态独立 |
 | **`console_write` 与 `kvprintf` 共用一把锁** | `console_out_lock`（irqsave，64 字节分块）——2026-10-01 起不再裸奔（C1 已修） |
 | **`PIT` 不驱动时钟** | BSP 与每个 AP 各有 LAPIC 周期 tick（period 来自 BSP 的 `lapic_timer_calibrate`），PIT 只提供标定窗口（必须模式 2，模式 3 会跑 200 Hz）；`jiffies` 只在 BSP 上递增 |
@@ -1705,7 +1814,7 @@ struct blkdev {
 | 维度 | 现状 | 出处 |
 |---|---|---|
 | 架构 | x86-64 单体内核，ring 0/ring 3，SMP 最多 8 CPU | `include/sys/apic.h:33` `MAX_CPUS 8` |
-| 语言 | ASM + C + C++ + Rust，**97 个源文件 / 17,706 行** | 实测（口径见 §35） |
+| 语言 | ASM + C，**101 个源文件 / 21,996 行** | 实测（2026-10-18，口径见 §35） |
 | 启动 | Linux x86 boot protocol **2.08** 的 bzImage；QEMU `-kernel` 或 GRUB 双路径 | `arch/setup.asm:25` |
 | 系统调用 | **32 个（编号 0–31 连续无空洞），全部已实现** | `include/abi/lnxrm_syscalls.def:23-54` |
 | 内存 | buddy 物理页 + 分箱内核堆 + 三槽 PML4 虚拟内存；NX/WP/SMEP/SMAP 全开 | `kernel/mm/pmm.c:10`、`kernel/mm/vmm.c` 文件头 |
@@ -1715,7 +1824,7 @@ struct blkdev {
 | 设备驱动 | PCI 枚举、IDE PIO、AHCI DMA、PS/2 键盘、COM1 串口、VBE 帧缓冲 | `kernel/drivers/`、`kernel/apic.c` |
 | 凭据 | 三级（user/root/kxld）+ 3 个能力位 + 64 MiB 内存配额 | `include/sys/cred.h:19-21,33-35,66` |
 | 信号 | 32 个信号槽（26 个已命名），sigaction/sigprocmask/sigreturn | `include/abi/lnxrm_abi.h:88`、`kernel/signal.c` |
-| 用户态 | 16 个程序 + shell，1,768 行 | 实测（见 §31） |
+| 用户态 | 16 个程序 + shell，1,812 行 | 实测（2026-10-18，见 §31） |
 | 自测 | 启动自测 **72 cases / 1546 checks**；端到端冒烟 **176/176** | 实测（见 §32） |
 
 ---
@@ -1724,18 +1833,20 @@ struct blkdev {
 
 #### 21.1 双启动路径
 
-* **QEMU `-kernel`**：`make run` 直接加载 `build/bzImage`（`Makefile:158-161`）。
-* **GRUB `linux`**：**`make imageiso` 生成 `build/lnxrm.iso`**（`Makefile:174`，暂存树
+* **QEMU `-kernel`**：`make run` 直接加载 `build/bzImage`（`Makefile:134-137`）。
+* **GRUB `linux`**：**`make imageiso` 生成 `build/lnxrm.iso`**（`Makefile:145`，暂存树
   `build/iso/`，`grub.cfg` 由 Makefile 生成），里面是 `linux /boot/bzImage`、`timeout=0`、
-  **`gfxpayload=1280x720x32`**。GRUB 路径下 `setup.asm` 不执行，所以必须由 GRUB 自己编程
+  **`gfxpayload=1920x1080x32,1280x720x32,keep`（2026-10-18 WIP 起；此前为 `1280x720x32`）**。GRUB 路径下 `setup.asm` 不执行，所以必须由 GRUB 自己编程
   VBE 模式并填 `boot_params.screen_info.lfb_*`。
   判据是 `arch/entry64.S:_start32` 把 `boot_params` 指针存进物理 `0x6F00`（DWORD），
   `kernel/main.c` 读到非 0 就走这条路径取 E820 / LFB / cmdline。
   内核没有 EFI handover stub（`handover_offset=0`），只支持 legacy BIOS/CSM。
   ⚠️ **`gfxpayload` 必须写 `x32` 而不是 `,32`**：逗号形式是 GRUB 的「后备模式列表」
   语法，`1280x720,32` 会被读成「1280x720，然后 32」，实测拿到的是 **24 bpp**
-  （pitch 3840）；`1280x720x32` 才真的编程 32 bpp 模式（pitch 5120）。这条写在
-  `Makefile:168-173` 的注释里。
+  （pitch 3840）；`1280x720x32` 才真的编程 32 bpp 模式（pitch 5120）。
+  （这条警告原写在 Makefile 注释里，注释已随脚本重构移除——以本文为准。
+  **2026-10-18 在库 WIP** 把 `gfxmode`/`gfxpayload` 改为 `1920x1080x32,1280x720x32,auto|keep`：
+  仍是逐项 `x32` 的合法后备列表，但主模式升为 1920，GRUB 路径**未重测**。）
 * ✅ **已实测（2026-10-06，原 C68「完全未经测试」解除）**，三种配置都过：
   * **`make imageiso` + `gfxpayload=1280x720x32`**（默认配置）
     → `[fb] lfb 1280x720 **32 bpp** phys=0xfd000000 pitch=5120 mode=0x0`、
@@ -1775,28 +1886,30 @@ struct blkdev {
 
 #### 21.3 内核 bring-up 顺序
 
-`kernel/main.c:210 start_kernel()` 的实际次序（行号即调用点）：
+`kernel/main.c:222 start_kernel()` 的实际次序（行号即调用点）：
 
 ```
-console_init → gdt_init → cpu_set_gs_base(&cpu_table[0]) → idt_init   main.c:221-224
+console_init → gdt_init → cpu_set_gs_base(&cpu_table[0]) → idt_init   main.c:233-236
   ← 头四步。IDT 之前任何异常 = 三重故障复位（见 §22.6）
-  → boot_collect_e820        main.c:226
-  → boot_read_vbe / boot_read_cmdline   main.c:252-253
-  → ktest_run(KTEST_EARLY)   main.c:265
-  → cpu_init_percpu(0,0)     main.c:268
-  → pmm_reserve ×5（LFB / FB_PD / slot96 / slot128 / slots256..271）  main.c:271-304
-  → pmm_init / vmm_init / kheap_init / cpu_init / pit_init   main.c:306-310
-  → ktest_run(KTEST_MM)      main.c:314
-  → fb_init                  main.c:317
-  → serial_irq_init / ps2_kbd_init      main.c:319-320
-  → vfs_init                 main.c:322
-  → ide_init / ahci_init     main.c:326-327
-  → do_global_ctors（C++ 全局构造） main.c:333
-  → sched_init               main.c:335
-  → ktest_run(KTEST_LATE) + ktest_summary   main.c:339-340
-  → kernel_spawn("/bin/init") main.c:342
-  → lapic_timer_calibrate / smp_init / lapic_timer_start(32, HZ)   main.c:351-356
-  → sti → idle_loop          main.c:366-367
+  → boot_collect_e820        main.c:238
+  → boot_read_vbe / boot_read_cmdline   main.c:264-265
+  → ktest_run(KTEST_EARLY)   main.c:278
+  → cpu_init_percpu(0,0)     main.c:282
+  → pmm_reserve ×5（LFB / FB_PD / slot96 / slot128 / slots256..271）  main.c:287-318
+  → pmm_init / vmm_init / kheap_init   main.c:320-322
+  → acpi_init（RSDP/MADT：AP 名单 + IOAPIC 定址；2026-10-18 加）  main.c:326
+  → cpu_init / pit_init      main.c:327-328
+  → ktest_run(KTEST_MM)      main.c:333
+  → fb_init                  main.c:337
+  → ps2_kbd_init / serial_irq_init      main.c:339-340
+  → vfs_init                 main.c:342
+  → ide_init / ahci_init     main.c:345-347
+  → do_global_ctors（现为空转：零 C++ 全局构造函数） main.c:364
+  → sched_init               main.c:366
+  → ktest_run(KTEST_LATE) + ktest_summary   main.c:371-372
+  → kernel_spawn("/bin/init") main.c:375
+  → lapic_timer_calibrate / smp_init / lapic_timer_start(32, HZ)   main.c:384-389
+  → sti → idle_loop          main.c:399-400
 ```
 
 实测启动日志（2026-10-06，`build/smoke/serial.log`）关键行：
@@ -1816,7 +1929,7 @@ console_init → gdt_init → cpu_set_gs_base(&cpu_table[0]) → idt_init   main
 
 * 三阶段自测打印 `[ktest] stage {early,mm,late}: N cases, M checks, 0 failed`。
 * 保护特性逐项回读：`[vmm] EFER.NXE=1`、`[cpu] CR0.WP=1 CR4.SMEP=1 CR4.SMAP=1`
-  ——这些是 smoke 的有序 marker，不匹配就判失败（`scripts/smoke_test.py:52` BOOT_MARKERS，共 **20 条**）。
+  ——这些是 smoke 的有序 marker，不匹配就判失败（`scripts/smoke_test.py:71` `BOOT_MARKERS`，共 **21 条**，另有 `boot_markers(N)` 按 CPU 数替换其中 2 条）。
 * 磁盘容量行必须是 `64 MiB` 而非 `2097151 MB`（T-080/T-081 修复，见 §28.4）。
 
 ---
@@ -1843,9 +1956,9 @@ console_init → gdt_init → cpu_set_gs_base(&cpu_table[0]) → idt_init   main
   （`include/mm/mm.h:29,70`）。
 * 块头 8 字节，含 bin/order 与魔数 `HEAP_MAGIC 0xECEC0001`，可检测越界写
   （`include/mm/mm.h:60`）。
-* **分配失败返回 NULL 而不是 panic**（T-004，`include/mm/mm.h:67` 注释）；
-  内核里唯一的 panic 路径是 C++ 的 `operator new` → `kmalloc_or_panic`
-  （`kernel/mm/SlabAllocator.cpp` 文件头，只在 AHCI 探测这类 bring-up 路径上）。
+* **分配失败返回 NULL 而不是 panic**（T-004，`include/mm/mm.h` 注释）；
+  保留的 panic 分配入口是 `kmalloc_or_panic`（`kernel/mm/kheap.c`）——2026-10-18 起
+  `operator new` 已删除，它**当前零调用者**，按 C12/T-004 口径留给 bring-up 路径。
 
 #### 22.3 虚拟内存（三槽 PML4）
 
@@ -1979,13 +2092,16 @@ QEMU 的既有测试全是 `-m 256`，管理窗口上限 4 GiB 但实际 RAM 只
 
 #### 23.5 SMP
 
-* 最多 **8 CPU**（`MAX_CPUS 8`，`include/sys/apic.h:33`、`include/sys/percpu.h:11`）。
-* LAPIC/IOAPIC 均为 MMIO，映射进 `DEV_VMA` 窗口（`kernel/apic.c:1-10`）。
+* 最多 **8 CPU**（`MAX_CPUS 8`，唯一定义处 `include/types.h:77`；`apic.h`/`percpu.h` 的重复定义已收敛）。
+* LAPIC/IOAPIC 默认 MMIO，映射进 `DEV_VMA` 窗口（`kernel/apic.c:1-10`）；**x2APIC 模式下改走 MSR**
+  `0x800+(reg>>4)`，由每核 `apic_enable()` 各自定型（2026-10-18 加，见 §7.4）。
 * IPI 向量 **0xF0–0xF2**：`IPI_VECTOR_RESCHEDULE 0xF0`、`IPI_VECTOR_STOP 0xF2`
-  （`include/sys/smp.h:6-8`）；处理函数按向量注册（`include/sys/cpu.h:108-111`）。
+  （`include/sys/smp.h:6-8`）；处理函数按向量注册（`include/sys/cpu.h:110-111`）。
 * 每 CPU 独立 GDT/IDT/TSS（`gdt_init_cpu`，`include/sys/cpu.h:17`）。
-* AP 启动走 `arch/trampoline.S`，`kernel/smp.cpp` 负责 INIT-SIPI 与 bring-up。
-* 实测：`[smp] BSP online, APIC ID=0` / `AP1 online (APIC ID=1)` / `2 CPUs online`。
+* AP 启动走 `arch/trampoline.S`，`kernel/smp.c` 负责 INIT-SIPI 与 bring-up；
+  **AP 名单取自 ACPI MADT**（`kernel/acpi.c`，无 ACPI 时回退顺序探测）。
+* 实测：`[acpi] ... MADT ...: 2 local APICs` / `[smp] BSP online, APIC ID=0` /
+  `AP1 online (APIC ID=1)` / `2 CPUs online`（xAPIC 与 x2APIC 两条路径各跑过一遍 smoke 179/179）。
 * 自旋锁：`spinl` + irqsave 变体，自测 `test_spinlock_irqsave`（`ktest/t_cpu.c`）。
 
 ---
@@ -2236,15 +2352,15 @@ QEMU 的既有测试全是 `-m 256`，管理窗口上限 4 GiB 但实际 RAM 只
 |---|---|---|
 | **PCI** | 配置空间枚举，port IO `0xCF8/0xCFC`，bus 0..255，`pci_read/pci_write` | `kernel/drivers/pci.c:1-20` |
 | **IDE** | PIO，主通道 `0x1F0`；IDENTIFY 取容量，48 位标记正确处理 | `kernel/drivers/ide.c` |
-| **AHCI** | C++ 实现；通用/端口寄存器、FIS、**单 PRDT DMA**、FBS；CLB/CT 设置与命令下发由自旋锁串行，防止两 CPU 交错 | `kernel/drivers/ahci.cpp:12-40,210-212` |
+| **AHCI** | **C 实现**（2026-10-18 由 `ahci.cpp` 纯 C 化，寄存器编程与探测序列不变）；通用/端口寄存器、FIS、**单 PRDT DMA**、FBS；CLB/CT 设置与命令下发由自旋锁串行，防止两 CPU 交错 | `kernel/drivers/ahci.c` |
 | **PS/2 键盘** | 控制器初始化 + IOAPIC IRQ1 → vector 33 | `kernel/main.c:154-169` |
-| **串口 COM1** | IRQ4 → vector 36；还有轮询兜底 `lnxrm_uart_trygetc` | `kernel/fs/vfs.c:552`、`kernel/rust/uart.rs` |
-| **LAPIC/IOAPIC** | MMIO 映射进 `DEV_VMA`，`apic_send_ipi/sipi`、`ioapic_set_irq` | `kernel/apic.c:1-10`、`include/sys/apic.h:43-53` |
+| **串口 COM1** | IRQ4 → vector 36；还有轮询兜底 `lnxrm_uart_trygetc` | `kernel/fs/vfs.c`、`kernel/drivers/uart.c`（原 `rust/uart.rs`，2026-10-18 移植） |
+| **LAPIC/IOAPIC** | xAPIC MMIO 映射进 `DEV_VMA`，x2APIC 走 MSR；`apic_send_ipi/sipi`、`ioapic_set_irq` | `kernel/apic.c:1-10`、`include/sys/apic.h:43-53` |
 
-* **Rust 组件 3 个文件 / 296 行**：`kernel/rust/lib.rs`、`uart.rs`（串口驱动）、
-  `smp.rs`（SMP 原语）——实测行数见 §35。
-* **C++ 组件 3 个文件 / 679 行**：`smp.cpp`、`ahci.cpp`、`SlabAllocator.cpp`
-  （后者提供 freestanding `operator new`）。
+* **Rust 组件 3 个文件 / 296 行——已于 2026-10-18 整体移除**：`uart.rs` → `drivers/uart.c`
+  （`lnxrm_uart_*` ABI 不变）、`smp.rs` 并入 `smp.cpp`、`lib.rs` 随 `panic_handler` 删除，
+  构建不再需要 rustc（旧行数字见 §35 的 10-06 记录）。
+* **C++ 组件 0 个——2026-10-18 晚清零**：`smp.cpp`（309 行）与 `include/cpp/smp.hpp` 随 SMP 纯 C 重写（`kernel/smp.c`）删除，Makefile 的 g++/`CXXFLAGS`/`.opp` 规则同批拆除（`ahci.cpp` 已于同日纯 C 化为 `drivers/ahci.c`；全局 `operator new` 已删除，原 `SlabAllocator.cpp` 更早已并入 `kheap.c`）。
 * 控制台**双路输出**：`console_putc` 同时写 VGA 文本与 COM1（`include/console.h:11`）。
   `kprintf`/`console_write` 共用一把 irqsave 的 `print_lock`（`console.h:13-16`）。
 
@@ -2260,7 +2376,7 @@ QEMU 的既有测试全是 `-m 256`，管理窗口上限 4 GiB 但实际 RAM 只
 
 #### 30.2 ANSI 转义
 
-* **分词器共享**：`kernel/ansi.c`（31 行）的 `ansi_feed()` 只管把字节流切成
+* **分词器共享**：`ansi_feed()`（现位于 `kernel/print.c`）只管把字节流切成
   `ESC [` … 字母 的序列，`ansi_color_index()` 把 30–37 映射到 0–7。
 * **两个后端各自消费**：
   * VGA 文本：`ESC[2J` 清屏、`ESC[H` / `ESC[r;cH` 定位、`ESC[...m` SGR，
@@ -2371,11 +2487,22 @@ rn(29)   sh(111)    systest(859)         touch(19)
 * 日志里 9 条 `[fat32] I/O error` 是 `t_ioerr.c` **故意注入**的（基线就是 9，
   `GAP_ANALYSIS.md:1276`），不是回归。
 
-#### 32.3 单 CPU 冒烟（`scripts/smoke_smp1.py`）
+#### 32.3 单 CPU 冒烟（`smoke_test.py --smp 1`）
 
-* `BOOT_MARKERS` 是 `-smp 2` 专用（要求 AP marker 与 "2 cpus online"），所以
-  `-smp 1` 单独一个脚本：启动 → 跑 `systest` → 断言**同一套 81 条标签**
-  （文件头 docstring，49 行）。
+* 曾经单独一个 `scripts/smoke_smp1.py`：`BOOT_MARKERS` 是 `-smp 2` 专用
+ （要求 AP marker 与 "2 cpus online"），所以 `--qemu-args "-smp 1"` 永远过不了
+  phase 4，只能再开一个脚本只跑 boot + systest。
+* **2026-10-14 并入 `smoke_test.py`，旧脚本删除。** `--smp N` 是单一来源：
+ `Guest` 按它起机，`boot_markers(N)` 只替换两条 SMP 相关标记
+ （`2 cpus online` → `N CPUs online`；N=1 时去掉 AP marker），顺序不变。
+* N=1 时额外加一条**负向断言** `no AP on a -smp 1 guest`（`PHANTOM_AP`
+ 正则必须不命中）—— 光删标记会让"内核凭空带了个 QEMU 根本没给的 AP"溜过去，
+ 有序 marker 只能要求"必须打印"，要求"必须不打印"得单独查。
+* 跑法与结果：`make smoke SMOKE_FLAGS="--smp 1"` → **178/178**（旧脚本只有
+  boot + systest 两段，现在**全部 6 个 phase 都跑**，含 forged FAT）。
+ transcript 分开写 `serial-smp1.log`，不覆盖 `-smp 2` 的 `serial.log`。
+* **必须经 `make smoke`**：直跑 `python3 scripts/smoke_test.py --smp 1` 会绕过
+  target 里的 `KTEST=1`，把内核重建成无自测版本，全部 `[ktest]` 标记消失。
 
 #### 32.4 用户态自检（`usr/systest.c`）
 
@@ -2394,20 +2521,21 @@ rn(29)   sh(111)    systest(859)         touch(19)
 
 | 目标 | 作用 | 出处 |
 |---|---|---|
-| `all` | 构建 `build/bzImage` | `Makefile:68` |
-| `usr` | 用户态 ELF | `Makefile:71` |
-| `rust` | `build/liblnxrm.a` | `Makefile:81` |
-| `clean` | 删 `build/` 与 `usr/*.o,*.d` | `Makefile:153` |
-| `run` | QEMU 启动 | `Makefile:158` |
-| `smoke` | 跑 `scripts/smoke_test.py` | `Makefile:163` |
-| `imageiso` | GRUB 引导的可启动 ISO → `build/lnxrm.iso`（暂存树在 `build/iso/`） | `Makefile:174` |
+| `all` | 构建 `build/bzImage` | `Makefile:46` |
+| `usr` | 用户态 ELF | `Makefile:68` |
+| `clean` | 删 `build/` 与 `usr/*.o,*.d` | `Makefile:113` |
+| `run` | QEMU 启动 | `Makefile:134` |
+| `smoke` | 跑 `scripts/smoke_test.py` | `Makefile:140` |
+| `imageiso` | GRUB 引导的可启动 ISO → `build/lnxrm.iso`（暂存树在 `build/iso/`） | `Makefile:145` |
+
+**2026-10-18（晚）**：单文件 `Makefile`（原 241 行）拆分为根 `Makefile`（194 行）+ `arch/Makefile`、`kernel/Makefile`、`usr/Makefile` 三个 include 片段（根 `Makefile:48-50` 串联，共享变量空间、单遍 `-j`）；产物 SHA256 与拆分前逐字节一致（见 `BUILD.md` §3 登记与 §14.3），smoke 179/179。
 
 **注意**：`make` **不生成磁盘镜像**；`make clean` 后需重跑
-`make usr build/disk.img`（`docs/README.md` 快速开始）。
+`make usr build/disk.img`（`README.md` 快速开始）。
 
 **`imageiso` 不依赖 `disk.img`**——ISO 里只有 bootloader + 内核，根文件系统仍是
 单独的 IDE 盘。所以光盘启动要带上 `-drive file=build/disk.img,...`（见
-`docs/BUILD.md` §8.2）。`grub.cfg` 是**生成**的（`Makefile:176`），因此
+`docs/BUILD.md` §8.2）。`grub.cfg` 是**生成**的（`Makefile:147`），因此
 `make clean && make imageiso` 也能一次跑通；所需的 `gfxpayload` 写法与实测
 结果见 §21.1。
 
@@ -2419,15 +2547,15 @@ qemu-system-x86_64 -m 256 -smp 2 -cpu qemu64,+smep,+smap \
   -drive file=build/disk.img,format=raw,if=ide,index=0,media=disk \
   -serial stdio -no-reboot -d int -D build/qemu.log
 ```
-（`Makefile:158-161`）
+（`Makefile:134-137`）
 
 #### 33.3 磁盘镜像
 
 * `dd` 64 MiB → `mkfs.vfat -F 32` → `mcopy README.md` → `mmd ::bin` → 逐个 `mcopy` 用户程序
-  （`Makefile:204-212`）。
+  （`Makefile:176` 起）。
 * 镜像里根目录有 `README.md` 与 `bin/`（实测日志 `README.md bin/`）。
 
-#### 33.4 产物（2026-10-06 实测）
+#### 33.4 产物（下表 2026-10-06 实测；**2026-10-18 重测见表下**）
 
 | 产物 | 大小 | 说明 |
 |---|---|---|
@@ -2435,13 +2563,36 @@ qemu-system-x86_64 -m 256 -smp 2 -cpu qemu64,+smep,+smap \
 | `build/vmlinux.bin` | **160,152 B** | 纯 payload（按 LMA 导出） |
 | `build/vmlinux.elf` | 755,920 B | 带调试信息（`.image` 160,000、`.bss` 405,520） |
 | `build/disk.img` | 67,108,864 B | 64 MiB FAT32 |
-| `build/liblnxrm.a` | 10,499,526 B | Rust 静态库 |
+
+**2026-10-18 非 KTEST 干净构建**（`make clean && make`，0 警告；Rust staticlib 删除后
+`.image`/`bzImage` 大幅缩水，与在库 WIP 变更交织，登记不对账）：
+
+| 产物 | 大小 | 说明 |
+|---|---|---|
+| `build/bzImage` | **102,840 B** | = setup.bin 2,048 + vmlinux.bin 100,792 |
+| `build/vmlinux.bin` | **100,792 B** | 纯 payload（按 LMA 导出） |
+| `build/vmlinux.elf` | 589,848 B | 带调试信息（`.image` 100,640、`.bss` 409,600） |
+
+（KTEST=1 构建另计：当日 smoke 用构建 `bzImage` 200,632 B——自测代码进 `.image`。）
+
+**2026-10-18（最终）非 KTEST 干净构建**（`make clean && make -j8`，**0 警告**；`smp.c`
+355→375 卡死修复与在库 WIP 落地后重测，**为四份文档的最终口径**）：
+
+| 产物 | 大小 | 说明 |
+|---|---|---|
+| `build/bzImage` | **105,304 B** | = setup.bin 2,048 + vmlinux.bin 103,256 |
+| `build/vmlinux.bin` | **103,256 B** | 纯 payload（按 LMA 导出 = `.image` 103,104 + `.trampoline` 152） |
+| `build/vmlinux.elf` | 603,840 B | 带调试信息（`.bss` 411,424 ≈402 KB；入口 `_start64` @ `0xffffffff8010010e` 不变） |
+| `build/disk.img` | 67,108,864 B | 64 MiB FAT32 |
+
+（当日更早两组口径——10-06 的 162,200 与 10-18 的 102,840——均保留作历史；GNU_STACK 段数
+由 4 变 3、`.got`/`.got.plt` 不再单列，见 BUILD §14.1 的现行段布局。）
 
 ---
 
 ### 34. 明确未实现的能力
 
-以下功能**当前没有**（依据 `docs/README.md` "未实现" 段 + 代码核对）：
+以下功能**当前没有**（依据 `README.md` 开篇能力口径 + `GAP_ANALYSIS.md` 第一部分 + 代码核对）：
 
 | 类别 | 未实现项 |
 |---|---|
@@ -2463,8 +2614,8 @@ qemu-system-x86_64 -m 256 -smp 2 -cpu qemu64,+smep,+smap \
 * **偶发 `#GP (13)` panic**：`rip=ffffffff8011e3c7` 落在 `isr32` 末尾 `iretq`，
   `err=0x440` 表示 IRET 弹出的 CS 无效选择子——是被打断现场帧被写坏，
   不是 `iretq` 本身有 bug（分析已交付，改造方案未获批）。
-* 差距与计划：GAP_ANALYSIS 第一部分 **66 条**有效编号缺陷、第三部分 **55 个**任务卡
-  （数字取自 `docs/README.md:31,33`）。
+* 差距与计划：GAP_ANALYSIS 第一部分 **66 条**当前有效编号缺陷（C1–C72 为稳定 ID、失效留号）、
+  第三部分 **55 个**任务卡（数字取自 `README.md:30,32` 与 GAP 第一部分的编号引言）。
 
 ---
 
@@ -2497,10 +2648,58 @@ qemu-system-x86_64 -m 256 -smp 2 -cpu qemu64,+smep,+smap \
 * **本轮已对齐**：本文 `:4,27,28,31,36,38,40,47`、§2 目录地图、§9.4、§14、§18
   与 §33.4 的行数/产物大小已逐个按 `wc -l`、`stat` 重算（连带修掉 `fat32_priv.h`
   213→247、`fat32_dir.c` 251→258、`fat32_meta.c` 738→745 这类上一轮的遗留漂移）。
-* **仍待同步**：`docs/README.md:7`、`docs/BUILD.md:17,1184,1186`、
-  `GAP_ANALYSIS.md` §12.1 的规模数字仍是 2026-10-05 的旧数。
-  口径统一需要单独一次同步（口径与行数统计方法的既往争议见
-  `GAP_ANALYSIS.md` 评审部分）。
+* ~~**仍待同步**：`README.md:7`、`docs/BUILD.md:17,1184,1186`、
+  `GAP_ANALYSIS.md` §12.1 的规模数字仍是 2026-10-05 的旧数。~~
+  **2026-10-18 已一并同步**：根 `README.md`、`docs/BUILD.md`、`GAP_ANALYSIS.md`
+  （masthead/§2.5/§12.1/§17/§12.4）都已加当日更正框或追加表；口径与行数统计方法的
+  既往争议仍见 `GAP_ANALYSIS.md` 评审部分。
+
+**2026-10-18 追加**（Rust 组件整体移除 + `kheap.cpp`/`ahci.cpp` 纯 C 重写 + 在库 WIP 落地后重测；
+方法同上，扩展名列表中的 `.rs` 归零）：
+
+| 项 | 实测（2026-10-18） | 记载（2026-10-06） | 差 |
+|---|---|---|---|
+| 源文件数 | **100** | 97 | +3（`.rs` −3、移植 +1、在库 WIP 增删交织，登记不逐项对账） |
+| 内核 `kernel/ arch/ include/`（含 `ktest/`） | **19,772**（kernel 10,785 + ktest 4,740 + arch 1,713 + include 2,534） | 16,029 | **+3,743** |
+| 用户态 `init/ usr/` | **1,812**（239 + 1,573） | 1,768 | +44 |
+| 合计 | **21,584** | 17,797 | **+3,787** |
+| `scripts/`（4 个 `.py`） | 1,148 | 967 | +181 |
+
+* 逐语言：`.c` 68 文件 17,281 行、`.h` 24/2,583、`.hpp` 1/27、`.cpp` 1/309、`.S` 3/678、
+  `.asm` 1/572、`.ld` 1/80、`.def` 1/54、**`.rs` 0/0（组件已删）**。
+* 子系统：`kernel/mm` 1,070、`kernel/fs`（含 fat32）3,672（`fat32/` 2,058）、
+  `kernel/drivers` 1,359、`kernel/lib` 90、`ktest` 4,740（19 文件；10-06 记载 3,297）、
+  `include/abi` 278（未变）、`include/sys` 894、`scripts` 1,148；`kernel/rust` **已不存在**（296 行 → 0）。
+* **+3,743 的构成**：ktest +1,443、`ahci.c` 942→971、`kheap.c` 147→211、
+  `smp.cpp` 262→309（并入 trampoline 数据块）、`uart.c` +74（由 `rust/uart.rs` 移植）、
+  Rust −297，其余为在库 WIP 的多文件增长（含 FAT32 journal 重建、initramfs/pagefault
+  新文件、framebuffer/vfs 等）——同 §17 口径，**交织登记，不逐项对账**。
+* 产物大小随 KTEST 档位变化，见 §33.4 的 2026-10-18 行（以非 KTEST 干净构建为准）。
+
+**2026-10-18 追加（二）**（SMP 完整修：`smp.cpp`/`cpp/smp.hpp` 删除、`smp.c`+`acpi.c`+
+`sys/acpi.h` 落地、Makefile C++ 工具链拆除，及 q35+KVM 启动卡死修复后重测；方法同上，
+`.cpp`/`.hpp` 两行自此归零）：
+
+| 项 | 实测（2026-10-18 晚二） | 记载（10-18 早） | 差 |
+|---|---|---|---|
+| 源文件数 | **101** | 100 | +1（`smp.cpp`→`smp.c` 换名净 0、`acpi.c`+`sys/acpi.h` +2、`cpp/smp.hpp` −1） |
+| 内核 `kernel/ arch/ include/`（含 `ktest/`） | **20,184**（kernel 11,177 + ktest 4,741 + arch 1,723 + include 2,543） | 19,772 | **+412** |
+| 用户态 `init/ usr/` | **1,812**（239 + 1,573） | 1,812 | 0 |
+| 合计 | **21,996** | 21,584 | **+412** |
+| `scripts/`（4 个 `.py`） | 1,148 | 1,148 | 0 |
+
+* 逐语言：`.c` 70 文件 17,993 行、`.h` 25/2,619、`.S` 3/678、`.asm` 1/572、`.ld` 1/80、
+  `.def` 1/54、**`.cpp` 0/0、`.hpp` 0/0、`.rs` 0/0**。
+* 子系统：`kernel/mm` 1,070、`kernel/fs`（含 fat32）3,672（`fat32/` 2,058）、
+  `kernel/drivers` 1,359、`kernel/lib` 90、`ktest` 4,741、`include/abi` 278、
+  `include/sys` 930（含新增 `sys/acpi.h` 30）、`scripts` 1,148。
+* 分阶段登记：当晚更早口径为内核 20,164 / 合计 21,976（SMP 重写落地、卡死修复之前）；
+  q35+KVM 卡死修复使 `smp.c` 355→375（+20）后定格 **20,184 / 21,996**。
+  +412 的构成（kernel +392、ktest +1、arch +10、include +9）为 C 化改写、在库 WIP 与
+  本次修复交织——同上口径，**登记不逐项对账**；事故与修复详见
+  `GAP_ANALYSIS.md` §17 追加（三）。
+* 产物大小已随 §1.2/§33.4 的 **2026-10-18（最终）** 行登记：`bzImage` **105,304** /
+  `vmlinux.bin` 103,256 / `vmlinux.elf` 603,840（干净构建 0 警告）。
 
 ---
 

@@ -52,6 +52,12 @@ enum task_state {
 
 struct task {
     u32 pid;
+    /* T-050: bumped on every slot claim, so (pid, generation) names exactly
+     * one *incarnation* of a task.  pid alone stops being unique the moment
+     * pid_counter wraps past 2^32 forks; a stale reference would then resolve
+     * to a stranger and kill()/getppid() would hit the wrong process.  The
+     * generation makes such a lookup miss instead of impersonating. */
+    u32 generation;
     u32 cpu_id; /* CPU running this task (-1 if none) */
     enum task_state state;
     char name[TASK_NAME_LEN];
@@ -65,6 +71,13 @@ struct task {
     u64 pml4;       /* CR3 physical */
     void *brk_base; /* user heap start (= end of segments) */
     void *brk_cur;
+
+    /* T-094: lowest page currently mapped for the user stack.  The stack
+     * is mapped 16 KiB at exec/spawn and grows DOWN on demand: a not-present
+     * #PF below this line (and above the growth floor, USER_STACK_TOP minus
+     * USTACK_MAX_GROW) maps another page here.  0 = no user stack tracked
+     * (idle/kernel-only task), which makes every growth attempt decline. */
+    u64 ustack_lo;
 
     /* T-032: what this task's user space costs, in 4 KiB pages.
      * mem_pages is refreshed from the page tables themselves (at exec,
@@ -84,9 +97,16 @@ struct task {
     u64 sleep_until;
     int quantum;
 
-    struct task *parent;
+    /* T-050/T-051: the parent link is (pid, generation), never a raw pointer.
+     * A pointer into task_table dangles the instant the slot is recycled, and
+     * a free-time sweep cannot repair a reference it was never told about --
+     * so there is no pointer left to dangle.  Resolve with task_parent(),
+     * which returns NULL once the slot no longer names that incarnation. */
+    u32 parent_pid;
+    u32 parent_gen;
     struct task *rq_next; /* runqueue link */
     int rq_cpu;           /* CPU whose runqueue holds this task; -1 = not queued */
+    struct task *con_next; /* T-054: console-waiter list link (isr.c) */
 
     /* signal support */
     u64 signal_pending; /* bitmask of pending signals */
@@ -123,6 +143,13 @@ long sys_sigreturn(void);
 long sys_uname(struct lnxrm_utsname *u);
 u32 next_pid(void);
 struct task *find_task(u32 pid);
+/* find_task(), but pid AND generation must both match.  This is the lookup a
+ * *stale* reference performs: a recycled slot keeps its pid out of trouble only
+ * by luck, while a mismatched generation makes the lookup miss outright. */
+struct task *find_task_gen(u32 pid, u32 gen);
+/* Resolve t's parent link, or NULL when it no longer names a live incarnation
+ * (parent died and was reaped, or its slot has been recycled for someone else). */
+struct task *task_parent(struct task *t);
 
 int copy_from_user(void *kdst, const void *usrc, size_t n);
 int copy_to_user(void *udst, const void *ksrc, size_t n);
