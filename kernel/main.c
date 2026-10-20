@@ -294,6 +294,23 @@ void start_kernel(void)
         if (fb_slots > FB_PD_SLOTS) fb_slots = FB_PD_SLOTS;
         if (fb_slots)
             pmm_reserve((u64)FB_PD_BASE << 21, ((u64)FB_PD_BASE + fb_slots) << 21);
+        /* Same story, one window lower: the double-buffer back surface
+         * (framebuffer.h's FB_DB_*) is ordinary RAM reached through PD
+         * slots [97, 104), so the frames those slots would otherwise alias
+         * -- 194 MiB and up -- lose their high-half alias exactly like the
+         * LFB's do and must stay out of the buddy.
+         *
+         * Unlike the reserve above this one is the *whole* window, not the
+         * mode's share of it.  fb_back_init() maps page-at-a-time up to
+         * FB_DB_MAX_BYTES, and vmm_map_kernel_page() is willing to split
+         * whichever 2 MiB slot it lands on -- so any slot it might reach
+         * has to be filtered and reserved, or the split would replace the
+         * alias of frames the buddy is still handing out.  How much of the
+         * window the mode actually uses is decided later, by DISPI's pitch,
+         * which is not known yet here; reserving all of it costs memory but
+         * cannot disagree with what fb_init() ends up mapping. */
+        pmm_reserve((u64)FB_DB_PD_BASE << 21,
+                    ((u64)FB_DB_PD_BASE + FB_DB_SLOTS) << 21);
     }
 
     /* Slot 96 is the VGA text window (entry64.S: PD_HI[96] -> PT 0x64000
@@ -385,6 +402,9 @@ void start_kernel(void)
 
     if (kernel_spawn("/bin/init") < 0) {
         kprintf("\033[34mStop!\033[0m\n");
+        /* No LAPIC timer yet -- lapic_timer_start() is below -- so no tick
+         * will ever present this.  Same reason panic() flips. */
+        fb_flip();
         for (;;) __asm__ volatile("hlt");
     }
 

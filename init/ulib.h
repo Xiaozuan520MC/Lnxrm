@@ -116,6 +116,9 @@ static inline long kfb_char(struct lnxrm_fb_char *c)
 { return syscall1(SYS_fb_char, (long)c); }
 static inline long kfb_puts(struct lnxrm_fb_str *s)
 { return syscall1(SYS_fb_puts, (long)s); }
+/* publish the back surface: draw a frame with the calls above, then flip
+ * once so it lands as one frame (no-op cost-wise when nothing drew) */
+static inline long kfb_flip(void) { return syscall1(SYS_fb_flip, 0); }
 
 /* ---- mini libc ---- */
 size_t xstrlen(const char *);

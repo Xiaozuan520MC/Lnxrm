@@ -640,7 +640,9 @@ int main(int argc, char **argv)
 
     /* ---- numbers past LNXRM_SYSCALL_LAST and unknown ones -> -38 ---- */
     {
-        static const long past_table[] = {32, 33, 34};
+        static const long past_table[] = {
+            LNXRM_SYSCALL_LAST + 1, LNXRM_SYSCALL_LAST + 2, LNXRM_SYSCALL_LAST + 3,
+        };
         for (int i = 0; i < (int)(sizeof(past_table) / sizeof(past_table[0])); i++) {
             xputs("past.");
             xprinti(past_table[i]);

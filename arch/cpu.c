@@ -2,6 +2,7 @@
 #include <sys/cpu.h>
 #include <sys/apic.h>
 #include <console.h>
+#include <framebuffer.h>
 #include <mm/mm.h>
 #include <sys/sched.h>
 #include <io.h>
@@ -162,7 +163,14 @@ volatile u64 jiffies;
  * idempotent (runqueue_add rejects an already-queued task). */
 static void pit_handler(struct intr_frame *f)
 {
-    if (this_cpu_data()->bsp) jiffies++;
+    if (this_cpu_data()->bsp) {
+        jiffies++;
+        /* Double buffering: present whatever was drawn since the last
+         * tick.  BSP-only because it coalesces on jiffies, which only the
+         * BSP advances -- one present per couple of ticks, not one per
+         * CPU.  It is a couple of instructions when nothing drew. */
+        fb_tick_flush();
+    }
     sched_tick();
     sched_maybe_preempt(f);
 }

@@ -15,10 +15,10 @@
  * History: the table used to leave three holes for retired calls
  * (21 getcpu, 31 getkey, 33 move).  The 0..30 renumbering compacted them
  * away, so those old numbers now name the calls listed below -- only
- * pre-rebuild binaries from that era would notice.  32 and up are free;
- * setuid took 31 in the T-031 round (the first number appended since the
- * renumbering -- appended, never renumbered, exactly as the rule above
- * says).
+ * pre-rebuild binaries from that era would notice.  setuid took 31 in the
+ * T-031 round (the first number appended since the renumbering --
+ * appended, never renumbered, exactly as the rule above says), fb_flip
+ * took 32 for double buffering; 33 and up are free.
  */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
@@ -52,3 +52,4 @@ LNXRM_SYS(unlink, 28)
 LNXRM_SYS(rmdir, 29)
 LNXRM_SYS(rename, 30)
 LNXRM_SYS(setuid, 31)
+LNXRM_SYS(fb_flip, 32)

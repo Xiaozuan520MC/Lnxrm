@@ -176,8 +176,10 @@ def boot_markers(smp):
 SYSTEST_TAGS = [
     ("uname.ret", br"uname\.ret=0"),
     ("unknown.99 = -ENOSYS", br"unknown\.99=-38"),
-    ("past.32 = -ENOSYS", br"past\.32=[\s\S]{0,80}?-38"),
-    ("past.33 = -ENOSYS", br"past\.33=[\s\S]{0,80}?-38"),
+    # 钉住内核回显的 "unknown syscall N" 再等 -38：过去只等一个 -38，
+    # 当 32 成为合法编号（fb_flip）时会跨行误匹配到下一条的 -38 而假通过。
+    ("past.33 = -ENOSYS", br"past\.33=[\s\S]{0,60}?unknown syscall 33[\s\S]{0,60}?-38"),
+    ("past.34 = -ENOSYS", br"past\.34=[\s\S]{0,60}?unknown syscall 34[\s\S]{0,60}?-38"),
     ("open.fd >= 0", br"open\.fd=\d+"),
     ("read.after.seek = 15", br"read\.after\.seek=15"),
     ("read.at.end = tail only", br"read\.at\.end=[1-9]\d*"),

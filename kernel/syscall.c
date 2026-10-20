@@ -215,12 +215,13 @@ long sys_uname(struct lnxrm_utsname *u)
     return 0;
 }
 
-/* ---- framebuffer syscalls (23-27) ----
+/* ---- framebuffer syscalls (23-27, plus fb_flip 32) ----
  * Colour fields are true-colour 0x00RRGGBB (see lnxrm_abi.h), never
  * palette indices.  Every primitive clips to the visible area, so a bad
- * rectangle from user space can at worst draw nothing.
+ * rectangle from user space can at worst draw nothing.  The drawing calls
+ * land in the offscreen back surface; fb_flip (32) publishes it.
  *
- * T-031: the four drawing calls need CAP_FB -- without it any process
+ * T-031: the five surface calls need CAP_FB -- without it any process
  * could repaint the console the shell is writing to.  fb_info stays
  * open: it reads geometry (width/height/pitch) and draws nothing, and a
  * program that cannot even learn the screen size has no way to decide
@@ -268,6 +269,18 @@ static long sys_fb_puts(struct lnxrm_fb_str *ustr)
     char kbuf[256];
     if (copy_user_str(kbuf, (u64)s.str, sizeof(kbuf)) < 0) return LNXRM_EFAULT;
     fb_puts(s.x, s.y, kbuf, s.fg, s.bg);
+    return 0;
+}
+
+/* fb_flip: publish everything drawn since the last flip, as one frame.
+ * The drawing calls above put pixels into the offscreen back surface; this
+ * is the call that puts them on the screen, so it carries the same two
+ * gates as they do -- it touches the surface just as directly, it only
+ * does it in the other direction.  A program draws a whole frame through
+ * 24-27 and then flips once, instead of watching each call land. */
+static long sys_fb_flip(void)
+{
+    fb_flip();
     return 0;
 }
 
@@ -381,9 +394,11 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
     case SYS_fb_info:
         ret = sys_fb_info((struct lnxrm_fb_info *)f->rdi);
         break;
-    /* T-033: both gates, in this order, on all four drawing calls --
+    /* T-033: both gates, in this order, on all five surface calls --
      * capability (may you draw at all) then ownership (are you the one
-     * on the screen).  fb_info above has neither: it draws nothing. */
+     * on the screen).  fb_flip is the fifth: it publishes rather than
+     * draws, but it touches the surface just as directly.  fb_info above
+     * has neither: it draws nothing. */
     case SYS_fb_clear:
         if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_clear")) != 0) break;
         if ((ret = fb_owner_gate("fb_clear")) != 0) break;
@@ -404,6 +419,11 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         if ((ret = fb_owner_gate("fb_puts")) != 0) break;
         ret = sys_fb_puts((struct lnxrm_fb_str *)f->rdi);
         break;
+    case SYS_fb_flip:
+        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_flip")) != 0) break;
+        if ((ret = fb_owner_gate("fb_flip")) != 0) break;
+        ret = sys_fb_flip();
+        break;
     case SYS_unlink:
         ret = path_syscall(f->rdi, sys_unlink);
         break;
@@ -417,7 +437,7 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         ret = sys_setuid((u32)f->rdi);
         break;
     default:
-        /* Anything the table does not name: numbers above LAST (31). */
+        /* Anything the table does not name: numbers above LAST (32). */
         kprintf("[sys] unknown syscall %lu from pid %u\n", (unsigned long)nr,
                 current ? current->pid : 0);
         ret = LNXRM_ENOSYS;

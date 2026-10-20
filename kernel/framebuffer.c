@@ -2,12 +2,20 @@
  * Supports 8 / 15 / 16 / 24 / 32 bits per pixel.  Every colour handed to
  * the drawing primitives is a true-colour 0x00RRGGBB value; fb_rgb_px()
  * turns it into a stored pixel (packed channels, or the nearest DAC cube
- * entry on 8bpp indexed modes). */
+ * entry on 8bpp indexed modes).
+ *
+ * Drawing is double buffered by default: fb_ptr (what every fb_* routine
+ * writes) is an offscreen back surface in WB RAM, the visible LFB is the
+ * front surface, and fb_flip() copies what was drawn since the last
+ * present -- the dirty region -- onto the screen, so the screen shows a
+ * whole frame or the previous one, never a half-drawn one.  See FB_DB_*
+ * in framebuffer.h for the window the back surface lives in. */
 #include <framebuffer.h>
 #include <console.h>
 #include <boot.h>
 #include <mm/mm.h>
 #include <sys/cpu.h>
+#include <sys/spinlock.h>
 #include <io.h>
 #include <font8x16.h>
 
@@ -15,9 +23,11 @@ extern struct boot_info bootinfo;
 
 static volatile u8 *fb_ptr;   /* what every fb_* routine draws into */
 static volatile u8 *fb_front; /* the visible LFB */
+static volatile u8 *fb_back;  /* the offscreen draw surface; NULL = single buffered */
 
 /* fb_put_pixel is internal to this file; the other four are exported and
- * serve both the text console and the fb_* syscalls (24-28). */
+ * serve both the text console and the fb_* syscalls (24-27).  They all
+ * draw into the back surface -- fb_flip (syscall 32) is what shows it. */
 static void fb_put_pixel(u32 x, u32 y, u32 color);
 
 
@@ -314,12 +324,178 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
         *d++ = *s++;
 }
 
+/* ---- double buffering ----
+ * Everything below draws into fb_ptr, which is the back surface whenever
+ * one could be mapped (fb_back_init()).  Presenting is deliberately not
+ * the caller's job for ordinary output:
+ *
+ *  - The console has no frames, it has a stream of characters.  Presenting
+ *    per character would push a region to the screen thousands of times
+ *    over a boot log, so a console write marks its region dirty and lets
+ *    fb_present_due() decide when the screen is worth updating.
+ *  - A drawing program does have frames, and calls fb_flip() (or the
+ *    fb_flip syscall) to land one as one.
+ *
+ * Dirty tracking is a *region*, not a flag: fb_mark_dirty(x,y,w,h) unions
+ * the box each write covered into (fb_dx0..fb_dx1, fb_dy0..fb_dy1), and a
+ * present copies exactly that box, row by row -- a char cell costs an
+ * 8x16 copy instead of the whole surface.  The box is sound because
+ * fb_console_init() clears the whole surface before the first flip (front
+ * and back then agree everywhere) and every write afterwards marks its
+ * box; fbc_scroll()'s raw fb_copy_fwd() is the one write that bypasses
+ * fb_store_px(), so it marks its rows itself.
+ *
+ * Two rules keep a mark from being lost to a present running on the other
+ * CPU.  With the whole-surface flag this was merely a tear -- the next
+ * store anywhere repainted everything -- but a lost *region* would sit in
+ * the back surface until something marked that region again, so both
+ * rules are now structural, held under fb_box_lock:
+ *
+ *  - Mark after the store, never before.  A present may then skip a write
+ *    that is not marked yet (one more frame for it), but it can never
+ *    consume the mark of a write that has not happened.
+ *  - The present consumes the box (flag down, box emptied) in one locked
+ *    step and copies *outside* the lock.  A mark either completes before
+ *    it -- its pixels are in the snapshot just copied -- or lands after
+ *    it -- a fresh box, presented next.  Neither can slip between.
+ *
+ * fb_box_lock is held for about a dozen stores on each side (irqsave:
+ * handlers print).  The copy itself stays lockless, as the flag design
+ * was: two concurrent presents copy snapshots that agree, and a draw
+ * racing a present can tear for one frame -- the same window the old
+ * direct-to-LFB code had per pixel, now reduced to one copy.
+ *
+ * fb_present_due() / fb_tick_flush() split presenting between two callers:
+ *
+ *  - Once the timer runs (everything after lapic_timer_start(), which is
+ *    where the steady state lives), the BSP's tick presents: at most one
+ *    copy every FB_PRESENT_TICKS ticks, no matter how much was drawn in
+ *    between, and always in the timer handler -- never in whatever
+ *    context printed the byte.  A burst of kprintfs becomes one present,
+ *    not one per line.
+ *  - Before the first tick (fb_init() through kernel_spawn, which
+ *    includes all of ktest stage 3), jiffies never advances and no tick
+ *    is coming, so the console presents itself -- coalesced on the output
+ *    instead of a clock, once per FB_PRESENT_CHARS characters.  The paths
+ *    that halt before the timer ever starts (panic, the kernel_spawn
+ *    failure loop) flip the surface themselves for the same reason. */
+#define FB_PRESENT_TICKS  2    /* HZ=100 -> a dirty box shows within 20 ms */
+#define FB_PRESENT_CHARS 1024  /* pre-timer coalescing, see above */
+
+static volatile u8 fb_dirty;    /* a present is owed: the box below is live */
+static u64 fb_last_present;     /* jiffies of the last present */
+static u32 fb_chars_since;      /* chars printed since it (pre-timer clock) */
+
+/* The dirty box: pixels written since the last present, in pixels, x1/y1
+ * exclusive.  Guarded by fb_box_lock together with fb_dirty; only the
+ * present consumes it (snapshot + empty), marks only grow it. */
+static u32 fb_dx0, fb_dy0, fb_dx1, fb_dy1;
+static spinlock_t fb_box_lock = SPINLOCK_INIT;
+
+/* Record the box a write just covered; fb_present_due() does the rest.
+ * Over-marking is harmless -- an extra row copies bytes that already
+ * match -- so the box grows in u64 and is clamped to the visible area,
+ * and only a write with no visible pixel in it (fully off-screen) marks
+ * nothing.  Single buffered there is nothing to track: every write
+ * already showed.  A mark while nothing is pending starts a fresh box:
+ * the zeros left behind by a consume are not a live box to union into
+ * (unioning would anchor every later box at the origin). */
+static void fb_mark_dirty(u32 x, u32 y, u32 w, u32 h)
+{
+    if (!fb_back) return;
+    u64 x0 = x, y0 = y, x1 = (u64)x + w, y1 = (u64)y + h;
+    if (x1 > fb_width) x1 = fb_width;
+    if (y1 > fb_height) y1 = fb_height;
+    if (x0 >= x1 || y0 >= y1) return;
+    u64 fl;
+    spin_lock_irqsave(&fb_box_lock, &fl);
+    if (!fb_dirty) {
+        fb_dx0 = (u32)x0;
+        fb_dy0 = (u32)y0;
+        fb_dx1 = (u32)x1;
+        fb_dy1 = (u32)y1;
+        fb_dirty = 1;
+    } else {
+        if (x0 < fb_dx0) fb_dx0 = (u32)x0;
+        if (y0 < fb_dy0) fb_dy0 = (u32)y0;
+        if (x1 > fb_dx1) fb_dx1 = (u32)x1;
+        if (y1 > fb_dy1) fb_dy1 = (u32)y1;
+    }
+    spin_unlock_irqrestore(&fb_box_lock, fl);
+}
+
+/* Publish what was drawn: snapshot the dirty box, consume it, then copy
+ * exactly that box from the back surface into the visible LFB, row by
+ * row.  This is the whole of double buffering -- a half-drawn frame is
+ * simply never copied, because the copy only happens here, and what is
+ * copied is only what was marked (front and back agree outside the box:
+ * fb_console_init() synced them at boot and every write has marked its
+ * box since).  No-op when single buffered (fb_ptr is the LFB then and
+ * every draw already showed) or when nothing is dirty. */
+void fb_flip(void)
+{
+    if (!fb_back || !fb_front) return;
+    u32 x0, y0, x1, y1;
+    u64 fl;
+    spin_lock_irqsave(&fb_box_lock, &fl);
+    if (!fb_dirty) {
+        spin_unlock_irqrestore(&fb_box_lock, fl);
+        return;
+    }
+    x0 = fb_dx0;
+    y0 = fb_dy0;
+    x1 = fb_dx1;
+    y1 = fb_dy1;
+    fb_dx0 = fb_dy0 = fb_dx1 = fb_dy1 = 0; /* empty: consumed */
+    fb_dirty = 0;
+    spin_unlock_irqrestore(&fb_box_lock, fl);
+
+    size_t row_bytes = (size_t)(x1 - x0) * fb_pxsz;
+    for (u32 y = y0; y < y1; y++)
+        fb_copy_fwd((volatile void *)(fb_front + (u64)y * fb_pitch + (u64)x0 * fb_pxsz),
+                    (const volatile void *)(fb_back + (u64)y * fb_pitch + (u64)x0 * fb_pxsz),
+                    row_bytes);
+    fb_chars_since = 0;
+    fb_last_present = jiffies;
+}
+
+int fb_double_buffered(void) { return fb_back != NULL; }
+
+/* Called by the console after every character.  Once the timer runs,
+ * presenting is the tick's job (fb_tick_flush) -- this returns, and the
+ * copy happens in the BSP's timer handler instead of in whatever context
+ * happened to print the byte: an ISR, another CPU, an IRQ-off section.
+ * Only before the first tick, when no tick is coming at all, does the
+ * console present itself, and then only once per FB_PRESENT_CHARS
+ * characters (a good fraction of a screenful). */
+static void fb_present_due(void)
+{
+    if (!fb_back || !fb_dirty) return;
+    if (jiffies != fb_last_present) return; /* a tick owns it from here */
+    if (++fb_chars_since < FB_PRESENT_CHARS) return;
+    fb_flip();
+}
+
+/* The BSP timer handler: show what was drawn, at most one copy every
+ * FB_PRESENT_TICKS ticks however much was written in between -- a burst of
+ * kprintfs becomes one present, not one per line.  It is a load and a
+ * branch when nothing drew, which is most ticks. */
+void fb_tick_flush(void)
+{
+    if (!fb_back || !fb_dirty) return;
+    if (jiffies - fb_last_present < FB_PRESENT_TICKS) return;
+    fb_flip();
+}
+
 static void fbc_scroll(void)
 {
     u32 row_bytes = fb_pitch * FB_CELL_H;
     if (fbc_rows < 2) return;
     fb_copy_fwd((volatile void *)fb_ptr, (volatile void *)((volatile u8 *)fb_ptr + row_bytes),
                 (size_t)row_bytes * (fbc_rows - 1));
+    /* the raw copy above bypasses fb_store_px(), so it marks its rows
+     * itself -- store first, mark after, like every other write */
+    fb_mark_dirty(0, 0, fb_width, (u32)(fbc_rows - 1) * FB_CELL_H);
     /* clear the last text row (pixel-aware: memset would only fit 8bpp) */
     fb_fill_rect(0, (u32)(fbc_rows - 1) * FB_CELL_H, fb_width, FB_CELL_H, fbc_bg);
 }
@@ -334,11 +510,17 @@ void fb_console_putc(char c)
          * byte itself, later sequence bytes keep phase != 1 so this fires
          * exactly once per sequence */
         if (fbc_ansi.phase == 1) fbc_cursor(0);
+        fb_present_due();
         return;
     }
     if (r == ANSI_DONE) {
         fbc_esc_process(fbc_ansi.buf, fbc_ansi.len);
         fbc_cursor(1); /* redraw at wherever the sequence left the cursor */
+        /* This is where double buffering pays for itself on the console:
+         * ESC[H + ESC[2J used to blank the screen in front of the reader
+         * and repaint it afterwards; now the whole sequence lands as one
+         * present. */
+        fb_present_due();
         return;
     }
 
@@ -384,6 +566,7 @@ void fb_console_putc(char c)
     }
 
     fbc_cursor(1);
+    fb_present_due();
 }
 
 void fb_console_init(void)
@@ -396,6 +579,10 @@ void fb_console_init(void)
 
     int n = ring_get_count();
     for (int i = 0; i < n; i++) fb_console_putc(ring_get_char(i));
+
+    /* Everything the console replayed is in the back surface; show it in
+     * one piece rather than trickling it out through the present clock. */
+    fb_flip();
 }
 
 /* published for the boot self-test (ktest/t_fb.c): the escape parser's
@@ -499,6 +686,52 @@ static u64 fb_lfb_pte_flags(u64 pa, u64 len)
     return flags;
 }
 
+/* Map an offscreen back surface for the running mode and start drawing
+ * into it (fb_ptr).  Leaves single buffering in place -- with a saying-so
+ * on the console -- when the mode does not fit the window or RAM is short;
+ * fb_flip() and fb_present_due() are no-ops then, and every other path is
+ * unchanged because they all go through fb_ptr either way.
+ *
+ * The surface is built from single 4 KiB buddy frames mapped contiguously:
+ * the buddy's largest block is 4 MiB (MAX_ORDER 10) but a 1080p surface is
+ * ~7.9 MiB, and page-at-a-time mapping also survives any fragmentation. */
+static void fb_back_init(void)
+{
+    u64 size = (u64)fb_pitch * fb_height;
+    if (!size || size > FB_DB_MAX_BYTES) {
+        /* !size cannot happen (fb_init() rejected zero-pitch and
+         * zero-height modes first) -- but fb_ptr would become an
+         * unmapped address if it ever did, and every draw from there is
+         * a fault, so the guard earns its keep. */
+        kprintf("[fb] surface %lu B outside the %lu B window - single buffered\n",
+                (unsigned long)size, (unsigned long)FB_DB_MAX_BYTES);
+        return;
+    }
+    u64 need = ALIGN_UP(size, PAGE_SIZE);
+    for (u64 off = 0; off < need; off += PAGE_SIZE) {
+        u64 pa = pmm_alloc();
+        if (!pa) {
+            /* Failing this early means RAM is essentially gone already.
+             * The frames mapped so far stay where they are (nothing writes
+             * through them -- fb_back stays NULL, so fb_ptr remains the
+             * LFB): unwinding a boot-time allocation that is at most a few
+             * MiB is not worth a rollback path here. */
+            kprintf("[fb] back surface wants %lu KiB - RAM too low, single buffered\n",
+                    (unsigned long)(need >> 10));
+            return;
+        }
+        /* WB, the same memory type as the frames' own high-half alias.
+         * Two cacheable mappings of one frame are coherent on x86, and
+         * drawing into WB RAM is the point: the slow aperture gets one
+         * wide copy per flip instead of one uncached store per pixel. */
+        vmm_map_kernel_page(FB_DB_VMA + off, pa, PG_P | PG_W);
+    }
+    fb_back = (volatile u8 *)FB_DB_VMA;
+    fb_ptr = fb_back;
+    kprintf("[fb] double buffered: back %p (%lu KiB, WB RAM) -> LFB on flip\n",
+            (void *)fb_back, (unsigned long)(need >> 10));
+}
+
 void fb_init(void)
 {
     struct fb_info *fb = &bootinfo.fb;
@@ -582,6 +815,9 @@ void fb_init(void)
     /* palette: DAC programming for 8bpp, packed pixels otherwise */
     fb_setup_palette();
 
+    /* Start drawing offscreen; a no-op that logs why when it cannot. */
+    fb_back_init();
+
     /* Switch console to framebuffer output */
     fb_console_init();
 }
@@ -597,7 +833,9 @@ static inline void fb_store(volatile u8 *dst, u32 px)
         for (u32 i = 0; i < fb_pxsz; i++) dst[i] = (u8)(px >> (8 * i));
 }
 
-/* one pixel, pre-converted by fb_rgb_px(), clipped to the visible area */
+/* one pixel, pre-converted by fb_rgb_px(), clipped to the visible area.
+ * A bare store: the caller marks what it wrote (see fb_mark_dirty -- the
+ * store must land before its mark). */
 static inline void fb_store_px(u32 x, u32 y, u32 px)
 {
     if (x >= fb_width || y >= fb_height || !fb_ptr) return;
@@ -607,6 +845,7 @@ static inline void fb_store_px(u32 x, u32 y, u32 px)
 static void fb_put_pixel(u32 x, u32 y, u32 color)
 {
     fb_store_px(x, y, fb_rgb_px(color));
+    fb_mark_dirty(x, y, 1, 1); /* no-op when clipped off-screen */
 }
 
 /* ---- self-test hooks (include/framebuffer.h) ---- */
@@ -633,10 +872,12 @@ void fb_layout_set(const struct fb_layout *l)
     fb_pxsz = l->pxsz;
 }
 
-bool fb_read_px(u32 x, u32 y, u32 *out)
+/* one raw stored pixel out of `base` (the back surface or the LFB); both
+ * surfaces have the same geometry, so only the base differs */
+static bool fb_px_read(volatile u8 *base, u32 x, u32 y, u32 *out)
 {
-    if (!fb_ptr || x >= fb_width || y >= fb_height) return false;
-    volatile u8 *p = fb_ptr + (u64)y * fb_pitch + (u64)x * fb_pxsz;
+    if (!base || x >= fb_width || y >= fb_height) return false;
+    volatile u8 *p = base + (u64)y * fb_pitch + (u64)x * fb_pxsz;
     u32 v = 0;
     if (fb_pxsz == 4)
         v = *(volatile u32 *)p;
@@ -648,24 +889,38 @@ bool fb_read_px(u32 x, u32 y, u32 *out)
     return true;
 }
 
+bool fb_read_px(u32 x, u32 y, u32 *out) { return fb_px_read(fb_ptr, x, y, out); }
+
+bool fb_read_front_px(u32 x, u32 y, u32 *out) { return fb_px_read(fb_front, x, y, out); }
+
+/* ktest only (see framebuffer.h): one raw store into the back surface
+ * *without* marking it.  A present copies exactly the marked region, and
+ * that is only observable through a write that does not mark. */
+void fb_poke_back_px(u32 x, u32 y, u32 raw)
+{
+    if (!fb_back || x >= fb_width || y >= fb_height) return;
+    fb_store(fb_back + (u64)y * fb_pitch + (u64)x * fb_pxsz, raw);
+}
+
 void fb_write_px(u32 x, u32 y, u32 raw)
 {
     if (!fb_ptr || x >= fb_width || y >= fb_height) return;
     fb_store(fb_ptr + (u64)y * fb_pitch + (u64)x * fb_pxsz, raw);
+    fb_mark_dirty(x, y, 1, 1);
 }
 
 void fb_clear(u32 color)
 {
     if (!fb_ptr) return;
     u32 px = fb_rgb_px(color);
-    if (fb_pxsz == 1) {
+    if (fb_pxsz == 1)
         memset((void *)fb_ptr, (int)px, (size_t)fb_pitch * fb_height);
-        return;
-    }
-    for (u32 y = 0; y < fb_height; y++) {
-        volatile u8 *row = fb_ptr + (u64)y * fb_pitch;
-        for (u32 x = 0; x < fb_width; x++) fb_store(row + (u64)x * fb_pxsz, px);
-    }
+    else
+        for (u32 y = 0; y < fb_height; y++) {
+            volatile u8 *row = fb_ptr + (u64)y * fb_pitch;
+            for (u32 x = 0; x < fb_width; x++) fb_store(row + (u64)x * fb_pxsz, px);
+        }
+    fb_mark_dirty(0, 0, fb_width, fb_height); /* the whole surface changed */
 }
 
 void fb_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 color)
@@ -677,6 +932,7 @@ void fb_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 color)
         for (u32 col = x; col < x + w && col < fb_width; col++)
             fb_store(base + (u64)col * fb_pxsz, px);
     }
+    fb_mark_dirty(x, y, w, h); /* clamped; a fully off-screen rect marks nothing */
 }
 
 void fb_draw_char(u32 x, u32 y, char ch, u32 fg, u32 bg)
@@ -692,6 +948,8 @@ void fb_draw_char(u32 x, u32 y, char ch, u32 fg, u32 bg)
         for (int col = 0; col < 8; col++)
             fb_store_px(x + (u32)col, y + (u32)row, (bits & (0x80 >> col)) ? fgpx : bgpx);
     }
+    /* one mark for the whole glyph box (writes clipped per pixel above) */
+    fb_mark_dirty(x, y, FB_CELL_W, FB_CELL_H);
 }
 
 void fb_puts(u32 x, u32 y, const char *s, u32 fg, u32 bg)

@@ -43,7 +43,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  31
+#define LNXRM_SYSCALL_LAST  32
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
@@ -147,9 +147,10 @@ struct lnxrm_utsname {
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_utsname) == 320, "utsname ABI");
 
-/* framebuffer syscalls (24-28).  Every colour field (color/fg/bg) is a
- * true-colour 0x00RRGGBB value -- 24-bit RGB carried in 32 bits, never a
- * palette index. */
+/* framebuffer syscalls: fb_info 23 and the drawing calls 24-27, plus
+ * fb_flip 32 (double buffering: publish the back surface).  Every colour
+ * field (color/fg/bg) is a true-colour 0x00RRGGBB value -- 24-bit RGB
+ * carried in 32 bits, never a palette index. */
 struct lnxrm_fb_info {
     uint32_t width;
     uint32_t height;

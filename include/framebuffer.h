@@ -19,6 +19,29 @@ extern "C" {
 #define FB_PD_SLOTS   8
 #define FB_MAX_BYTES  (FB_PD_SLOTS * 0x200000UL)
 
+/* ---- double buffering (default on) ----
+ * fb_init() draws into an offscreen *back* surface in ordinary WB RAM and
+ * keeps the visible LFB as the front surface; fb_flip() copies whatever
+ * was drawn since the last present -- the dirty region -- onto the
+ * screen.  The back surface lives in its
+ * own PD window, slots [97,104) = 14 MiB, picked because it is the free
+ * run just above the VGA window (slot 96) and clear of the LFB window
+ * (104..107) and the ACPI bounce page (slot 108).
+ *
+ * Like every fixed window, its PD entries are not frame aliases, so the
+ * physical pages they shadow (194..208 MiB) have no high-half alias left
+ * and start_kernel() keeps them out of the buddy; vmm_init() filters the
+ * same slots out of the alias loop.  A mode whose front *and* back surface
+ * would not fit the window (back > 14 MiB, i.e. beyond ~2048x1536x32)
+ * keeps single buffering instead -- fb_init() says so on the console. */
+#define FB_DB_PD_BASE 97
+#define FB_DB_SLOTS   7
+#define FB_DB_VMA     0xffffffff8c200000UL /* PD_HI[97], 4 KiB pages */
+#define FB_DB_MAX_BYTES (FB_DB_SLOTS * 0x200000UL)
+
+LNXRM_STATIC_ASSERT(PD_SLOT_OF(FB_DB_VMA) == FB_DB_PD_BASE,
+                    "FB_DB_VMA must sit in PD_HI[97]");
+
 /* runtime values set from VBE mode info */
 extern u32 fb_width;
 extern u32 fb_height;
@@ -27,6 +50,22 @@ extern u32 fb_bpp;   /* actual depth of the running mode (8/15/16/24/32) */
 extern u32 fb_pxsz;  /* bytes per stored pixel */
 
 void fb_init(void);
+
+/* ---- double buffering (default on) ----
+ * Every drawing call above goes to the offscreen back surface.  fb_flip()
+ * publishes it: the box written since the last present is copied into the
+ * visible LFB row by row (a char cell costs 8x16, a scrolled screen costs
+ * a full copy), so the screen shows either the old frame or the new one,
+ * never a half-drawn one.  It is a no-op in single-buffered mode (back-
+ * surface allocation failed, or the mode is too big for the window). */
+void fb_flip(void);
+int fb_double_buffered(void); /* 1 = a back surface is in use */
+/* The BSP tick calls this: present the back surface if anything drew into
+ * it, at most once per couple of ticks.  Console and drawing-syscall
+ * output mark the region they touched; nobody has to remember to flip for
+ * the screen to catch up -- fb_flip() is for a program that wants its
+ * frame to land as one frame, right now. */
+void fb_tick_flush(void);
 
 /* drawing primitives shared with the fb_* syscalls (24-28) and the
  * console above; all clip to the visible area.  Every colour argument is a
@@ -77,6 +116,15 @@ u32 fb_pack(u8 r, u8 g, u8 b);   /* 8-bit channels -> stored pixel */
 u32 fb_rgb_px(u32 rgb);          /* 0x00RRGGBB -> stored pixel */
 bool fb_read_px(u32 x, u32 y, u32 *out); /* false when off-screen/unmapped */
 void fb_write_px(u32 x, u32 y, u32 raw); /* stored value, no colour conversion */
+/* ktest only: the same read against the *visible* surface.  fb_read_px()
+ * above reads whatever a drawing call last wrote, which with double
+ * buffering is the offscreen back surface -- so it cannot by itself show
+ * that a flip moved pixels onto the screen. */
+bool fb_read_front_px(u32 x, u32 y, u32 *out);
+/* ktest only: store one raw pixel into the back surface *without* marking
+ * it dirty.  A present copies exactly the marked region, and that property
+ * is only observable through a write that does not mark. */
+void fb_poke_back_px(u32 x, u32 y, u32 raw);
 
 /* framebuffer text console (mirrors VGA text mode) */
 void fb_console_init(void);

@@ -435,6 +435,133 @@ static void test_fb_console_scroll(void)
     fbc_move(c_row > 0 ? c_row - 1 : 0, c_col);
 }
 
+/* ---- double buffering: draw offscreen, flip onto the screen ----
+ *
+ * With a back surface a drawing call must NOT reach the visible LFB by
+ * itself -- that is the whole point: the screen shows a completed frame or
+ * the previous one, never a half-drawn one.  fb_flip() is what puts pixels
+ * on the glass, and what it puts is exactly the region marked since the
+ * last present (the next case checks that half of the contract).
+ *
+ * Neither half is observable through fb_read_px(): it reads whatever a
+ * drawing call last wrote, which is the back surface, so it would happily
+ * report the pixel as shown whether or not anything was presented.  This
+ * case therefore reads the screen directly, through the ktest hook
+ * fb_read_front_px().
+ *
+ * The probe pixel is fb_pack()ed, not an RGB constant: fb_write_px() takes
+ * a *stored* value, so 0x00ff00ff would read back truncated on a 16bpp
+ * mode and the check would fail for the wrong reason.  Bottom-right pixel,
+ * snapshotted and restored like t_draw.c does, so the log above it stays
+ * readable. */
+static void test_fb_flip_moves_pixels(void)
+{
+    const u32 x = 0, y = 0; /* top-left: always mapped, always in the log */
+    u32 back_before, front_before, got;
+    u32 hot = fb_pack(0xff, 0x00, 0xff); /* magenta, as this mode stores it */
+
+    if (!fb_read_front_px(x, y, &front_before)) {
+        ktest_skip("no framebuffer mapped");
+        return;
+    }
+    if (!fb_double_buffered()) {
+        ktest_skip("single buffered (no back surface for this mode)");
+        return;
+    }
+    K_ASSERT(fb_read_px(x, y, &back_before));
+
+    /* A drawing call lands in the back surface, and the screen keeps
+     * showing what it was showing: nothing leaked through on its own. */
+    fb_write_px(x, y, hot);
+    K_EXPECT(fb_read_px(x, y, &got) && got == hot);
+    K_EXPECT(fb_read_front_px(x, y, &got) && got == front_before);
+
+    /* One flip carries the surface over, this pixel included. */
+    fb_flip();
+    K_EXPECT(fb_read_front_px(x, y, &got) && got == hot);
+
+    /* Being shown does not consume the back surface: it is a copy, not a
+     * swap, so the next drawing call still has the whole frame to work
+     * from -- which is what lets a program draw a frame across many calls
+     * and flip once at the end. */
+    K_EXPECT(fb_read_px(x, y, &got) && got == hot);
+
+    /* Restore both surfaces; the flip leaves the screen showing the
+     * original pixel again. */
+    fb_write_px(x, y, back_before);
+    fb_flip();
+    K_EXPECT(fb_read_front_px(x, y, &got) && got == back_before);
+}
+
+/* ---- a present copies the marked region, and nothing else ----
+ *
+ * fb_flip() used to copy the whole surface, which made "only drawn pixels
+ * reach the screen" true by construction.  With a dirty box the claim is
+ * narrower and therefore testable: a write that does NOT mark its box
+ * must stay off the screen even though it changed the back surface.
+ * fb_poke_back_px() is the one write that does not mark -- ktest-only,
+ * see framebuffer.h -- and this case is its reason to exist.
+ *
+ * Sequence: sync both surfaces with a flip, poke a pixel unmarked, then
+ * mark (and flip) a box somewhere else; the screen must move in the box
+ * but not at the poke.  Finally the ordinary marked path must present the
+ * same pixel, so the case pins both halves of the contract.  Colors are
+ * fb_pack()ed for the same reason as above. */
+static void test_fb_flip_copies_only_marked_region(void)
+{
+    const u32 px = 0, py = 0;                      /* probe: top-left, in the log */
+    const u32 ax = 480, ay = 320, aw = 6, ah = 6;  /* the marked box, far away */
+    u32 back0, rect0, x_at_sync, got;
+    u32 hot = fb_pack(0xff, 0x00, 0xff);  /* magenta: the unmarked poke */
+    u32 boxc = fb_pack(0x00, 0x00, 0xff); /* blue: the marked box */
+    u32 hot2 = fb_pack(0x00, 0xff, 0x00); /* green: the marked poke */
+
+    if (!fb_read_front_px(px, py, &got)) {
+        ktest_skip("no framebuffer mapped");
+        return;
+    }
+    if (!fb_double_buffered()) {
+        ktest_skip("single buffered (no back surface for this mode)");
+        return;
+    }
+    if (fb_width < ax + aw || fb_height < ay + ah) {
+        ktest_skip("mode too small for the marked box");
+        return;
+    }
+    /* snapshot both places, to hand them back at the end */
+    K_ASSERT(fb_read_px(px, py, &back0));
+    K_ASSERT(fb_read_px(ax, ay, &rect0));
+
+    /* (1) present everything outstanding: from here the surfaces agree
+     * everywhere -- the invariant the region copy rests on */
+    fb_flip();
+    K_ASSERT(fb_read_px(px, py, &x_at_sync));
+    K_EXPECT(fb_read_front_px(px, py, &got) && got == x_at_sync);
+
+    /* (2) an unmarked write changes the back surface and nothing else */
+    fb_poke_back_px(px, py, hot);
+    K_EXPECT(fb_read_px(px, py, &got) && got == hot);
+
+    /* (3) flipping a region that does not contain the poke: the marked
+     * box lands, the poked pixel stays on the screen as it was */
+    fb_fill_rect(ax, ay, aw, ah, boxc);
+    fb_flip();
+    K_EXPECT(fb_read_front_px(ax, ay, &got) && got == boxc);
+    K_EXPECT(fb_read_front_px(px, py, &got) && got == x_at_sync);
+
+    /* (4) the ordinary marked path does present the same pixel */
+    fb_write_px(px, py, hot2);
+    fb_flip();
+    K_EXPECT(fb_read_front_px(px, py, &got) && got == hot2);
+
+    /* (5) hand both surfaces back as they were found */
+    fb_write_px(px, py, back0);
+    fb_fill_rect(ax, ay, aw, ah, rect0);
+    fb_flip();
+    K_EXPECT(fb_read_front_px(px, py, &got) && got == back0);
+    K_EXPECT(fb_read_front_px(ax, ay, &got) && got == rect0);
+}
+
 /* ---- T-033: the surface is held by exactly one pid ----
  *
  * fb_claim()/fb_disown() are the entire policy behind the owner gate in
@@ -484,4 +611,6 @@ KTEST("fb", KTEST_LATE, test_fb_rgb_px_8bpp);
 KTEST("fb", KTEST_LATE, test_fb_layout_restored);
 KTEST("fb", KTEST_LATE, test_fb_console_clipping);
 KTEST("fb", KTEST_LATE, test_fb_console_scroll);
+KTEST("fb", KTEST_LATE, test_fb_flip_moves_pixels);
+KTEST("fb", KTEST_LATE, test_fb_flip_copies_only_marked_region);
 KTEST("fb", KTEST_LATE, test_fb_owner_is_one_pid_at_a_time);

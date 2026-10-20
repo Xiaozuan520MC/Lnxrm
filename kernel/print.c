@@ -449,6 +449,12 @@ __attribute__((noreturn)) void panic(const char *fmt, ...)
     __builtin_va_end(ap);
     putstr_unlocked("\033[0m\n"); /* reset color */
 
+    /* The panic text sits in the back surface like any other console
+     * output, and no tick will ever present it: interrupts are off and
+     * the machine halts below.  The last word on screen is the one thing
+     * here that must not depend on the present clock. */
+    fb_flip();
+
     __asm__ volatile("hlt; jmp .");
     for (;;);
 }

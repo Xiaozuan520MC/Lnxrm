@@ -232,6 +232,17 @@ void vmm_init(void)
         fb_slots = ((fb_hi - fb_lo) + 0x1FFFFFUL) >> 21;
         if (fb_slots > FB_PD_SLOTS) fb_slots = FB_PD_SLOTS;
     }
+    /* The double-buffer back surface claims a second run of slots, one
+     * window lower (FB_DB_* in framebuffer.h).  It is RAM, not MMIO, so
+     * unlike the LFB above there is no *physical* range to filter -- but
+     * the slots it will occupy are not aliases either, and start_kernel()
+     * keeps the frames behind them out of the buddy to match.  The whole
+     * window is filtered, not just the mode's share of it, for the same
+     * reason start_kernel() reserves the whole of it: how much of the
+     * window a given mode fills is decided by DISPI inside fb_init(),
+     * after both of these have run, so nothing here may assume a smaller
+     * footprint than FB_DB_SLOTS. */
+    u64 db_slots = (fb_hi > fb_lo) ? FB_DB_SLOTS : 0;
 
     /* Two page directories, one per GiB of the alias window: PD_HI covers
      * physical [0,1 GiB) (kernel image + the VGA/device/heap windows carved
@@ -255,6 +266,8 @@ void vmm_init(void)
                 continue; /* VGA / device MMIO windows */
             if (idx == ACPI_SCRATCH_PD) continue; /* ACPI table bounce window */
             if (idx >= FB_PD_BASE && idx < FB_PD_BASE + fb_slots) continue; /* LFB window */
+            if (idx >= FB_DB_PD_BASE && idx < FB_DB_PD_BASE + db_slots)
+                continue; /* double-buffer back surface window */
             if (fb_hi && pa < fb_hi && pa + 0x200000UL > fb_lo)
                 continue; /* LFB page range */
         }
