@@ -467,3 +467,27 @@ void syscall_entry(struct intr_frame *f)
      * before iretq back to user mode. */
     if (current && (f->cs & 3) == 3) do_signal_check(current);
 }
+
+#ifdef CONFIG_KTEST
+/* ktest hook: run the dispatch table against caller-built arguments.
+ *
+ * syscall_entry()'s half of the contract -- CLAC, the kxld BUG_ON, the tf
+ * save, the signal check -- is ring-0 *user-entry* plumbing and starts
+ * with int 0x80, which a kernel self-test cannot raise on itself.  The
+ * other half -- the capability/owner gates, the pointer validation, the
+ * per-syscall error codes -- is what the self-test wants, and this calls
+ * exactly that half: syscall_do() with a zeroed frame.  Not reachable
+ * from user space (it is not a syscall of its own) and built only when
+ * CONFIG_KTEST is defined. (2026-10-20) */
+long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3)
+{
+    struct intr_frame f;
+
+    memset(&f, 0, sizeof(f));
+    f.rax = nr;
+    f.rdi = a1;
+    f.rsi = a2;
+    f.r10 = a3;
+    return syscall_do(&f, nr, a3);
+}
+#endif

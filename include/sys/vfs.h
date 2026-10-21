@@ -76,6 +76,9 @@ struct file {
 struct intr_frame;
 
 void syscall_entry(struct intr_frame *f);
+#ifdef CONFIG_KTEST
+long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3); /* ktest only: dispatch, no user-entry */
+#endif
 long sys_open(const char *path, int flags);
 
 void vfs_init(void);
@@ -90,6 +93,7 @@ int vfs_mount_initramfs(void);
  * /bin/init on it mounts perfectly and still cannot start anything. */
 bool vfs_file_exists(const char *path);
 bool vfs_root_ready(void);    /* a filesystem answers at "/" (boot self-test) */
+bool vfs_root_is_fat(void);   /* ...and it is the on-disk FAT32 volume (ENOSPC test) */
 /* prefix a relative path with '/', returning `path` itself when it is
  * already absolute; NULL when the normalised path would not fit `buf` --
  * the caller answers LNXRM_ENAMETOOLONG instead of using a truncated

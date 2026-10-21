@@ -188,6 +188,91 @@ static void test_copy_to_user_readonly(void)
     K_EXPECT_EQ(vmm_translate_in(current->pml4, TEST_VA), 0);
 }
 
+/* copy_user_str() is the only sanctioned way a NUL-terminated string
+ * crosses into the kernel (open/execve/rename paths, fb_puts).  Its
+ * contract: always terminate the destination, never write past max, and
+ * on any unreadable byte answer failure with kdst[0] == 0 instead of
+ * handing back a half-string.  A source with no NUL within max keeps the
+ * first max-1 bytes and forces the last to NUL. (2026-10-20) */
+static void test_copy_user_str_boundaries(void)
+{
+    u8 kbuf[16];
+    u64 w = pmm_alloc();
+    K_ASSERT(w != 0);
+    K_ASSERT_EQ(vmm_map_user(current->pml4, TEST_VA, w, true, true, false), 0);
+
+    /* page layout: "hello" at 0; 5 non-NUL bytes against the page end;
+     * 32 'A's at 8 for the truncation case */
+    u64 ac = smap_enter();
+    memcpy((void *)TEST_VA, "hello", 6);
+    memset((void *)TEST_VA + 8, 'A', 32);
+    memset((void *)TEST_VA + PAGE_SIZE - 5, 'B', 5);
+    smap_leave(ac);
+
+    /* ---- happy path: copied, terminated, nothing past the string ---- */
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT_EQ(copy_user_str((char *)kbuf, TEST_VA, sizeof(kbuf)), 0);
+    K_EXPECT_EQ(kbuf[0], 'h');
+    K_EXPECT_EQ(kbuf[4], 'o');
+    K_EXPECT_EQ(kbuf[5], 0);
+    K_EXPECT_EQ(kbuf[6], 0x5A); /* past the terminator: untouched */
+
+    /* ---- max == 0 refuses without touching the destination ---- */
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT(copy_user_str((char *)kbuf, TEST_VA, 0) != 0);
+    K_EXPECT_EQ(kbuf[0], 0x5A);
+
+    /* ---- every unreadable source: failure, and kdst[0] marked zero ---- */
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT(copy_user_str((char *)kbuf, TEST_VA + PAGE_SIZE, sizeof(kbuf)) != 0);
+    K_EXPECT_EQ(kbuf[0], 0);
+
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT(copy_user_str((char *)kbuf, (u64)kbuf, sizeof(kbuf)) != 0); /* kernel */
+    K_EXPECT_EQ(kbuf[0], 0);
+
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT(copy_user_str((char *)kbuf, 0x8000000000000000ULL, sizeof(kbuf)) != 0);
+    K_EXPECT_EQ(kbuf[0], 0);
+
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT(copy_user_str((char *)kbuf, ~0ULL - 4, sizeof(kbuf)) != 0); /* wrap */
+    K_EXPECT_EQ(kbuf[0], 0);
+
+    /* ---- 5 non-NUL bytes at the page end: the 6th byte is unmapped,
+     * the whole call must fail rather than return "BBBBB?" ---- */
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT(copy_user_str((char *)kbuf, TEST_VA + PAGE_SIZE - 5, sizeof(kbuf)) != 0);
+    K_EXPECT_EQ(kbuf[0], 0);
+
+    /* ---- a string whose terminator is the page's last byte reads fine ---- */
+    ac = smap_enter();
+    ((char *)TEST_VA)[PAGE_SIZE - 3] = 'x';
+    ((char *)TEST_VA)[PAGE_SIZE - 2] = 'y';
+    ((char *)TEST_VA)[PAGE_SIZE - 1] = 0;
+    smap_leave(ac);
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT_EQ(copy_user_str((char *)kbuf, TEST_VA + PAGE_SIZE - 3, sizeof(kbuf)), 0);
+    K_EXPECT_EQ(kbuf[0], 'x');
+    K_EXPECT_EQ(kbuf[1], 'y');
+    K_EXPECT_EQ(kbuf[2], 0);
+
+    /* ---- no NUL within max: first max-1 bytes kept, last forced to 0,
+     * and byte max never written ---- */
+    memset(kbuf, 0x5A, sizeof(kbuf));
+    K_EXPECT_EQ(copy_user_str((char *)kbuf, TEST_VA + 8, 8), 0);
+    K_EXPECT_EQ(kbuf[0], 'A');
+    K_EXPECT_EQ(kbuf[6], 'A');
+    K_EXPECT_EQ(kbuf[7], 0);
+    K_EXPECT_EQ(kbuf[8], 0x5A); /* beyond max: untouched */
+
+    u64 back = vmm_unmap_user(current->pml4, TEST_VA);
+    K_EXPECT_EQ(back, w);
+    pmm_free(w);
+    K_EXPECT_EQ(vmm_translate_in(current->pml4, TEST_VA), 0);
+}
+
 KTEST("usercopy", KTEST_LATE, test_user_ptr_ok_bounds);
 KTEST("usercopy", KTEST_LATE, test_copy_user_boundaries);
 KTEST("usercopy", KTEST_LATE, test_copy_to_user_readonly);
+KTEST("usercopy", KTEST_LATE, test_copy_user_str_boundaries);

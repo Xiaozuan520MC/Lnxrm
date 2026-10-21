@@ -55,7 +55,7 @@ kernel/               内核 C 实现
   fs/fat32/           fat32.c fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
   drivers/            pci.c ide.c ahci.c uart.c
   lib/string.c        memcpy memset strcmp strcpy strlen
-ktest/                启动自测：ktest.c 框架 + 18 个 t_*.c 用例文件
+ktest/                启动自测：ktest.c 框架 + 19 个 t_*.c 用例文件
 init/                 用户态运行库（crt0.S + ulib.c/h），链接进每个用户程序
 usr/                  16 个用户程序，一个 .c 一个二进制
 scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_test.py
@@ -575,7 +575,7 @@ spc/fatsz/reserved 非零、`num_fats ∈ {1,2}`、`root_cluster >= 2`）→ 算
 
 | 驱动 | 要点 |
 |---|---|
-| `drivers/ide.c` | 硬编码主通道 `0x1F0`、主设备、PIO、一次一扇区。`ide_init` 选盘 → 4 次状态读当 400 ns → `s == 0x00 \|\| s == 0xFF` 判无设备 → 等 DRDY → 发 `0xEC` → `ide_wait_drq()`（**全文件唯一的 ERR 判定点**）→ 读 IDENTIFY → `ata_total_sectors()` 取容量，容量为 0 不注册。读写先做 LBA 上界检查（28 位命令），`ide_lock` 包住整个循环 |
+| `drivers/ide.c` | 硬编码主通道 `0x1F0`、主设备、PIO、单命令至多 256 扇区（`IDE_MAX_CHUNK`）。`ide_init` 选盘 → 4 次状态读当 400 ns → `s == 0x00 \|\| s == 0xFF` 判无设备 → 等 DRDY → 发 `0xEC` → `ide_wait_drq()`（**全文件唯一的 ERR 判定点**）→ 读 IDENTIFY → `ata_total_sectors()` 取容量，容量为 0 不注册。读写先做 LBA 上界检查（28 位命令），`ide_lock` 包住整个循环。轮询预算分两档：探测 `IDE_PROBE_ITERS`（无盘口几秒内放弃）、读写 `IDE_POLL_ITERS`（QEMU 在 vCPU 线程里同步落宿主文件，宿主回写压力下 BSY 可持数十毫秒，旧 10 万次预算会把正常命令饿成 EIO） |
 | `drivers/ahci.c` | `ahci_init → pci_scan → ahciProbe`（class 过滤）→ 映射 ABAR → HBA 复位 → `ahciProbePort`（命令表 / FIS 区 / IDENTIFY）→ `blk_register`。命令下发 `buildH2dFis` + `issueCmd`：轮询 `P_CI` 清零后**先查 `IS_TFES` 再查 `PxTFD.ERR`**（完成 ≠ 成功），超时用 TSC 折算。单 PRD，缓冲必须物理连续的 512 字节 |
 | `drivers/pci.c` | 传统 `0xCF8/0xCFC` 配置窗口，`pci_scan` 递归（带 visited 与深度上限），支持多功能设备 |
 
@@ -638,7 +638,10 @@ spc/fatsz/reserved 非零、`num_fats ∈ {1,2}`、`root_cluster >= 2`）→ 算
   **快照并清空**脏箱，逐行拷贝在锁外进行。两条结构性规则防止标记被 present 吞掉：
   **先写后标**（present 最多漏一帧，不会消费"还没发生"的写）与**锁内快照+清空**
   （标记要么完整进入本次快照，要么落在清空之后、留给下一次 present）。无待呈现内容时
-  `fb_flip` 是空操作。`fbc_scroll` 的裸 `fb_copy_fwd` 是唯一绕过 `fb_store_px` 的写，
+  `fb_flip` 是空操作。逐行拷贝走 `fb_copy_fwd`（对齐前奏 + u64 宽循环 + 字节收尾）：
+  宽路径的收尾必须先把字节指针跟到宽循环之后再用，否则每行末尾 `n % 8` 字节——
+  也就是脏箱的右缘——会漏拷而留下旧像素（2026-10-21 修复，`test_fb_dirty_brute`
+  以随机坐标钉住这个形状）。`fbc_scroll` 的裸 `fb_copy_fwd` 是唯一绕过 `fb_store_px` 的写，
   自己补标；ktest 专用 `fb_poke_back_px()` 不标记——"未标记不上屏"只有经由它才可观测。
 - **谁来 present（两条时钟）**：控制台每个字符只标记其字格区域；
   **定时器启动后**由 BSP tick 节流（`FB_PRESENT_TICKS = 2`，HZ=100 即 ≤ 50 次/秒，
@@ -774,7 +777,7 @@ smp_init():
 
 ### 9.1 内核自测（`ktest/`）
 
-框架与用例分离：`ktest/ktest.c` + **18 个 `t_*.c`**；用 `KTEST(suite, stage, fn)`
+框架与用例分离：`ktest/ktest.c` + **19 个 `t_*.c`**；用 `KTEST(suite, stage, fn)`
 注册进 `.ktest` 段，按 `KTEST_EARLY / KTEST_MM / KTEST_LATE` 三阶段在 `start_kernel`
 里跑（位置见《启动》的 bring-up 顺序）。编译开关 `KTEST=1`；`make smoke` 会强制
 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
@@ -783,19 +786,20 @@ smp_init():
 
 | 阶段 | cases | checks | failed |
 |---|---|---|---|
-| early | 24 | 339 | 0 |
-| mm | 16 | 431 | 0 |
-| late | 47 | 881 | 0 |
-| 合计 | 87 | 1651 | 0（`[2 skipped]`、`[1 warn]`） |
+| early | 25 | 359 | 0 |
+| mm | 17 | 437 | 0 |
+| late | 51 | 1031 | 0 |
+| 合计 | 93 | 1827 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (87 cases, 1651 checks) [2 skipped]` 与
-`[selftest] 1651/1651 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**，
+汇总行 `[ktest] selftest PASS (93 cases, 1827 checks) [2 skipped]` 与
+`[selftest] 1827/1827 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**，
 `WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 在任何模式下都停机。
 
-套件按主题分组（23 个 suite）：`abi boot console cpu cred draw elf fat32 fb jrn kheap
-ktest lib lock oom pmm prop task usercopy vfs vmm blkcache blkio`，覆盖 ABI 布局与
+套件按主题分组（24 个 suite）：`abi boot console cpu cred draw elf fat32 fb jrn kheap
+ktest lib lock oom pmm prop syscall task usercopy vfs vmm blkcache blkio`，覆盖 ABI 布局与
 编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、
 ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、
+系统调用分发的指针门（坏指针回 `EFAULT`、位置/目录 cookie 不被坏指针消耗）、
 信号与任务、VFS/FAT32。
 
 ### 9.2 端到端冒烟（`scripts/smoke_test.py`，`make smoke`）

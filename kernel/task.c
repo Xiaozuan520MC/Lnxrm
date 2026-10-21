@@ -159,22 +159,31 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
      * memory raw. */
     if (copy_user_str(path, (u64)upath, sizeof(path)) < 0) return LNXRM_EFAULT;
 
-    if (uargv && UCP((u64)uargv)) {
+    /* A NULL argv/envp stays legal (usr/sh.c execs with envp NULL); a
+     * NON-NULL but unreachable array used to be accepted and dropped --
+     * the new image then ran with argc 0 instead of the caller being told
+     * the pointer was bad.  Refuse it, and refuse a bad entry pointer or
+     * entry string instead of truncating the array there. (2026-10-20) */
+    if (uargv) {
+        if (!UCP((u64)uargv)) return LNXRM_EFAULT;
         for (int i = 0; i < 16; i++) {
             const char *a;
-            if (copy_from_user(&a, &uargv[i], sizeof(a)) < 0 || !a) break;
-            if (copy_user_str(argv[i], (u64)a, sizeof(argv[i])) < 0) break;
+            if (copy_from_user(&a, &uargv[i], sizeof(a)) < 0) return LNXRM_EFAULT;
+            if (!a) break;
+            if (copy_user_str(argv[i], (u64)a, sizeof(argv[i])) < 0) return LNXRM_EFAULT;
             argc++;
         }
     }
 
     /* envp used to be accepted and silently dropped; copy it for real so
      * the new image's stack carries it (crt0 publishes it as `environ`). */
-    if (uenvp && UCP((u64)uenvp)) {
+    if (uenvp) {
+        if (!UCP((u64)uenvp)) return LNXRM_EFAULT;
         for (int i = 0; i < 16; i++) {
             const char *e;
-            if (copy_from_user(&e, &uenvp[i], sizeof(e)) < 0 || !e) break;
-            if (copy_user_str(envp[i], (u64)e, sizeof(envp[i])) < 0) break;
+            if (copy_from_user(&e, &uenvp[i], sizeof(e)) < 0) return LNXRM_EFAULT;
+            if (!e) break;
+            if (copy_user_str(envp[i], (u64)e, sizeof(envp[i])) < 0) return LNXRM_EFAULT;
             envc++;
         }
     }
@@ -384,6 +393,13 @@ void sys_exit(int code)
 
 int sys_waitpid(int wpid, int *ustatus, int opts)
 {
+    /* Refuse a bad status pointer BEFORE anything is reaped.  The old
+     * code guarded the copy with UCP() and skipped it silently on
+     * failure: the zombie was consumed, the pid came back as success,
+     * and the caller's untouched status word read as a garbage exit
+     * code.  One threaded task owns its address space, so once this
+     * check passes nothing can unmap before the copy below. (2026-10-20) */
+    if (ustatus && !user_ptr_ok((u64)ustatus, sizeof(int))) return LNXRM_EFAULT;
     for (;;) {
         bool have_kids = false;
         int i = 0;
@@ -396,7 +412,7 @@ int sys_waitpid(int wpid, int *ustatus, int opts)
             if (wpid > 0 && t->pid != (u32)wpid) continue;
             if (t->state == T_ZOMBIE) {
                 int code = t->exit_code;
-                if (ustatus && UCP(ustatus)) copy_to_user(ustatus, &code, sizeof(code));
+                if (ustatus) copy_to_user(ustatus, &code, sizeof(code));
                 u32 pid = t->pid;
                 vmm_destroy_user_aspace(t->pml4);
                 kfree(t->kstack);

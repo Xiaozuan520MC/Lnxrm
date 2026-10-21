@@ -7,6 +7,7 @@
 #include <sys/ktest.h>
 #include <sys/vfs.h>
 #include <console.h>
+#include <mm/mm.h>
 
 /* C46: a path that does not fit the 128-byte scratch buffer abs_path()
  * normalises into is refused with ENAMETOOLONG.  Cutting it short instead
@@ -178,8 +179,91 @@ static void test_ata_capacity(void)
     K_EXPECT_EQ(ata_total_sectors(id), 0x400000000ull);
 }
 
+/* Fill the boot volume until it answers ENOSPC, then prove the failure is
+ * clean: the write reports -28 instead of a swallowed short count, the
+ * file still unlinks, and one write succeeds again afterwards -- space
+ * that does not come back is a leak one write away from a volume that
+ * never recovers.  Guarded to the real FAT32 root: a ram-backed
+ * initramfs has no bottom to hit (vfs_root_is_fat()).  No K_ASSERT before
+ * the unlink: a mid-case abort would leave the volume full for every
+ * later smoke step. (2026-10-20) */
+#define ENSPC_CHUNK (16 * 1024)
+/* 64 MiB of attempts: past that, skip, do not fail.  A 16 KiB payload is
+ * sized so this case never *allocates* while the volume is under test --
+ * a heap buffer handed back to the block layer mid-fill would have the
+ * allocator racing the very ENOSPC it is measuring. */
+#define ENSPC_MAX 4096
+
+static void test_enospc_on_full_volume(void)
+{
+    if (!vfs_root_ready()) {
+        ktest_skip("no root filesystem");
+        return;
+    }
+    if (!vfs_root_is_fat()) {
+        ktest_skip("root is not the FAT32 volume");
+        return;
+    }
+
+    /* kmalloc, not a static buffer: a 16 KiB array in every ktest object
+     * is .bss the linker does not account for when it places the heap. */
+    u8 *buf = kmalloc(ENSPC_CHUNK);
+    if (!buf) {
+        ktest_skip("no memory for the fill buffer");
+        return;
+    }
+
+    struct file *f = NULL;
+    long r = vfs_open_file("/ENOSPC.T", O_CREAT | 1 /* O_WRONLY */ | O_TRUNC, &f);
+    K_EXPECT_EQ(r, 0);
+    if (r != 0 || !f) return;
+
+    long hit = 0, bad = 0, nwrite = 0;
+    for (int i = 0; i < ENSPC_MAX; i++) {
+        long w = f->ops->write(f, buf, ENSPC_CHUNK);
+        if (w == LNXRM_ENOSPC) { hit = 1; break; }
+        if (w != ENSPC_CHUNK) { bad = w; break; }
+        nwrite++;
+    }
+    kprintf("[t-enspc] wrote=%ld hit=%d bad=%ld\n", nwrite, (int)hit, bad);
+    vfs_close_file(f);
+    kfree(buf);
+
+    /* remove first, judge after: the assertions must not run before the
+     * volume has been given back its space */
+    long un = sys_unlink("/ENOSPC.T");
+
+    K_EXPECT_EQ(bad, 0); /* no short count, no surprise errno */
+    if (!hit) {
+        /* a volume larger than the attempt cap is not a failure */
+        K_EXPECT_EQ(un, 0);
+        ktest_skip("volume did not fill within the attempt cap");
+        return;
+    }
+    K_EXPECT(nwrite > 100); /* it really filled a volume, not one cluster */
+    K_EXPECT_EQ(un, 0);
+
+    /* space is back: one more file writes normally and removes again */
+    buf = kmalloc(ENSPC_CHUNK);
+    if (!buf) {
+        ktest_skip("no memory for the recovery buffer");
+        return;
+    }
+    struct file *g = NULL;
+    r = vfs_open_file("/ENOSPC.T", O_CREAT | 1 | O_TRUNC, &g);
+    K_EXPECT_EQ(r, 0);
+    if (r == 0 && g) {
+        long w2 = g->ops->write(g, buf, ENSPC_CHUNK);
+        K_EXPECT_EQ(w2, ENSPC_CHUNK);
+        vfs_close_file(g);
+    }
+    kfree(buf);
+    K_EXPECT_EQ(sys_unlink("/ENOSPC.T"), 0);
+}
+
 KTEST("vfs", KTEST_LATE, test_ata_capacity);
 KTEST("vfs", KTEST_LATE, test_read_readme);
 KTEST("vfs", KTEST_LATE, test_root_listing);
 KTEST("vfs", KTEST_LATE, test_char_device_size);
 KTEST("vfs", KTEST_LATE, test_path_too_long);
+KTEST("vfs", KTEST_LATE, test_enospc_on_full_volume);

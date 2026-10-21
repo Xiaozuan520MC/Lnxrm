@@ -807,8 +807,10 @@ def main():
                     help="reuse the artifacts already in build/")
     ap.add_argument("--clean", action="store_true",
                     help="make clean before building")
-    ap.add_argument("--timeout", type=float, default=60.0,
-                    help="seconds allowed per wait (default 60)")
+    ap.add_argument("--timeout", type=float, default=240.0,
+                    help="seconds allowed per wait (default 240: the ktest "
+                         "ENOSPC case fills the whole 62 MiB volume through "
+                         "the journal, ~2 minutes of PIO on TCG)")
     ap.add_argument("--jobs", type=int, default=None,
                     help="make -jN (default: 2x cores)")
     ap.add_argument("--qemu-args", default="",

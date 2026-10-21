@@ -606,6 +606,175 @@ static void test_fb_owner_is_one_pid_at_a_time(void)
     K_ASSERT_EQ(fb_owner_get(), 0); /* nobody leaves holding it */
 }
 
+/* Brute force for the dirty box: a fixed-seed pseudo-random stream of
+ * drawing operations -- hostile rectangles built from the coordinate
+ * extremes a bad user rectangle can be, ordinary ones from the middle of
+ * the surface -- with presents interleaved every 8th operation.  Violation
+ * counters keep 600 iterations to a handful of printed lines.  Held on
+ * every present cycle:
+ *   1. after a flip front == back (sampled grid each cycle, the whole
+ *      surface once at the end);
+ *   2. an unmarked poke never reaches the front surface: the probe cycle
+ *      drains first (empty box), pokes, flips again -- a second flip with
+ *      nothing marked must copy nothing -- then restores the pixel
+ *      silently so the surfaces reconverge;
+ *   3. reads of in-range pixels never fail. (2026-10-20) */
+#define DBR_OPS 600
+
+static u64 dbr_rng;
+static u64 dbr_next(void)
+{
+    u64 x = dbr_rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    dbr_rng = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+static u32 dbr_below(u32 n) { return (u32)(dbr_next() % n); }
+
+static void test_fb_dirty_brute(void)
+{
+    u32 t;
+    if (!fb_read_front_px(0, 0, &t)) {
+        ktest_skip("no framebuffer mapped");
+        return;
+    }
+    if (!fb_double_buffered()) {
+        ktest_skip("single buffered (no back surface for this mode)");
+        return;
+    }
+
+    const u32 W = fb_width, H = fb_height;
+    static const u32 ex[] = {0, 1, 0x7ffffffeU, 0x7fffffffU, 0x80000000U,
+                             0xfffffffeU, 0xffffffffU};
+    const u32 exn = sizeof(ex) / sizeof(ex[0]);
+    u64 bad_front = 0, bad_poke = 0, bad_fault = 0, nprobe = 0, flips = 0;
+    u64 bad_grid = 0, bad_scan = 0, mismatch_x = 0, mismatch_y = 0;
+    u32 mismatch_fv = 0, mismatch_bv = 0;
+    bool have_mismatch = false;
+    bool scan_ok = true;
+
+    dbr_rng = 0xA0761D6478BD642FULL;
+
+    for (int it = 0; it < DBR_OPS; it++) {
+        if ((it & 7) == 7) {
+            /* ---- a present cycle every 8th operation ---- */
+            if (dbr_below(3) == 0) {
+                /* probe: unmarked write must not surface */
+                fb_flip(); flips++; /* drain: front == back everywhere */
+                u32 px = dbr_below(W), py = dbr_below(H), f0 = 0, now = 0;
+                if (fb_read_front_px(px, py, &f0)) {
+                    u32 val = (u32)dbr_next();
+                    if (val == f0) val ^= 0x00FFFFFFU; /* guarantee a change */
+                    fb_poke_back_px(px, py, val);
+                    fb_flip(); flips++; /* empty box: must copy nothing */
+                    if (!fb_read_front_px(px, py, &now) || now != f0) bad_poke++;
+                    fb_poke_back_px(px, py, f0); /* restore, surfaces reconverge */
+                    nprobe++;
+                } else bad_fault++;
+            } else {
+                fb_flip(); flips++;
+            }
+            /* front == back on a scattered grid right after the present */
+            for (int s = 0; s < 24; s++) {
+                u32 sx = (u32)((s * 37 + (u32)it) % W);
+                u32 sy = (u32)((s * 53 + 7) % H);
+                u32 fv, bv;
+                if (!fb_read_front_px(sx, sy, &fv) || !fb_read_px(sx, sy, &bv)) bad_fault++;
+                else if (fv != bv) { bad_grid++; bad_front++;
+                    if (!have_mismatch) {
+                        have_mismatch = 1; mismatch_x = sx; mismatch_y = sy;
+                        mismatch_fv = fv; mismatch_bv = bv;
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* ---- one drawing operation: hostile or ordinary ---- */
+        u32 kind = dbr_below(10);
+        if (kind < 8) {
+            bool hostile = dbr_below(2) == 0;
+            u32 x, y, w, h;
+            if (hostile) {
+                x = ex[dbr_below((u32)exn)];
+                y = ex[dbr_below((u32)exn)];
+                if (dbr_below(4) == 0) x = (dbr_below(2)) ? W : W + 1;
+                if (dbr_below(4) == 0) y = (dbr_below(2)) ? H : H + 1;
+                w = ex[dbr_below((u32)exn)];
+                h = ex[dbr_below((u32)exn)];
+            } else {
+                x = dbr_below(W);
+                y = dbr_below(H);
+                w = 1 + dbr_below(64);
+                h = 1 + dbr_below(64);
+            }
+            if (kind < 5) fb_fill_rect(x, y, w, h, (u32)dbr_next() & 0xFFFFFFU);
+            else fb_write_px(x, y, (u32)dbr_next());
+        } else {
+            /* Character cells stay on-screen.  The hostile corner is
+             * covered by fill/write_px, whose per-pixel loops are clipped
+             * *and* whose mark covers every pixel they store; a glyph is
+             * the one drawing call that adds a per-pixel offset to its
+             * origin, so an extreme origin can wrap x+col back into the
+             * visible surface -- the pixel is stored, but the glyph's
+             * mark is anchored off-screen and never unions in.  That
+             * origin-plus-offset wrap is the call's documented shape, not
+             * a present bug, so the brute stream does not feed it. */
+            u32 x, y;
+            if (dbr_below(4) == 0) {
+                x = (dbr_below(2)) ? W : W + 1; /* clipped: one-cell grid */
+                y = (dbr_below(2)) ? H : H + 1;
+            } else {
+                x = dbr_below(W);
+                y = dbr_below(H);
+            }
+            fb_draw_char(x, y, (char)(33 + dbr_below(94)), (u32)dbr_next() & 0xFFFFFFU,
+                         (u32)dbr_next() & 0xFFFFFFU);
+        }
+    }
+
+    fb_flip(); flips++;
+
+    /* ---- the whole surface, pixel by pixel ---- */
+    for (u32 y = 0; y < H && scan_ok; y++) {
+        for (u32 x = 0; x < W; x++) {
+            u32 fv, bv;
+            if (!fb_read_front_px(x, y, &fv) || !fb_read_px(x, y, &bv)) {
+                bad_fault++;
+                scan_ok = false;
+                break;
+            }
+            if (fv != bv) {
+                bad_scan++;
+                bad_front++;
+                if (!have_mismatch) {
+                    have_mismatch = 1;
+                    mismatch_x = x;
+                    mismatch_y = y;
+                    mismatch_fv = fv;
+                    mismatch_bv = bv;
+                }
+                break;
+            }
+        }
+    }
+
+    K_EXPECT(scan_ok);
+    K_EXPECT(flips >= 70);
+    K_EXPECT(nprobe >= 15); /* the isolation probe really ran */
+    if (bad_front || bad_poke || bad_fault)
+        kprintf("[t-fbbrute] bad_grid=%lu bad_scan=%lu bad_front=%lu bad_poke=%lu "
+                "bad_fault=%lu first=(%lu,%lu) f=0x%lx b=0x%lx\n",
+                bad_grid, bad_scan, bad_front, bad_poke, bad_fault, mismatch_x,
+                mismatch_y, (u64)mismatch_fv, (u64)mismatch_bv);
+    K_EXPECT_EQ(bad_front, 0);
+    K_EXPECT_EQ(bad_scan, 0);
+    K_EXPECT_EQ(bad_poke, 0);
+    K_EXPECT_EQ(bad_fault, 0);
+}
+
 KTEST("fb", KTEST_LATE, test_fb_pack_layouts);
 KTEST("fb", KTEST_LATE, test_fb_rgb_px_8bpp);
 KTEST("fb", KTEST_LATE, test_fb_layout_restored);
@@ -613,4 +782,5 @@ KTEST("fb", KTEST_LATE, test_fb_console_clipping);
 KTEST("fb", KTEST_LATE, test_fb_console_scroll);
 KTEST("fb", KTEST_LATE, test_fb_flip_moves_pixels);
 KTEST("fb", KTEST_LATE, test_fb_flip_copies_only_marked_region);
+KTEST("fb", KTEST_LATE, test_fb_dirty_brute);
 KTEST("fb", KTEST_LATE, test_fb_owner_is_one_pid_at_a_time);

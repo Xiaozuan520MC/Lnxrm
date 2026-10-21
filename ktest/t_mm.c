@@ -270,7 +270,93 @@ static void test_vmm_count_user_pages(void)
     K_EXPECT_EQ(pmm_free_bytes(), before);
 }
 
+/* Brute force for the buddy: a fixed-seed pseudo-random stream of
+ * alloc/free pairs across orders 0..9 (4 KiB .. 2 MiB), checking on every
+ * step the three properties the hand-picked cases prove only for a few
+ * sizes -- alignment to the requested order, mutual exclusion of live
+ * frames, and free-byte accounting that tracks the live set exactly.
+ * Violations are counted, not raised, so 1500 iterations print at most a
+ * handful of lines.  Live bytes are capped under the machine's free pool
+ * so an exhausted buddy reads as bad_fail (a bug at this load), never as
+ * a false alarm.  The stream must return pmm_free_bytes() to the byte. (2026-10-20) */
+#define CHURN_ITERS 1500
+#define CHURN_LIVE  48
+#define CHURN_BYTES (48ULL << 20)
+
+static u64 churn_rng;
+
+static u64 churn_next(void)
+{
+    u64 x = churn_rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    churn_rng = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+static u32 churn_below(u32 n) { return (u32)(churn_next() % n); }
+
+static void test_pmm_random_churn(void)
+{
+    struct {
+        u64 pa;
+        u32 order;
+    } live[CHURN_LIVE];
+    int nlive = 0;
+    u64 live_bytes = 0, nalloc = 0;
+    u64 bad_align = 0, bad_alias = 0, bad_acct = 0, bad_fail = 0;
+    u64 snap = pmm_free_bytes();
+    u64 expected = snap;
+
+    churn_rng = 0x9E3779B97F4A7C15ULL ^ 0x51ED270BF5AE3B19ULL;
+
+    for (int it = 0; it < CHURN_ITERS; it++) {
+        bool take = nlive == 0 || (nlive < CHURN_LIVE && churn_below(100) < 60);
+        if (take) {
+            u32 order = churn_below(10);
+            u64 sz = 1UL << (12 + order);
+            /* keep the live set comfortably below the free pool: the
+             * accounting below must fail only for real bugs */
+            if (live_bytes + sz > CHURN_BYTES) { order = 0; sz = PAGE_SIZE; }
+            u64 pa = pmm_alloc_order(order);
+            if (!pa) {
+                if (expected >= sz) bad_fail++;
+                continue;
+            }
+            nalloc++;
+            if (pa & ((1UL << (12 + order)) - 1)) bad_align++;
+            for (int i = 0; i < nlive; i++) {
+                u64 osz = 1UL << (12 + live[i].order);
+                if (pa < live[i].pa + osz && live[i].pa < pa + sz) bad_alias++;
+            }
+            live[nlive].pa = pa;
+            live[nlive].order = order;
+            nlive++;
+            live_bytes += sz;
+            expected -= sz;
+        } else if (nlive) {
+            u32 pick = churn_below((u32)nlive);
+            u64 sz = 1UL << (12 + live[pick].order);
+            pmm_free_order(live[pick].pa, live[pick].order);
+            live_bytes -= sz;
+            expected += sz;
+            live[pick] = live[--nlive];
+        }
+        if (pmm_free_bytes() != expected) bad_acct++;
+    }
+
+    for (int i = 0; i < nlive; i++) pmm_free_order(live[i].pa, live[i].order);
+
+    K_EXPECT_EQ(pmm_free_bytes(), snap); /* back to the byte: no leak */
+    K_EXPECT_EQ(bad_align, 0);
+    K_EXPECT_EQ(bad_alias, 0);
+    K_EXPECT_EQ(bad_acct, 0);
+    K_EXPECT_EQ(bad_fail, 0);
+    K_EXPECT(nalloc > 500); /* the stream actually churned */
+}
+
 KTEST("pmm", KTEST_MM, test_pmm_buddy_accounting);
+KTEST("pmm", KTEST_MM, test_pmm_random_churn);
 KTEST("pmm", KTEST_MM, test_pmm_high_alias);
 KTEST("kheap", KTEST_MM, test_kheap_alloc_free);
 KTEST("kheap", KTEST_MM, test_kheap_distinct_blocks);

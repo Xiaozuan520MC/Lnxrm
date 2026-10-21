@@ -117,9 +117,97 @@ static void test_cr4_smap_on(void)
     K_EXPECT(g_smap);
 }
 
+/* The IDT, gate by gate.  isr_common() dispatches whatever vector the CPU
+ * delivers; a gate that is missing, mistyped, IST-carrying or open to
+ * ring 3 sends the fault it should catch somewhere else instead.  This
+ * walks all 256 entries as sidt reads them back and pins the whole shape
+ * idt_init() promises: present 64-bit interrupt gates on kernel CS, IST 0
+ * everywhere (no fault stack exists -- GAP 3.4), DPL 3 on exactly the two
+ * user-entry vectors, and the stub every vector must target. (2026-10-20) */
+struct idt_gate16 {
+    u16 off_lo;
+    u16 sel;
+    u8 ist;
+    u8 type;
+    u16 off_mid;
+    u32 off_hi;
+    u32 zero;
+} __attribute__((packed));
+struct idtr16 {
+    u16 limit;
+    u64 base;
+} __attribute__((packed));
+
+extern u64 isr_stub_table[]; /* entry64.S: stubs for vectors 0..48 */
+
+static void test_idt_gate_table(void)
+{
+    struct idtr16 idtr;
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+
+    /* 256 gates x 16 bytes - 1: a shorter limit means delivery of a high
+     * vector would run off the end of the table */
+    K_EXPECT_EQ(idtr.limit, 256 * 16 - 1);
+    K_EXPECT(idtr.base != 0);
+
+    const struct idt_gate16 *g = (const struct idt_gate16 *)idtr.base;
+    u32 bad_present = 0, bad_type = 0, bad_sel = 0, bad_ist = 0;
+    u32 bad_canon = 0, bad_stub = 0, bad_dpl = 0;
+    u64 ipi_off[3] = {0, 0, 0};
+
+    for (int v = 0; v < 256; v++) {
+        u64 off = (u64)g[v].off_lo | ((u64)g[v].off_mid << 16) | ((u64)g[v].off_hi << 32);
+
+        if (!(g[v].type & 0x80)) { bad_present++; continue; } /* P must be set */
+        if ((g[v].type & 0x1F) != 0x0E) bad_type++;           /* 64-bit interrupt gate */
+        if (g[v].zero != 0) bad_type++;                        /* packed pad dword */
+        if (g[v].sel != 0x08) bad_sel++;                       /* kernel CS */
+        if (g[v].ist != 0) bad_ist++;                          /* no IST configured anywhere */
+        if ((i64)off >> 47 != -1) bad_canon++;                 /* kernel-half target */
+
+        /* DPL: ring 3 only on int 0x30 (48) and int 0x80 (128) */
+        u32 dpl = (g[v].type >> 5) & 3;
+        u32 dpl_want = (v == 48 || v == 128) ? 3 : 0;
+        if (dpl != dpl_want) bad_dpl++;
+
+        /* which stub this gate must target */
+        u64 want;
+        if (v <= 48) want = isr_stub_table[v];
+        else if (v == 128) want = isr_stub_table[48]; /* 0x80 lands on the syscall stub */
+        else if (v >= 0xF0 && v <= 0xF2) continue;    /* IPI: own stubs, checked below */
+        else want = isr_stub_table[19];               /* spurious vectors -> catch-all */
+        if (off != want) bad_stub++;
+    }
+
+    /* the three IPI gates must exist and override the catch-all */
+    for (int i = 0; i < 3; i++) {
+        int v = 0xF0 + i;
+        ipi_off[i] = (u64)g[v].off_lo | ((u64)g[v].off_mid << 16) | ((u64)g[v].off_hi << 32);
+        K_EXPECT(ipi_off[i] != isr_stub_table[19]);
+        K_EXPECT((g[v].type & 0x80) != 0);
+    }
+    K_EXPECT(ipi_off[0] != ipi_off[1] && ipi_off[1] != ipi_off[2]);
+
+    K_EXPECT_EQ(bad_present, 0);
+    K_EXPECT_EQ(bad_type, 0);
+    K_EXPECT_EQ(bad_sel, 0);
+    K_EXPECT_EQ(bad_ist, 0);
+    K_EXPECT_EQ(bad_canon, 0);
+    K_EXPECT_EQ(bad_stub, 0);
+    K_EXPECT_EQ(bad_dpl, 0);
+
+    /* the four vectors worth naming out loud: #DE and #PF are ring 0
+     * only, the two syscall entries are ring 3 */
+    K_EXPECT_EQ(g[0].type & 0x60, 0);    /* #DE  */
+    K_EXPECT_EQ(g[14].type & 0x60, 0);   /* #PF  */
+    K_EXPECT_EQ(g[48].type & 0x60, 0x60);  /* int 0x30 */
+    K_EXPECT_EQ(g[128].type & 0x60, 0x60); /* int 0x80 */
+}
+
 KTEST("lock", KTEST_EARLY, test_spinlock_irqsave);
 KTEST("cpu", KTEST_EARLY, test_tsc_advances);
 KTEST("cpu", KTEST_EARLY, test_kernel_text_range);
 KTEST("cpu", KTEST_EARLY, test_cr0_wp_on);
+KTEST("cpu", KTEST_EARLY, test_idt_gate_table);
 KTEST("cpu", KTEST_MM, test_cr4_smep_on);
 KTEST("cpu", KTEST_MM, test_cr4_smap_on);

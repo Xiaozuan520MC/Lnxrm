@@ -120,8 +120,6 @@ help:
 	@echo make usr
 	@echo make run
 	@echo make smoke
-	@echo make KTEST=1
-	@echo make initramfs
 	@echo make imageiso
 	@echo make INITRAMFS=build/initramfs.cpio
 

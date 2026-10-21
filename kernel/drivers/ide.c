@@ -33,6 +33,24 @@
 #define IDE_MAX_CHUNK 256
 #define IDE_CMD_IDENTIFY 0xEC
 
+/* Polling budgets, counted in port reads (there is no timer this early).
+ *
+ * IDE_PROBE_ITERS: the boot-time presence probe.  A port with no drive
+ * answers 0x00/0xFF forever, so the probe must give up quickly or every
+ * diskless boot stalls for seconds; a live drive answers immediately.
+ *
+ * IDE_POLL_ITERS: every wait on a drive we already know exists.  BSY may be
+ * held as long as the medium takes to commit a sector, and QEMU's IDE runs
+ * in the vCPU thread: a synchronous pwrite() into a host filesystem under
+ * writeback pressure blocks the guest for tens of milliseconds, which the
+ * old 100000-read budget (~10 ms at TCG port-I/O speed) turned into a
+ * spurious EIO in the middle of a sustained fill -- the command was never
+ * issued, so the sector was silently dropped and the caller saw a dead
+ * journal.  The budget is still finite: a wedged controller gives up in a
+ * couple of seconds of guest time instead of hanging the boot. (2026-10-21) */
+#define IDE_PROBE_ITERS 100000
+#define IDE_POLL_ITERS  20000000
+
 static int ide_wait_ready(int mask, int timeout)
 {
     for (int i = 0; i < timeout; i++) {
@@ -42,9 +60,9 @@ static int ide_wait_ready(int mask, int timeout)
     return LNXRM_EFAIL;
 }
 
-static int ide_wait_drq(void)
+static int ide_wait_drq(int timeout)
 {
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < timeout; i++) {
         u8 s = inb(IDE_STATUS);
         if (s & IDE_SR_ERR) return LNXRM_EFAIL;
         if (s & IDE_SR_DRQ) return 0;
@@ -60,7 +78,7 @@ static int ide_read_sectors(u64 lba, u32 n, void *buf)
      * in the log to trace it by (C53). */
     if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
     if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
-    if (ide_wait_ready(IDE_SR_DRDY, 100000)) return LNXRM_EFAIL;
+    if (ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS)) return LNXRM_EFAIL;
 
     outb(IDE_SECCOUNT, (u8)n); /* n == 256 encodes as 0, which ATA reads as 256 */
     outb(IDE_LBA_LO, (u8)(lba));
@@ -74,7 +92,7 @@ static int ide_read_sectors(u64 lba, u32 n, void *buf)
         /* One DRQ per sector, not one per command: the drive raises DRQ as
          * each sector becomes ready, so waiting only before the first would
          * race every sector after it. */
-        if (ide_wait_drq()) return LNXRM_EFAIL;
+        if (ide_wait_drq(IDE_POLL_ITERS)) return LNXRM_EFAIL;
         for (int i = 0; i < 256; i++) p[i] = inw(IDE_DATA);
         p += 256;
     }
@@ -86,7 +104,7 @@ static int ide_write_sectors(u64 lba, u32 n, const void *buf)
     /* Same ceiling as the read path. */
     if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
     if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
-    if (ide_wait_ready(IDE_SR_DRDY, 100000)) return LNXRM_EFAIL;
+    if (ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS)) return LNXRM_EFAIL;
 
     outb(IDE_SECCOUNT, (u8)n);
     outb(IDE_LBA_LO, (u8)(lba));
@@ -100,13 +118,13 @@ static int ide_write_sectors(u64 lba, u32 n, const void *buf)
         /* The device takes the data one sector at a time and re-asserts DRQ
          * between them; writing the next 256 words without that wait would
          * overrun a device that is still flushing the previous one. */
-        if (ide_wait_drq()) return LNXRM_EFAIL;
+        if (ide_wait_drq(IDE_POLL_ITERS)) return LNXRM_EFAIL;
         for (int i = 0; i < 256; i++) outw(IDE_DATA, p[i]);
         p += 256;
     }
 
     /* flush */
-    ide_wait_ready(IDE_SR_DRDY, 100000);
+    ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS);
     return 0;
 }
 
@@ -187,7 +205,7 @@ void ide_init(void)
         return;
     }
 
-    if (ide_wait_ready(IDE_SR_DRDY, 100000)) {
+    if (ide_wait_ready(IDE_SR_DRDY, IDE_PROBE_ITERS)) {
         kprintf("[ide] primary channel not ready\n");
         return;
     }
@@ -200,7 +218,7 @@ void ide_init(void)
      * 256-word read running against an idle data port, which answers 0xFFFF.
      * ident[60..61] then read as FFFFFFFFh, blk_register() published it, and
      * the console showed 2097151 -- that is where the number came from (C54). */
-    if (ide_wait_drq()) {
+    if (ide_wait_drq(IDE_PROBE_ITERS)) {
         kprintf("[ide] IDENTIFY rejected (status=%02x)\n", inb(IDE_STATUS));
         return;
     }

@@ -319,6 +319,13 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
             *d64++ = *s64++;
             n -= 8;
         }
+        /* The byte pointers must follow the wide loop, not the prologue:
+         * d64/s64 moved on while d/s stood still, and the tail below would
+         * then re-copy already-copied bytes from the wrong offset and leave
+         * the last (n % 8) bytes of the row -- the box's right edge --
+         * stale.  (2026-10-21) */
+        d = (volatile u8 *)(void *)d64;
+        s = (const volatile u8 *)(const void *)s64;
     }
     while (n--)
         *d++ = *s++;

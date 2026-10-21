@@ -7,7 +7,7 @@
 >
 > 已核对的基线：系统调用 33 个（0–32 连续无空洞），其中图形 6 个
 > （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)）；
-> ktest 87 cases / 1651 checks（2 skipped）；`make smoke` 179/179；`make` 零警告。
+> ktest 93 cases / 1827 checks（2 skipped）；`make smoke` 179/179；`make` 零警告。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文**只收仍然开放的条目**，
 > 不重排编号；半修的条目在「后果」列注明现状；已关闭的缺陷不复述。
@@ -33,7 +33,7 @@
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
 | 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
 | 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 87/1651（含属性测试、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 179/179（`-smp 1` / `-smp 2` / x2apic 三档）；无 CI、无宿主侧单测与 sanitizer |
+| 测试 | 3 | ktest 93/1827（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 179/179（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -52,7 +52,7 @@
 | C7 | `kernel/fs/blk_cache.c`（`cache_lock`）+ `include/fat32_priv.h` `FAT_ENTER()` | 缓存锁与 `fat_fs_lock` 两层 irqsave 嵌套且跨越设备 I/O：任一 CPU 碰缓存或文件系统就关中断自旋，慢盘把等待放大到全机 | 元数据与 I/O 分离（取条目 → 解锁 → I/O → 重新加锁回写），约 2 天 |
 | C10 | `include/sys/vfs.h` `struct blkdev`；`ide.c` / `ahci.c` 设备锁 | 块设备只有全局锁，无请求队列、无合并、无取消：并发磁盘访问完全串行且不可中断 | 多 slot 请求队列 + 每设备锁，约 300 行 |
 | C62 | `kernel/sched.c` `runqueue_add`（插队首）、`include/sys/percpu.h` | 队列是 push-front（注释已如实描述为 LIFO），持续争用下短任务可能被长队列饿死；无亲和性 API | 队尾指针 + 尾插 + 公平性用例，约 20 行 |
-| P0-2 / C64 | `usr/init.c:47,50`；`kernel/task.c:360` | init 只 `waitpid` 一次后永久睡眠：孤儿僵尸永久占 64 槽，槽满后全系统 `fork` 失败；pid 1 先退出时孤儿 `parent_pid` 置 0，同样无人收 | init 循环收尸 + 退出路径的兜底重挂载，约 10 行 |
+| P0-2 / C64 | `usr/init.c:47,50`；`kernel/task.c:369` | init 只 `waitpid` 一次后永久睡眠：孤儿僵尸永久占 64 槽，槽满后全系统 `fork` 失败；pid 1 先退出时孤儿 `parent_pid` 置 0，同样无人收 | init 循环收尸 + 退出路径的兜底重挂载，约 10 行 |
 
 ### 2.2 存储与文件系统
 
@@ -60,12 +60,12 @@
 |---|---|---|---|
 | C16 | `kernel/fs/fat32/fat32_file.c:107` | `u32 nclus` 截断 u64 需求簇数。**半修**：文件大小已按实际写入字节（`done`）发布，少分配时写提前停止，但分配数仍是 32 位算术 | 改 u64 + 上界检查，半天 |
 | C17 | `kernel/fs/fat32/fat32_dir.c:38-52,56` | `lfn_state` 只清 3 个字段，256 字节 `longname` 残留栈垃圾；LFN 序号有洞时按 `name_end` 整段拷出，未初始化字节经 `getdent` 进入用户态；读路径不校验 LFN 校验和与序号连续性 | `lfn_reset` 整体清零 + 校验 checksum/序号，约 40 行 |
-| C19 | `kernel/fs/vfs.c:213` → `fat32_file.c:152` | `O_TRUNC` 只把内存里的 `filesize` 置 0 就返回：磁盘目录项仍是旧大小、簇链不释放，重新打开还是老内容 | truncate 真正释放簇并写回 dirent（进 journal），约 1 天 |
+| C19 | `kernel/fs/vfs.c:214` → `fat32_file.c:152` | `O_TRUNC` 只把内存里的 `filesize` 置 0 就返回：磁盘目录项仍是旧大小、簇链不释放，重新打开还是老内容 | truncate 真正释放簇并写回 dirent（进 journal），约 1 天 |
 | C20 | `kernel/fs/fat32/fat32_file.c:213-265` | 写完在父目录里找不到对应 dirent（例如写期间文件被 unlink）会落到 `done_write` 返回成功：新簇成孤儿，元数据与数据不一致 | 未匹配即回 `EIO` 并回滚，约 1 天 |
 | C21 | `kernel/fs/fat32/fat32_file.c:249`；`fat32_dir.c:139` | 写回只按 11 字节 8.3 别名匹配：两个 LFN 同短名时，大小与首簇会写到别的文件 | 匹配改为目录簇 + 槽位定位，约 1 天 |
 | C23 | `kernel/fs/fat32/fat32_meta.c:54` vs `:230` | 两套"可用槽"判定不一致（一个认 0x00/0x05/0xE5，一个把 0x05 当活记录断开 run），可能重叠写槽；且两条路径都不扩展目录链 —— 目录写满即 `ENOSPC` | 统一槽判定 + 目录链扩展，约 2 天 |
 | C27 | `kernel/fs/blk_cache.c`（全文件） | 无周期回写、无 exit/panic 同步、无 `fsync`/`sync` 系统调用：崩溃时最多丢 64 扇区（32 KiB）脏数据；journal 只保证自己那条提交点上的元数据 | 定时 + close/panic 回写、新增 `SYS_sync`，约 100 行 |
-| C28 | `kernel/fs/vfs.c:635`；`kernel/fs/mbr.c` | 分区设备从不 `blk_register`，`diskinfo` 看不到分区；`blk_count` 满 8 之后新设备进不了 `blk_list` 却仍会顶掉 `blk_first` | 分区注册 + 满槽一致处理，约 1 天 |
+| C28 | `kernel/fs/vfs.c:660`；`kernel/fs/mbr.c` | 分区设备从不 `blk_register`，`diskinfo` 看不到分区；`blk_count` 满 8 之后新设备进不了 `blk_list` 却仍会顶掉 `blk_first` | 分区注册 + 满槽一致处理，约 1 天 |
 | C29 | `fat32_meta.c` / `fat32_file.c` 多处 `u8 buf[512]` | 按 `bytes_per_sector` 索引 512 字节栈缓冲：`bps > 512` 即栈溢出；守卫在挂载层（`fat32.c:329` 要求 `bps == dev->sector_size` 且 `<= 4096`），不变量守在错误的层 | 缓冲改 `kmalloc`，或驱动层强制 512 并在挂载层拒绝，约 1 天 |
 | C30 | `kernel/fs/fat32/fat32_dir.c:230-245` | 每次 getdent 都从目录首簇重扫（cookie 只存条目索引）：`ls` 是 O(n²) 磁盘读 | cookie 改为簇 + 偏移游标，约 1 天 |
 | C31 | `kernel/fs/fat32/fat32_dir.c:39` | `longname[256]` 小于 LFN 上限 260 字符：247+ 字符文件名被静默截断 | 缓冲扩到 261 字节并处理末字符，几行 |
@@ -81,11 +81,11 @@
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
-| C40 | `kernel/fs/vfs.c:250-259,510-513` | 每次 open 普通文件都 `kmalloc` 一份 vnode 拷贝，而 `reg_fops.close = noop_close` 不释放：约 48 字节/次永久泄漏 | close 时释放，或改为共享 vnode + 引用计数，2 小时 |
-| C41 | `kernel/fs/vfs.c:452-467` | `reg_read` / `reg_write` 不看 `f->flags`：`O_RDONLY` 打开的文件照样可写；`O_APPEND` 完全未实现 | 按 flags 拒绝或追加，约 1 天 |
-| C43 | `kernel/fs/vfs.c:292-297` | `vfs_close_file` 对 refcnt 没有下溢保护，完全依赖 `sys_close` 先清 fd 槽这条调用序 | 饱和判断 + 断言，几行 |
-| C44 | `kernel/fs/vfs.c:442-449` | `sys_getdent` 只钳制上界，`len` 小于单条 dirent 时 `dir_getdent` 返回 0：调用方忙等死循环 | 小于单条即回 `EINVAL`，几行 |
-| C47 | `kernel/fs/vfs.c:19,44-97,674` | 挂载表只注册过一个 `"/"`，`fs_for_path` 的"无前导斜杠"分支不可达：多挂载与卸载路径从未运行 | 第二挂载点 + `umount` + 用例，约 1 天 |
+| C40 | `kernel/fs/vfs.c:251-260,521-524` | 每次 open 普通文件都 `kmalloc` 一份 vnode 拷贝，而 `reg_fops.close = noop_close` 不释放：约 48 字节/次永久泄漏 | close 时释放，或改为共享 vnode + 引用计数，2 小时 |
+| C41 | `kernel/fs/vfs.c:463-478` | `reg_read` / `reg_write` 不看 `f->flags`：`O_RDONLY` 打开的文件照样可写；`O_APPEND` 完全未实现 | 按 flags 拒绝或追加，约 1 天 |
+| C43 | `kernel/fs/vfs.c:293-298` | `vfs_close_file` 对 refcnt 没有下溢保护，完全依赖 `sys_close` 先清 fd 槽这条调用序 | 饱和判断 + 断言，几行 |
+| C44 | `kernel/fs/vfs.c:449-456` | `sys_getdent` 只钳制上界，`len` 小于单条 dirent 时 `dir_getdent` 返回 0：调用方忙等死循环 | 小于单条即回 `EINVAL`，几行 |
+| C47 | `kernel/fs/vfs.c:19,45-98,704` | 挂载表只注册过一个 `"/"`，`fs_for_path` 的"无前导斜杠"分支不可达：多挂载与卸载路径从未运行 | 第二挂载点 + `umount` + 用例，约 1 天 |
 
 ### 2.4 设备驱动
 
@@ -94,7 +94,7 @@
 | C49 | `kernel/drivers/ahci.c`（`GHC_ARE`，无 `GHC_IE` / MSI / ISR） | AHCI 纯轮询：每条命令在 irqsave 锁里自旋等完成，多核下与 C7 相互放大 | 中断路径（`P_IE`、`HBA.IS` 排空、ISR）约 1 周；或把 AHCI 标为实验性、默认只走 IDE，约 1 小时 |
 | C51 | `kernel/drivers/ahci.c:694-716,959` | **半修**：ABAR 已映射 8 KiB、容量读不出即拒绝注册；仍未校验 BAR 类型（假定 64-bit memory BAR）、不拒 `abar == 0`，且第一块盘注册后 `return 1` —— 多盘只认一块、盘名硬编码 `sda` | BAR/`abar` 校验 + 多盘注册，约 1 天 |
 | C53 | `kernel/drivers/ide.c` | **半修**：容量按 48 位 IDENTIFY 读、LBA28 超界回 `EFAIL`；`READ/WRITE SECTORS EXT`(0x24/0x25) 未实现，>128 GiB 盘仍读不到 | 补 EXT 命令路径，约 1 天 |
-| C55 | `kernel/drivers/ide.c:36-43,106-112` | 写路径的"flush"只等 DRDY：不发 `0xE7` CACHE FLUSH 且忽略返回值，断电时盘内写缓存可能丢失；`ide_wait_ready` 仍不判 `IDE_SR_ERR`（有意保留：发命令前判错会把上一条的 ERR 变成死等，错误已由命令后的 `ide_wait_drq` 兜住） | 写后发 `0xE7` 并检查返回，约 30 行 |
+| C55 | `kernel/drivers/ide.c:54-61,126-127` | 写路径的"flush"只等 DRDY：不发 `0xE7` CACHE FLUSH 且忽略返回值，断电时盘内写缓存可能丢失；`ide_wait_ready` 仍不判 `IDE_SR_ERR`（有意保留：发命令前判错会把上一条的 ERR 变成死等，错误已由命令后的 `ide_wait_drq` 兜住） | 写后发 `0xE7` 并检查返回，约 30 行 |
 | C56 | `kernel/drivers/pci.c`（文件头注释、`:37-38`） | **半修**：visited 位图 + `PROBE_MAX_DEPTH 16` 已加；`0xCF8/0xCFC` 对所有总线拼同一 type-1 地址，而该机制只对 bus 0 有架构保证；文件头注释仍写"既无 visited 也无深度限制"，与紧邻的实现矛盾 | 按总线选择配置机制 + 改注释，半天 |
 
 ### 2.5 内存
@@ -118,7 +118,7 @@
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
-| OBS-1 | `ktest/t_cache.c` `test_write_readback_is_coherent`；`usr/sh` | 各出现过一次失败（3 条断言挂并伴随 FAT/dir `I/O error`；用户态一次性 `#UD`），重跑通过、根因未定位；门控每轮只跑一次，可能漏报抖动 | 连跑 N 次的抖动门 + 失败时保存串口现场，约 1 天 |
+| OBS-1 | `ktest/t_cache.c` `test_write_readback_is_coherent`；`usr/sh`；2026-10-21 一次连跑 | 历史各出现一次失败（伴随 FAT/dir `I/O error`；用户态一次性 `#UD`），重跑通过。其中 I/O 类的常见根因已定位并修掉：IDE 轮询预算（旧 10 万次 port read）短于 QEMU 在 vCPU 线程同步落宿主盘时的 BSY 保持，正常命令被判 EIO（改 `IDE_POLL_ITERS`，旧预算 A/B 必现）；修后连跑 16/17 全绿，余 1 次（3 用例 5 断言，伴 fs 用例整段 skip）未复现；`#UD` 仍未复现 | 连跑 N 次的抖动门 + 失败时保存串口现场，约 1 天 |
 
 ---
 

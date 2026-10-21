@@ -39,6 +39,7 @@ int fat_dir_iter(struct dir_iter *it, struct dirent_out *d);
 int copy_from_user(void *, const void *, size_t);
 int copy_to_user(void *, const void *, size_t);
 bool user_ptr_ok(u64 p, u64 n);
+bool user_ptr_writable(u64 p, u64 n);
 
 /* ---------------- routing ---------------- */
 static struct fs_ops *fs_for_path(const char **path)
@@ -424,6 +425,12 @@ long sys_read(int fd, void *ubuf, size_t n)
      * tasks and broke under concurrent reads (SMP + preemption). */
     char kbuf[4096];
     if (n > sizeof(kbuf)) n = sizeof(kbuf);
+    /* Validate the whole (clamped) destination BEFORE reading: a bad
+     * pointer must fail without consuming the file position.  The old
+     * order read first and copied after, so read(fd, bad, 16) answered
+     * EFAULT having already skipped 16 bytes -- data lost on a typo.
+     * (2026-10-20) */
+    if (n && !user_ptr_writable((u64)ubuf, n)) return LNXRM_EFAULT;
     long r = f->ops->read(f, kbuf, n);
     if (r > 0 && copy_to_user(ubuf, kbuf, r) < 0) return LNXRM_EFAULT;
     return r;
@@ -445,6 +452,10 @@ long sys_getdent(int fd, void *ubuf, size_t len)
     if (!f || !f->is_dir) return LNXRM_EBADF;
     char kbuf[1024];
     if (len > sizeof(kbuf)) len = sizeof(kbuf);
+    /* Same rule as sys_read, for the directory cookie instead of a file
+     * offset: the destination is validated before the iterator moves, so
+     * a bad pointer cannot eat a directory entry. (2026-10-20) */
+    if (len && !user_ptr_writable((u64)ubuf, len)) return LNXRM_EFAULT;
     long r = f->ops->getdent(f, kbuf, len);
     if (r > 0 && copy_to_user(ubuf, kbuf, r) < 0) return LNXRM_EFAULT;
     return r;
@@ -628,6 +639,20 @@ void vfs_init(void)
  * root-path assertions on a diskless boot instead of reporting them failed. */
 bool vfs_root_ready(void) { return disk_ready; }
 
+/* Is that root the on-disk FAT32 volume, as opposed to the ram-backed
+ * initramfs that also answers at "/"?  The boot self-test asks before
+ * filling the volume to provoke ENOSPC: a ramfs has no bottom to hit and
+ * filling it would walk straight into the OOM tests' territory. (2026-10-20) */
+bool vfs_root_is_fat(void)
+{
+    for (int i = 0; i < mount_count; i++) {
+        if (!mounts[i].active || mounts[i].prefix_len != 1 || mounts[i].prefix[0] != '/')
+            continue;
+        return mounts[i].ops == &fat32_ops;
+    }
+    return false;
+}
+
 struct blkdev *blk_first;
 static struct blkdev *blk_list[8];
 static int blk_count;
@@ -642,7 +667,12 @@ void blk_register(struct blkdev *b)
 
 int blk_list_all(void *ubuf, int max)
 {
+    if (max < 0) return LNXRM_EINVAL;
     int n = blk_count < max ? blk_count : max;
+    /* Validate the whole record range up front: the per-entry copy below
+     * used to answer a bad destination with the count written so far --
+     * 0, indistinguishable from "no devices registered". (2026-10-20) */
+    if (n && !user_ptr_writable((u64)ubuf, (u64)n * 28)) return LNXRM_EFAULT;
     for (int i = 0; i < n; i++) {
         struct blkdev *b = blk_list[i];
         /* pack: name[16] + sector_size(u32) + num_sectors(u64) = 28 bytes */

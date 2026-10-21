@@ -187,7 +187,7 @@ make smoke SMOKE_FLAGS="--no-build" # 复用 build/ 里现成产物
 
 - 强制 `KTEST=1`：smoke 校验的 `[ktest]` 标记只有该模式才有，`make KTEST=0 smoke` 不会把它带偏。
 - 单/双 CPU 各有独立标记集（双 CPU 要求 AP 打印 CR0/CR4、内核报 2 CPUs online；单 CPU 则反过来禁止出现 AP 行），所以**单 CPU 必须用 `--smp 1` 而不是 `--qemu-args "-smp 1"`**。
-- 完整串口记录在 `build/smoke/serial.log`（`--smp 1` 时是 `serial-smp1.log`，伪造盘的两次在 `serial-forged-*.log`），可直接核对内核自测行，如 `[ktest] selftest PASS (87 cases, 1651 checks)`。
+- 完整串口记录在 `build/smoke/serial.log`（`--smp 1` 时是 `serial-smp1.log`，伪造盘的两次在 `serial-forged-*.log`），可直接核对内核自测行，如 `[ktest] selftest PASS (93 cases, 1827 checks)`。
 - 阶段 6 用的是副本 `build/smoke/forged.img`，不碰 `build/disk.img`。
 
 手动判据（不跑 smoke 时）：串口出现 `[boot] ready in N ms` 与 `[ktest] selftest PASS`，且无 `[PANIC]`、无三重故障。
