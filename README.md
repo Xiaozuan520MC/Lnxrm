@@ -5,15 +5,14 @@ Unix 风格小系统。C/ASM 两语言，无第三方库，全程零警告构建
 
 ## 构建与运行
 
-依赖：gcc（x86_64 freestanding）、nasm、binutils、python3、qemu-system-x86_64；
-ISO 额外要 grub-mkrescue + grub-pc-bin；镜像要 dosfstools（`mkfs.vfat`）与 mtools。
+依赖：gcc、nasm、binutils、python3、qemu-system-x86_64；
+ISO 额外要 grub-mkrescue；镜像要 dosfstools（`mkfs.vfat`）与 mtools。
 
 | 命令 | 做什么 |
 |---|---|
 | `make` | 构建 `build/bzImage`（`KTEST=1 make` 为带自测的变体） |
 | `make run` | 构建用户态与磁盘镜像，QEMU 启动到 shell |
-| `make smoke` | 端到端冒烟：串口判据 + ktest + 错误注入 + `fsck.vfat -n`，失败即非零退出 |
-| `make imageiso` | 产出 GRUB ISO `build/lnxrm.iso`（真机/UEFI 走这条） |
+| `make imageiso` | 产出 GRUB ISO `build/lnxrm.iso`（真机/BIOS 走这条） |
 | `make clean` | 清理 `build/` |
 
 QEMU 参数、GRUB gfxpayload 规则与排障见 `docs/BUILD.md`。
@@ -23,7 +22,7 @@ QEMU 参数、GRUB gfxpayload 规则与排障见 `docs/BUILD.md`。
 | 文件 | 说明 |
 |---|---|
 | `build/bzImage` | 内核镜像 |
-| `build/disk.img` | FAT32 磁盘（`/boot/bzImage` + `/bin/*`） |
+| `build/disk.img` | FAT32 磁盘 /bin/ |
 | `build/lnxrm.iso` | GRUB ISO |
 | `build/smoke/serial.log` | 冒烟运行的完整串口输出 |
 
@@ -35,4 +34,3 @@ QEMU 参数、GRUB gfxpayload 规则与排障见 `docs/BUILD.md`。
 | `docs/CODEBASE.md` | 代码结构与各子系统契约 |
 | `docs/GAP_ANALYSIS.md` | 当前开放缺陷、能力差距、修复优先级 |
 
-项目暂无 LICENSE 文件（记录在 `docs/GAP_ANALYSIS.md`）。
