@@ -7,7 +7,7 @@
 >
 > 已核对的基线：系统调用 33 个（0–32 连续无空洞），其中图形 6 个
 > （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)）；
-> ktest 93 cases / 1827 checks（2 skipped）；`make smoke` 179/179；`make` 零警告。
+> ktest 94 cases / 1834 checks（2 skipped）；`make smoke` 179/179；`make` 零警告。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文**只收仍然开放的条目**，
 > 不重排编号；半修的条目在「后果」列注明现状；已关闭的缺陷不复述。
@@ -23,7 +23,7 @@
 | 引导与启动 | 4 | QEMU `-kernel` 与 GRUB `linux` 双路径、VBE 级联选型、E820 采集；缺 GRUB 路径自动化（C68）、只用单个最大 E820 区（C69）、固定物理地址与 loader 指针未校验（C66/C67/C70） |
 | 物理内存 | 3 | buddy 分配器、按进程记账（`ps` 的 MEM/PEAK）、普通用户 64 MiB 配额（`cred_mem_quota`）、管理窗口 `PMM_WINDOW_TOP` = 2 GiB；无回收、无 swap、无 OOM killer |
 | 虚拟内存 | 3 | 三槽 PML4（内核映射对新进程零成本传播）、用户页 NX、懒栈增长（`page_fault_try_fix` → `stack_grow`）；无 `mmap`/`mprotect`/COW/需求分页，内核映射不带 NX（无 W^X） |
-| 进程与信号 | 3 | `fork/execve/wait4/brk/kill`、`sigaction/sigprocmask/sigreturn`、`parent` 存 (pid, 世代) 并经 `task_parent()` 解析；init 不回收孤儿（P0-2）、无 CPU 时间限制 |
+| 进程与信号 | 3 | `fork/execve/wait4/brk/kill`、`sigaction/sigprocmask/sigreturn`、`parent` 存 (pid, 世代) 并经 `task_parent()` 解析；无 CPU 时间限制 |
 | 调度 | 3 | 每 CPU 运行队列、按空闲/队列长度的负载均衡、每 CPU 本地 LAPIC tick；队列实为 push-front LIFO（C62）、内核态不可抢占、无优先级/nice |
 | SMP | 3 | ACPI MADT 枚举 + xAPIC/x2APIC 双路访问、AP 本地时钟与共享标定；全局锁 + 轮询 I/O 使延迟敏感场景不可用 |
 | 系统调用 / ABI | 3 | 33 个编号全部实现，用户指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；缺 `mmap`/时间类/`stat`/`pipe` |
@@ -33,7 +33,7 @@
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
 | 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
 | 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 93/1827（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 179/179（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
+| 测试 | 3 | ktest 94/1834（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 179/179（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -52,7 +52,6 @@
 | C7 | `kernel/fs/blk_cache.c`（`cache_lock`）+ `include/fat32_priv.h` `FAT_ENTER()` | 缓存锁与 `fat_fs_lock` 两层 irqsave 嵌套且跨越设备 I/O：任一 CPU 碰缓存或文件系统就关中断自旋，慢盘把等待放大到全机 | 元数据与 I/O 分离（取条目 → 解锁 → I/O → 重新加锁回写），约 2 天 |
 | C10 | `include/sys/vfs.h` `struct blkdev`；`ide.c` / `ahci.c` 设备锁 | 块设备只有全局锁，无请求队列、无合并、无取消：并发磁盘访问完全串行且不可中断 | 多 slot 请求队列 + 每设备锁，约 300 行 |
 | C62 | `kernel/sched.c` `runqueue_add`（插队首）、`include/sys/percpu.h` | 队列是 push-front（注释已如实描述为 LIFO），持续争用下短任务可能被长队列饿死；无亲和性 API | 队尾指针 + 尾插 + 公平性用例，约 20 行 |
-| P0-2 / C64 | `usr/init.c:47,50`；`kernel/task.c:369` | init 只 `waitpid` 一次后永久睡眠：孤儿僵尸永久占 64 槽，槽满后全系统 `fork` 失败；pid 1 先退出时孤儿 `parent_pid` 置 0，同样无人收 | init 循环收尸 + 退出路径的兜底重挂载，约 10 行 |
 
 ### 2.2 存储与文件系统
 
@@ -238,15 +237,14 @@
 
 一行一项，按依赖顺序排列；括号内引用第 2、3 节的编号。
 
-1. 孤儿回收：init 循环 `waitpid` + 退出路径兜底重挂载（P0-2 / C64，约 10 行）——资源耗尽是现在就成立的故障。
-2. 静默数据损坏三件：`O_TRUNC` 落盘（C19）、找不到 dirent 即回 `EIO`（C20）、写回按槽位而非 8.3 别名匹配（C21），各约 1 天。
-3. 几行级止血：空文件 `write 0`（C35）、`getdent` 小缓冲忙等（C44）、vnode 泄漏（C40）、写路径访问模式（C41），合计约 2 天。
-4. 边界与校验：`bytes_per_sector` 缓冲（C29）、BPB 校验（C38）、目录游标（C30）、目录槽判定与目录增长（C23）、MBR 范围与 EBR（C36）。
-5. 锁与抢占：先 C7（锁外做 I/O），再 C10（请求队列），然后 C62/C4（RR 与队列读），最后 3.6 的内核态抢占与 syscall 关中断——每一步都要有 smoke 兜底。
-6. 验证面：smoke 矩阵化（C68：ISO、内存档位、q35+KVM、双盘）+ 连跑抖动门（OBS-1），再上 CI（3.5）。
-7. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
-8. 内核自身加固：内核 W^X、canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。
-9. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（3.3）。
-10. 驱动收口：AHCI 二选一（补 C49/C51 或标实验性），IDE LBA48（C53）与写后 flush（C55），PCI 配置机制与注释（C56）。
-11. 能力面：`mmap` 家族（3.2）→ COW 与需求分页 → `stat`/时间类 syscall（3.8）→ `pipe`（3.1）。
-12. 暂不做：新子系统、更换文件系统、POSIX 全覆盖、网络栈——上面 1–11 未落地前不加宽度。
+1. 静默数据损坏三件：`O_TRUNC` 落盘（C19）、找不到 dirent 即回 `EIO`（C20）、写回按槽位而非 8.3 别名匹配（C21），各约 1 天。
+2. 几行级止血：空文件 `write 0`（C35）、`getdent` 小缓冲忙等（C44）、vnode 泄漏（C40）、写路径访问模式（C41），合计约 2 天。
+3. 边界与校验：`bytes_per_sector` 缓冲（C29）、BPB 校验（C38）、目录游标（C30）、目录槽判定与目录增长（C23）、MBR 范围与 EBR（C36）。
+4. 锁与抢占：先 C7（锁外做 I/O），再 C10（请求队列），然后 C62/C4（RR 与队列读），最后 3.6 的内核态抢占与 syscall 关中断——每一步都要有 smoke 兜底。
+5. 验证面：smoke 矩阵化（C68：ISO、内存档位、q35+KVM、双盘）+ 连跑抖动门（OBS-1），再上 CI（3.5）。
+6. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
+7. 内核自身加固：内核 W^X、canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。
+8. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（3.3）。
+9. 驱动收口：AHCI 二选一（补 C49/C51 或标实验性），IDE LBA48（C53）与写后 flush（C55），PCI 配置机制与注释（C56）。
+10. 能力面：`mmap` 家族（3.2）→ COW 与需求分页 → `stat`/时间类 syscall（3.8）→ `pipe`（3.1）。
+11. 暂不做：新子系统、更换文件系统、POSIX 全覆盖、网络栈——上面 1–10 未落地前不加宽度。

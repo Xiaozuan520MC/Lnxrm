@@ -134,10 +134,10 @@ int fat_scan_find_cb(const char *name, const struct fat_dirent *e, u32 dirclus, 
                      void *ctx)
 {
     struct find_ctx *f = ctx;
-    (void)dirclus;
-    (void)off;
     if (!strcasecmp(name, f->want) || fat_name_eq_short(f->want, e)) {
         f->found = *e;
+        f->dirclus = dirclus;
+        f->off = off;
         return 1;
     }
     return 0;
@@ -174,6 +174,8 @@ int fat_resolve_path(struct fat_mount *m, const char *path, struct resolve *r)
         if (last) {
             r->de = fc.found;
             r->dir_cluster = cur;
+            r->ent_clus = fc.dirclus;
+            r->ent_off = fc.off;
             strncpy(r->name, comp, sizeof(r->name) - 1);
             r->found = true;
             return 1;
@@ -185,6 +187,8 @@ int fat_resolve_path(struct fat_mount *m, const char *path, struct resolve *r)
         if (!*p) { /* trailing slash: it's this dir */
             r->de = fc.found;
             r->dir_cluster = cur;
+            r->ent_clus = fc.dirclus;
+            r->ent_off = fc.off;
             r->found = true;
             strncpy(r->name, comp, sizeof(r->name) - 1);
             return 1;

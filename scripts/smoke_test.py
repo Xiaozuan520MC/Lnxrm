@@ -743,6 +743,10 @@ def build_forged_image(value_for):
     value_for(cluster) yields the 32-bit value written into FAT[cluster].
     Returns (image path, cluster) or (None, reason)."""
     img = os.path.join(SMOKE_DIR, "forged.img")
+    # The transcript directory is created by the boot phase; this phase can
+    # also run on its own (--no-build after a `make clean`), so create it
+    # here instead of dying with a bare FileNotFoundError.
+    os.makedirs(SMOKE_DIR, exist_ok=True)
     shutil.copyfile(DISK, img)
     rc, out = sh(["mmd", "-i", img, "::CYC"])
     if rc != 0:
@@ -768,6 +772,9 @@ def phase_forged_fat(report, args):
         if not (os.path.exists(BZIMAGE) and os.path.exists(DISK)):
             report.skip("forged FAT cases", "nothing to boot")
             return ph.ok
+        # The transcripts written below live next to the forged images; the
+        # directory has to exist even when the boot phase never ran.
+        os.makedirs(SMOKE_DIR, exist_ok=True)
 
         for label, value_for, warn in FORGED_CASES:
             img, info = build_forged_image(value_for)

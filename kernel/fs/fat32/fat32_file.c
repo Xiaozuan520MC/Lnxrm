@@ -101,12 +101,21 @@ int fat_read_impl(void *mnt, void *node, u64 off, void *ubuf, size_t n)
  * LNXRM_EIO when a FAT update could not reach the disk.  Either way nothing
  * half-built is published: clusters linked so far stay linked (they are
  * valid chain tail, just more of the file than was asked for) and clusters
- * whose link-up failed are leaked, never cross-linked. */
-static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc)
+ * whose link-up failed are leaked, never cross-linked.
+ * *grown tells the caller which clusters this call linked on (the first
+ * one freshly allocated -- 0 when nothing grew); *tail the cluster that
+ * used to end the existing chain (0 when the chain was fresh) and *tail_old
+ * what its FAT entry held before this call touched it.  Together they are
+ * what rollback_growth() needs to undo the extension. */
+static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc, u32 *grown,
+                       u32 *tail, u32 *tail_old)
 {
     u32 nclus = (need_bytes + m->cluster_size - 1) / m->cluster_size;
     u32 head = first, prev = 0, cnt = 0;
     *rc = 0;
+    *grown = 0;
+    *tail = 0;
+    *tail_old = 0;
 
     if (first && cluster_is_eoc(first))
         ;
@@ -118,6 +127,10 @@ static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc)
             fat_chain_advance(&ch);
             cnt++;
         }
+        /* whatever sat at the tail is what the caller restores on failure --
+         * normally the end marker, but a tail left free (its record died)
+         * belongs back at free, not marked as used-and-unclaimed */
+        if (prev) *tail_old = *(u32 *)&m->fat[prev * 4];
     } else
         cnt = 0; /* fresh chain */
 
@@ -130,6 +143,10 @@ static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc)
         if (fat_set_entry(m, nc, 0x0FFFFFFF)) {
             *rc = LNXRM_EIO;
             return 0;
+        }
+        if (!*grown) {
+            *grown = nc;
+            *tail = prev;
         }
         if (prev) {
             if (fat_set_entry(m, prev, nc)) {
@@ -144,13 +161,101 @@ static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc)
     return head;
 }
 
+/* C20: a write whose directory record could not be verified or rewritten
+ * must not leave the clusters it booked dangling behind an entry nobody
+ * re-found: put the old chain back the way alloc_chain() moved it (restore
+ * the tail's previous answer, unlink this call's growth), then return every
+ * new cluster to the free pool.  Frees, never cross-links -- a dirent that
+ * still names the old head keeps pointing at exactly the data it published.
+ * Best effort, like every other failure-path cleanup: m->fat is the
+ * authority the next allocation scan reads, and each step is reported by
+ * fat_set_entry() on its own. */
+static void rollback_growth(struct fat_mount *m, u32 grown, u32 tail, u32 tail_old)
+{
+    if (!grown) return;
+    if (tail) fat_set_entry(m, tail, tail_old);
+    struct fat_chain ch;
+    for (fat_chain_start(&ch, m, grown); fat_chain_more(&ch);) {
+        u32 clus = ch.clus;
+        fat_chain_advance(&ch); /* next hop must be read before this one is freed */
+        fat_set_entry(m, clus, 0);
+    }
+}
+
+/* C21: rewrite the record `r` resolves to exactly where it physically sits
+ * -- one direct read-modify-write at (containing cluster, byte offset),
+ * never a directory scan that two files sharing an 8.3 alias can both win.
+ * The creation stamp beyond the 11-byte alias is the incarnation check: an
+ * unlink followed by a re-create of the same name hands the position to a
+ * stranger, and a record that is no longer ours must not be rewritten.
+ * With `trunc` the record is emptied instead of carrying the new size (C19).
+ * Returns 0 or LNXRM_EIO. */
+static int dirent_writeback_at(struct fat_mount *m, const struct resolve *r, bool trunc)
+{
+    if (r->ent_clus < 2 || r->ent_off >= m->cluster_size) {
+        kprintf("[fat32] open file without a dirent position: write refused\n");
+        return LNXRM_EIO;
+    }
+    u64 lba = cluster_lba(m, r->ent_clus) + r->ent_off / m->bytes_per_sector;
+    u32 doff = r->ent_off % m->bytes_per_sector;
+    u8 buf[512];
+    if (fat_read_sector(m, lba, buf)) {
+        fat_warn_io(m, "read dir", lba);
+        return LNXRM_EIO;
+    }
+    struct fat_dirent *e = (struct fat_dirent *)(buf + doff);
+    if (!entry_used(e) || memcmp(e->name, r->de.name, 11) ||
+        e->crttime != r->de.crttime || e->crtdate != r->de.crtdate ||
+        e->crttenth != r->de.crttenth) {
+        kprintf("[fat32] record under an open file is not the one that was "
+                "resolved (renamed, unlinked or re-created), LBA %llu: write refused\n",
+                lba);
+        return LNXRM_EIO;
+    }
+    if (trunc) {
+        e->filesize = 0;
+        e->fstclushi = 0;
+        e->fstcluslo = 0;
+    } else {
+        e->filesize = r->de.filesize;
+        e->fstclushi = r->de.fstclushi;
+        e->fstcluslo = r->de.fstcluslo;
+    }
+    e->attr |= ATTR_ARCHIVE;
+    if (fat_write_sector(m, lba, buf)) {
+        fat_warn_io(m, "write dir", lba);
+        return LNXRM_EIO;
+    }
+    return 0;
+}
+
 int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
 {
     struct fat_mount *m = fat_priv;
     struct resolve *r = node;
     if (r->de.attr & ATTR_DIR) return LNXRM_EFAIL;
-    if (!buf && !n) { /* truncate request */
+    if (!buf && !n) {
+        /* C19: O_TRUNC used to zero only the in-memory copy -- the on-disk
+         * record kept its size and its chain, so a re-open found the old
+         * content still sitting in permanently allocated clusters.  Now
+         * the record on disk is emptied first and the chain is freed
+         * second -- dirent-first is unlink's own order, so a failure here
+         * can only leak clusters, never cross-link them -- all inside the
+         * transaction fat_write() opened, so a crash between the two is
+         * replayed by the journal, not split. */
+        u32 first = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
+        int rc = dirent_writeback_at(m, r, true);
+        if (rc) return rc;
+        struct fat_chain ch;
+        for (fat_chain_start(&ch, m, first); fat_chain_more(&ch);) {
+            u32 clus = ch.clus;
+            fat_chain_advance(&ch); /* next hop must be read before this one is freed */
+            if (fat_set_entry(m, clus, 0))
+                return LNXRM_EIO; /* record already emptied: clusters leak */
+        }
         r->de.filesize = 0;
+        r->de.fstclushi = 0;
+        r->de.fstcluslo = 0;
         return 0;
     }
 
@@ -163,8 +268,11 @@ int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
 
     u32 clus = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
     u64 need = MAX(off + n, r->de.filesize);
+    u32 old_hi = r->de.fstclushi, old_lo = r->de.fstcluslo;
+    u64 old_size = r->de.filesize;
+    u32 grown = 0, tail = 0, tail_old = 0;
     int rc = 0;
-    clus = alloc_chain(m, clus, need, &rc);
+    clus = alloc_chain(m, clus, need, &rc, &grown, &tail, &tail_old);
     if (!clus) return rc ? rc : LNXRM_EIO;
     r->de.fstclushi = clus >> 16;
     r->de.fstcluslo = clus & 0xFFFF;
@@ -216,50 +324,32 @@ int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
         }
     }
 
-    /* Not one byte landed: leave the metadata byte-for-byte as it was. */
-    if (rc && !done) return rc;
+    /* Not one byte landed: the growth booked above is handed back and the
+     * vnode keeps its pre-write shape -- never publish what did not land. */
+    if (rc) {
+        rollback_growth(m, grown, tail, tail_old);
+        r->de.fstclushi = old_hi;
+        r->de.fstcluslo = old_lo;
+        return rc;
+    }
 
     /* The size published above is derived from `done`, never from the
      * request: a write that stopped half way must not claim the rest. */
     if (off + done > r->de.filesize) r->de.filesize = off + done;
 
-    /* update the on-disk dirent: rewrite parent dir sector */
-    u8 dbuf[512];
-    u32 dc = r->dir_cluster;
-    struct fat_chain chd;
-    for (fat_chain_start(&chd, m, dc); fat_chain_more(&chd); fat_chain_advance(&chd)) {
-        u32 cc = chd.clus;
-        for (u32 s = 0; s < m->sectors_per_cluster; s++) {
-            u64 lba = cluster_lba(m, cc) + s;
-            if (fat_read_sector(m, lba, dbuf)) {
-                /* The data reached the disk but its new size cannot: report
-                 * the failure instead of letting the caller believe the
-                 * write committed. */
-                fat_warn_io(m, "read dir", lba);
-                return LNXRM_EIO;
-            }
-            for (u32 doff = 0; doff <= m->bytes_per_sector - DIRENT_SIZE; doff += DIRENT_SIZE) {
-                struct fat_dirent *e = (struct fat_dirent *)(dbuf + doff);
-                if (e->name[0] == ENT_END) goto done_write;
-                if (!entry_used(e)) continue;
-                if (!memcmp(e->name, r->de.name, 11)) {
-                    e->filesize = r->de.filesize;
-                    e->fstclushi = r->de.fstclushi;
-                    e->fstcluslo = r->de.fstcluslo;
-                    e->attr |= ATTR_ARCHIVE;
-
-                    if (fat_write_sector(m, lba, dbuf)) {
-                        fat_warn_io(m, "write dir", lba);
-                        return LNXRM_EIO;
-                    }
-                    /* metadata matches the bytes that landed: a short count
-                     * is the honest answer for the partial case above */
-                    return (int)done;
-                }
-            }
-        }
+    /* C21: address the record where it physically sits (position + creation
+     * stamp), not by an 8.3 alias two files can share.  C20: a record that
+     * is no longer ours (unlinked or re-created under this open file) or
+     * that cannot be rewritten is an error -- the caller is told instead of
+     * being handed a success over data whose metadata never appeared, and
+     * this write's growth is rolled back so nothing ends up unreachable. */
+    int prc = dirent_writeback_at(m, r, false);
+    if (prc) {
+        rollback_growth(m, grown, tail, tail_old);
+        r->de.fstclushi = old_hi;
+        r->de.fstcluslo = old_lo;
+        r->de.filesize = old_size;
+        return prc;
     }
-
-done_write:
-    return rc ? rc : (int)done;
+    return (int)done;
 }

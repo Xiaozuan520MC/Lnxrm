@@ -73,9 +73,11 @@ pm32:
 
     ; enable paging + protected mode + write protect (CR0.WP): every AP
     ; must honor the page R/W bit for its own stores from the moment it
-    ; turns paging on, matching the BSP (setup.asm / entry64.S).
+    ; turns paging on, matching the BSP (setup.asm / entry64.S).  Clear
+    ; CD|NW the same way, or an AP inherits the BIOS's disabled caches.
     mov eax, cr0
     or eax, (1 << 31) | (1 << 16) | (1 << 0)
+    and eax, ~0x60000000
     mov cr0, eax
 
     ; far jump to 64-bit kernel code segment (selector 0x18)

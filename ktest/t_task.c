@@ -8,6 +8,7 @@
 #include <sys/sched.h>
 #include <sys/percpu.h>
 #include <sys/cpu.h>   /* console_waiter_arm/disarm, input_push/pop (T-054) */
+#include <mm/mm.h>     /* vmm_new_user_aspace: a fabricated zombie must own a real aspace */
 #include <console.h>
 
 static void test_current_is_bsp_idle(void)
@@ -222,6 +223,43 @@ static void test_multi_console_waiters_all_woken(void)
     K_EXPECT_EQ(input_pop(), (int)'x');
 }
 
+/* P0-2: a zombie wearing the no-adopter marker (parent 0,0) has no waiter
+ * left in the whole system, so task_alloc_slot must reclaim it under slot
+ * pressure instead of answering NULL -- while a zombie whose parent link
+ * still names a pid is its parent's to reap, never the kernel's. */
+static void test_slot_pressure_reclaims_ownerless_zombie(void)
+{
+    struct task *held[NR_TASKS];
+    int n = 0;
+    for (;;) {
+        struct task *t = task_alloc_slot();
+        if (!t) break;
+        t->state = T_RUNNABLE; /* live, so the sweep below must skip it */
+        held[n++] = t;
+    }
+    K_ASSERT(n > 0);
+    K_EXPECT(task_alloc_slot() == NULL); /* pinned: full really is full */
+
+    /* one corpse: die with the (0,0) marker only a dying init / free sweep
+     * can write, and hand it a real aspace the reclaim has to tear down */
+    held[0]->pml4 = vmm_new_user_aspace();
+    K_ASSERT(held[0]->pml4 != 0);
+    held[0]->state = T_ZOMBIE;
+    struct task *fresh = task_alloc_slot(); /* reclaims, not NULL */
+    K_ASSERT(fresh != NULL);
+    held[0] = fresh;
+
+    held[1]->state = T_ZOMBIE;       /* parent pid survives: not ours */
+    held[1]->parent_pid = 4242;
+    held[1]->parent_gen = 4242;
+    K_EXPECT(task_alloc_slot() == NULL); /* cannot happen now */
+    K_EXPECT_EQ(held[1]->state, T_ZOMBIE);
+    K_EXPECT_EQ(held[1]->parent_pid, 4242);
+
+    for (int i = 0; i < n; i++) task_free_slot(held[i]);
+}
+
+KTEST("task", KTEST_LATE, test_slot_pressure_reclaims_ownerless_zombie);
 KTEST("task", KTEST_LATE, test_current_is_bsp_idle);
 KTEST("task", KTEST_LATE, test_slot_claim_and_recycle);
 KTEST("task", KTEST_LATE, test_find_task_misses_unused_pids);

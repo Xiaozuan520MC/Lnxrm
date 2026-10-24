@@ -12,11 +12,26 @@
 #include <types.h>
 
 /* One-page bounce window: acpi.c maps the physical page holding the bytes
- * it needs here, copies them out, and moves on (vmm_map_kernel_page does
+ * it needs here, copies them out, and moves on.  vmm_map_kernel_page does
  * the invlpg).  PD_HI[108] — kernel/image slots 0..31, VGA 96, LFB 104..107,
  * device 128, heap 256..271 are taken; vmm.c's alias loop skips this slot
- * for the same reason it skips those.  Keep in sync with kernel/mm/vmm.c. */
-#define ACPI_SCRATCH_VA 0xffffffff8e000000UL
+ * for the same reason it skips those.  Keep in sync with kernel/mm/vmm.c.
+ *
+ * The VA MUST land in PD_HI[108] (ACPI_SCRATCH_PD in vmm.c, which both
+ * skips the slot in the alias loop and whose physical range start_kernel
+ * reserves out of the buddy).  Pointing it at any other slot makes
+ * vmm_map_kernel_page() split that slot's 2 MiB alias and overlay pt[0]
+ * with the bounce page -- which silently re-routes every ptable_ptr()
+ * access to the first 4 KiB of the slot's physical frame onto the bounce
+ * page.  A page-table frame pmm_alloc() happens to place there is then
+ * written through the alias into the bounce page while the real frame
+ * stays zero, so the CPU's hardware walk of that frame sees "not present"
+ * and faults, even though vmm_translate_in() (which walks the same alias)
+ * reports it present.  The smoke log caught this as a supervisor #PF in
+ * copy_from_user during the systest fork. */
+#define ACPI_SCRATCH_VA 0xffffffff8d800000UL
+LNXRM_STATIC_ASSERT(PD_SLOT_OF(ACPI_SCRATCH_VA) == 108,
+                    "ACPI_SCRATCH_VA must sit in PD_HI[108] (ACPI_SCRATCH_PD)");
 
 #ifdef __cplusplus
 extern "C" {

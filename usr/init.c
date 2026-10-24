@@ -47,6 +47,10 @@ int main(int argc, char **argv)
     kwaitpid(pid, &st, 0);
     xputs("\ninit: terminal exited\n");
 
-    for (;;) ksleep_ms(3600000, 0);
+    /* P0-2: init is every orphan's reaper.  After this loop no corpse has
+     * to outlive its reaper; with no children at all ECHILD would spin the
+     * loop, so breathe once per second instead. */
+    for (;;)
+        if (kwaitpid(-1, &st, 0) == LNXRM_ECHILD) ksleep_ms(1000, 0);
     return 0;
 }

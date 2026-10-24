@@ -551,7 +551,10 @@ pm_entry:
     wrmsr
     mov eax, cr0
     or  eax, 0x80010000             ; CR0.PG | CR0.WP
-    mov cr0, eax
+    and eax, ~0x60000000            ; clear CD|NW: SeaBIOS hands the kernel
+    mov cr0, eax                    ; over with caching disabled (0xE0010033
+                                    ; in cr0); leaving CD set makes every
+                                    ; access uncached forever
 
     mov DWORD [0x6F00], 0
 

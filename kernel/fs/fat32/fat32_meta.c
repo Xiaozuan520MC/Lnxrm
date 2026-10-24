@@ -85,6 +85,11 @@ static int parent_entry_add(struct fat_mount *m, u32 pdir, const char *name, u8 
                 e->crtdate = 0x5A21;
                 e->wrttime = 0x6000;
                 e->wrtdate = 0x5A21;
+                /* C21's identity stamp lives in crttenth: every record this
+                 * kernel creates gets a different one, so a record that
+                 * replaced a deleted one (same name, same slot) is never
+                 * mistaken by an open file for the incarnation it holds. */
+                e->crttenth = (u8)(++m->dirent_stamp % 200);
                 e->fstcluslo = first_clus & 0xFFFF;
                 e->fstclushi = first_clus >> 16;
                 e->filesize = 0;

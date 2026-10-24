@@ -83,6 +83,18 @@ int vmm_map_user(u64 root, u64 va, u64 pa, bool writable, bool user, bool exec)
         if (!pa) return LNXRM_EFAIL;
         pt[i1] = pa | PG_P | (writable ? PG_W : 0) | uf | (exec ? 0 : PG_NX);
     }
+    /* Per-page map trace.  Gated behind VMM_TRACE_PTE (default off): sys_brk
+     * eagerly maps every page in the growth range, so the brk-OOM self-test
+     * draining the whole ~238 MiB buddy prints ~60 000 of these lines, and at
+     * serial-console speed that alone blows the smoke timeout (and floods any
+     * real serial line).  invlpg below stays unconditional -- a freshly
+     * written PTE may otherwise still be served as the stale not-present
+     * entry the CPU cached before the mapping existed. */
+#ifdef VMM_TRACE_PTE
+    kprintf("[pte] map root=%#lx va=%#lx -> %#lx\n",
+            (unsigned long)root, (unsigned long)va,
+            (unsigned long)pt[i1]);
+#endif
     __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
     return 0;
 }
@@ -140,18 +152,24 @@ u64 vmm_unmap_user(u64 root, u64 va)
     u64 big_buf;
     int r = walk(root, va, &pte, &big_buf);
     if (r < 0 || !(*pte & PG_P)) return 0;
-    u64 pa;
+    u64 pa, old;
     if (r == 1) {
         /* 2 MiB large page: need to clear the PD entry directly */
         u64 i4 = (va >> 39) & 511, i3 = (va >> 30) & 511;
         u64 i2 = (va >> 21) & 511;
         u64 *pd = ptable_ptr(ptable_ptr(ptable_ptr(root)[i4] & ~0xfff)[i3] & ~0xfff);
         pa = pd[i2] & PTE_PA_MASK;
+        old = pd[i2];
         pd[i2] = 0;
     } else {
-        pa = *pte & PTE_PA_MASK;
+        old = *pte;
+        pa = old & PTE_PA_MASK;
         *pte = 0;
     }
+#ifdef VMM_TRACE_PTE
+    kprintf("[pte] unmap root=%#lx va=%#lx old=%#lx\n",
+            (unsigned long)root, (unsigned long)va, (unsigned long)old);
+#endif
     __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
     return pa;
 }

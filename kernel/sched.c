@@ -462,61 +462,77 @@ long sys_nanosleep(u64 ns, struct lnxrm_timespec *urem)
 /* ---- task table helpers used by task.c ---- */
 struct task *task_alloc_slot(void)
 {
-    u64 flags;
-    struct task *t = NULL;
-    spin_lock_irqsave(&task_table_lock, &flags);
-    for (int i = 1; i < NR_TASKS; i++) {
-        if (task_table[i].state == T_UNUSED) {
-            /* Claim immediately so a concurrent alloc cannot hand out
-             * the same slot. Caller may overwrite state to T_EMBRYO. */
-            task_table[i].state = T_EMBRYO;
-            task_table[i].pid = 0; /* drop the old pid NOW: until the
-              * caller assigns a fresh one, find_task(old_pid) must not
-              * match this half-built task. Every caller assigns its own
-              * pid right after alloc (fork/spawn/idle). */
-            /* T-050: this claim is a NEW incarnation -- and none of the
-             * previous occupant's links may survive it.  parent is cleared
-             * here (not only where a caller remembers to set it) because
-             * kernel_spawn never assigned one: without this line a recycled
-             * slot would hand init the dead occupant's parent. */
-            task_table[i].generation = ++task_generation_counter;
-            task_table[i].parent_pid = 0;
-            task_table[i].parent_gen = 0;
-            task_table[i].con_next = NULL;
-            task_table[i].rq_cpu = -1;
-            task_table[i].rq_next = NULL;
-            task_table[i].cpu_id = -1;
-            /* Slots are reused without being cleared, so a recycled task
-             * must not inherit the previous occupant's signal state. */
-            task_table[i].signal_pending = 0;
-            task_table[i].sig_blocked = 0;
-            task_table[i].sig_saved_blocked = 0;
-            task_table[i].sig_in_handler = false;
-            memset(task_table[i].sig_handlers, 0, sizeof(task_table[i].sig_handlers));
-            memset(task_table[i].sig_masks, 0, sizeof(task_table[i].sig_masks));
-            memset(&task_table[i].saved_tf, 0, sizeof(task_table[i].saved_tf));
-            task_table[i].sig_fault_rip = 0;
-            /* T-030: recycled slots start unprivileged.  Callers that
-             * know better overwrite this at once (fork inherits, spawn
-             * is root, idle is kxld) -- but a slot must never hand a
-             * fresh task the previous occupant's tier. */
-            task_table[i].cred.kind = CRED_USER;
-            task_table[i].cred.uid = CRED_UID_USER;
-            /* T-032: same rule for the memory account -- a slot must
-             * never report the 64 MiB the previous occupant died holding. */
-            task_table[i].mem_pages = 0;
-            task_table[i].mem_peak = 0;
-            /* T-094: and never the previous occupant's stack watermark --
-             * a stale non-zero value would let a fresh task "grow" a stack
-             * it never mapped.  0 means "no stack tracked", so every growth
-             * attempt declines until exec/spawn/fork sets it. */
-            task_table[i].ustack_lo = 0;
-            t = &task_table[i];
-            break;
+    for (;;) {
+        u64 flags;
+        struct task *t = NULL, *corpse = NULL;
+        spin_lock_irqsave(&task_table_lock, &flags);
+        for (int i = 1; i < NR_TASKS; i++) {
+            if (task_table[i].state == T_UNUSED) {
+                /* Claim immediately so a concurrent alloc cannot hand out
+                 * the same slot. Caller may overwrite state to T_EMBRYO. */
+                task_table[i].state = T_EMBRYO;
+                task_table[i].pid = 0; /* drop the old pid NOW: until the
+                  * caller assigns a fresh one, find_task(old_pid) must not
+                  * match this half-built task. Every caller assigns its own
+                  * pid right after alloc (fork/spawn/idle). */
+                /* T-050: this claim is a NEW incarnation -- and none of the
+                 * previous occupant's links may survive it.  parent is cleared
+                 * here (not only where a caller remembers to set it) because
+                 * kernel_spawn never assigned one: without this line a recycled
+                 * slot would hand init the dead occupant's parent. */
+                task_table[i].generation = ++task_generation_counter;
+                task_table[i].parent_pid = 0;
+                task_table[i].parent_gen = 0;
+                task_table[i].con_next = NULL;
+                task_table[i].rq_cpu = -1;
+                task_table[i].rq_next = NULL;
+                task_table[i].cpu_id = -1;
+                /* Slots are reused without being cleared, so a recycled task
+                 * must not inherit the previous occupant's signal state. */
+                task_table[i].signal_pending = 0;
+                task_table[i].sig_blocked = 0;
+                task_table[i].sig_saved_blocked = 0;
+                task_table[i].sig_in_handler = false;
+                memset(task_table[i].sig_handlers, 0, sizeof(task_table[i].sig_handlers));
+                memset(task_table[i].sig_masks, 0, sizeof(task_table[i].sig_masks));
+                memset(&task_table[i].saved_tf, 0, sizeof(task_table[i].saved_tf));
+                task_table[i].sig_fault_rip = 0;
+                /* T-030: recycled slots start unprivileged.  Callers that
+                 * know better overwrite this at once (fork inherits, spawn
+                 * is root, idle is kxld) -- but a slot must never hand a
+                 * fresh task the previous occupant's tier. */
+                task_table[i].cred.kind = CRED_USER;
+                task_table[i].cred.uid = CRED_UID_USER;
+                /* T-032: same rule for the memory account -- a slot must
+                 * never report the 64 MiB the previous occupant died holding. */
+                task_table[i].mem_pages = 0;
+                task_table[i].mem_peak = 0;
+                /* T-094: and never the previous occupant's stack watermark --
+                 * a stale non-zero value would let a fresh task "grow" a stack
+                 * it never mapped.  0 means "no stack tracked", so every growth
+                 * attempt declines until exec/spawn/fork sets it. */
+                task_table[i].ustack_lo = 0;
+                t = &task_table[i];
+                break;
+            }
+            /* P0-2: a zombie carrying the no-adopter marker (0,0) can never
+             * be reaped by any waiter, so under slot pressure reclaim one
+             * instead of answering NULL.  Claim it inside the lock so a
+             * concurrent alloc cannot free the same corpse twice. */
+            if (!corpse && task_table[i].state == T_ZOMBIE &&
+                task_table[i].parent_pid == 0 && task_table[i].parent_gen == 0) {
+                task_table[i].state = T_EMBRYO;
+                corpse = &task_table[i];
+            }
         }
+        spin_unlock_irqrestore(&task_table_lock, flags);
+        if (t) return t;
+        if (!corpse) return NULL;
+        vmm_destroy_user_aspace(corpse->pml4);
+        kfree(corpse->kstack);
+        corpse->kstack = NULL;
+        task_free_slot(corpse);
     }
-    spin_unlock_irqrestore(&task_table_lock, flags);
-    return t;
 }
 
 void task_free_slot(struct task *t)
