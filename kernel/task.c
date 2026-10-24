@@ -364,9 +364,12 @@ void sys_exit(int code)
     for (int i = 0; i < NR_FDS; i++)
         if (current->fds[i]) sys_close(i);
 
-    /* Reparent orphans to init (pid 1).  The old `init_t ? init_t :`
-     * was dead code — init_t was always NULL. */
+    /* Reparent children to init (pid 1).  A dying init cannot adopt
+     * itself and a zombie cannot raise children either: in both cases the
+     * link becomes the no-adopter marker (0,0), which task_alloc_slot
+     * reclaims on demand (P0-2). */
     struct task *init_t = find_task(1);
+    if (!init_t || init_t == current || init_t->state == T_ZOMBIE) init_t = NULL;
     int i = 0;
     for (struct task *t = task_iter(&i); t; t = task_iter(&i))
         if (t != current && t->parent_pid == current->pid &&

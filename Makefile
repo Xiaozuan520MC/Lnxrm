@@ -32,7 +32,7 @@ endif
 
 BASEFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
              -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
-             -O2 -g $(WARN) -Iinclude -I. -MMD -MP \
+             -Os -g $(WARN) -Iinclude -I. -MMD -MP \
              -ffunction-sections -fdata-sections $(KTEST_DEFS)
 KERNFLAGS := $(BASEFLAGS) -std=gnu11
 
@@ -45,9 +45,68 @@ USER_LINK_BASE := 0x7f8000400000
 .PHONY: all clean run usr smoke imageiso initramfs help
 all: $(BUILD)/bzImage
 
-include arch/Makefile
-include kernel/Makefile
-include usr/Makefile
+KASM_ALL := $(shell find arch -name '*.S' 2>/dev/null)
+KASM     := $(filter-out arch/trampoline.S,$(KASM_ALL))
+
+ARCH_SRC_C  := $(shell find arch -name '*.c' 2>/dev/null)
+ARCH_C_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(ARCH_SRC_C))
+ARCH_S_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(KASM))
+
+KERN_SRC_C  := $(shell find kernel -name '*.c' 2>/dev/null)
+KTEST_SRC_C := $(if $(KTEST_DIR),$(shell find $(KTEST_DIR) -name '*.c' 2>/dev/null))
+
+KERN_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(KERN_SRC_C))
+KTEST_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KTEST_SRC_C))
+
+USR_ALL_C := $(shell find usr -maxdepth 1 -name '*.c' 2>/dev/null)
+UIMG      := $(patsubst usr/%.c,%,$(USR_ALL_C))
+
+USR_OBJDIR := $(BUILD)/usro
+USER_ELFS  := $(addprefix $(BUILD)/usr/,$(UIMG))
+
+# ---- kernel rules -------------------------------------------------------
+$(BUILD)/%.o: %.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	@printf "  CC      $@\n"
+	@$(CC) $(KERNFLAGS) -MMD -MP -c -o $@ $<
+
+# ---- architecture rules -------------------------------------------------
+$(BUILD)/arch/%.o: arch/%.S | $(BUILD)
+	@mkdir -p $(dir $@)
+	@printf "  NASM    $@\n"
+	@$(NASM) -f elf64 -F dwarf -g -o $@ $<
+
+$(BUILD)/trampoline.bin: arch/trampoline.S | $(BUILD)
+	@printf "  NASM    $@\n"
+	@$(NASM) -f bin -o $@ $<
+
+$(BUILD)/trampoline.o: $(BUILD)/trampoline.bin | $(BUILD)
+	@printf "  OBJCOPY $@\n"
+	@$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.trampoline $< $@ \
+	  --redefine-sym _binary_build_trampoline_bin_start=trampoline_start \
+	  --redefine-sym _binary_build_trampoline_bin_end=trampoline_end \
+	  --redefine-sym _binary_build_trampoline_bin_size=trampoline_size
+
+$(USR_OBJDIR)/crt0.o: init/crt0.S | $(BUILD)
+	@mkdir -p $(USR_OBJDIR)
+	@printf "  NASM    $@\n"
+	@$(NASM) -f elf64 -o $@ $<
+
+$(USR_OBJDIR)/ulib.o: init/ulib.c | $(BUILD)
+	@mkdir -p $(USR_OBJDIR)
+	@printf "  CC      $@\n"
+	@$(CC) $(USRFLAGS) -MMD -MP -c -o $@ $<
+
+$(USR_OBJDIR)/%.o: usr/%.c | $(BUILD)
+	@mkdir -p $(USR_OBJDIR)
+	@printf "  CC      $@\n"
+	@$(CC) $(USRFLAGS) -MMD -MP -c -o $@ $<
+
+$(USER_ELFS): $(BUILD)/usr/%: $(USR_OBJDIR)/%.o $(USR_OBJDIR)/ulib.o $(USR_OBJDIR)/crt0.o | $(BUILD)
+	@mkdir -p $(dir $@)
+	@printf "  LD      $@\n"
+	@$(CC) $(USRFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
 
 KOBJ_C   := $(KERN_OBJS) $(ARCH_C_OBJS) $(KTEST_OBJS)
 KOBJ_ASM := $(ARCH_S_OBJS) $(BUILD)/trampoline.o

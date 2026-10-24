@@ -107,6 +107,10 @@ struct fat_mount {
     u8 *fat; /* cached FAT table */
     u64 fat_bytes;
     u32 fat_warns; /* corruption reports printed so far (rate limiter) */
+    u8 dirent_stamp; /* advances once per created record: the creation
+                      * tenth-of-second crttenth field gets this value, so
+                      * two incarnations of the same name never share their
+                      * identity stamp (the guard behind C21) */
 
     /* --- crash-consistency journal (fat32_journal.c) -------------------
      * A metadata-only redo log living in the reserved sectors mkfs leaves
@@ -311,9 +315,15 @@ typedef int (*dirent_cb)(const char *name, const struct fat_dirent *e, u32 dircl
 struct find_ctx {
     const char *want;
     struct fat_dirent found;
+    u32 dirclus, off; /* where the match physically sits (C21 write-back) */
 };
 struct resolve {
     u32 dir_cluster; /* parent's cluster */
+    u32 ent_clus, ent_off; /* where the 8.3 record physically sits:
+                            * the containing cluster and the byte offset
+                            * inside it.  C21: write-back addresses this
+                            * position directly -- never a name scan that
+                            * two files sharing one 8.3 alias can both win */
     char name[56];
     struct fat_dirent de; /* valid if found */
     bool found;

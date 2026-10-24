@@ -104,6 +104,7 @@ void ktest_run(enum ktest_stage stage)
         if (c->stage != (u8)stage) continue;
         kt.suite = c->suite;
         kt.name = c->name;
+        kprintf("[ktest] case %s/%s\n", c->suite, c->name);
         selftest_case_failed = false;
         kt.case_skipped = false;
         n++;

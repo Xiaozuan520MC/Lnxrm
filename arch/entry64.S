@@ -129,9 +129,12 @@ _start32:
     ; --- CR0.PG + CR0.WP --------------------------------------------------
     ; WP (bit 16) makes every ring-0 store honor the page R/W bit: a kernel
     ; write to a read-only page (#PF) can no longer corrupt it.  Every page
-    ; mapped so far is P|W, so switching it on here cannot fault.
+    ; mapped so far is P|W, so switching it on here cannot fault.  CD|NW
+    ; must go: the BIOS hands over with caching disabled, and the kernel
+    ; would otherwise run its whole life with every access uncached.
     mov  eax, cr0
     or   eax, 0x80010000
+    and  eax, ~0x60000000
     mov  cr0, eax
 
     ; --- jump to _start64's physical alias -------------------------------

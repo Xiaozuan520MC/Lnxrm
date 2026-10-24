@@ -31,6 +31,8 @@ lnxrm 是一个 x86-64 freestanding 单体内核：C 为主体，启动 / 中断
 ### 1.2 目录树
 
 ```
+Makefile               唯一构建入口：源文件自动发现 + 内核/汇编/用户态三套编译规则 +
+                       链接、镜像、initramfs、运行、冒烟
 arch/                 架构相关：汇编、CPU 状态、链接脚本
   setup.asm           实模式：E820 采集、VBE 四遍选型、临时页表、进长模式
   entry64.S           _start32(GRUB)/_start64、中断桩、swtch/glue_first/load_cr3
@@ -264,6 +266,21 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
 - 内核栈 32 KiB：顶部是 `intr_frame`，其下 56 字节是 `cpu_ctx`（`area[6] = glue_first`）。
 - `task_alloc_slot / task_free_slot` 走 `task_table_lock`；`task_iter()` 是**有意无锁**的
   线性扫描，返回表内裸指针，由调用方在锁外使用。
+- **无主僵尸由分配器兜底回收（P0-2）**。父链接 `(0,0)` 是内核专属的"无人领养"标记
+  （generation 从 1 起步，带活父的僵尸永不落上它；写它的只有 exit 时无活 init 可领养、
+  `task_free_slot` 清扫时无 init 存在），三层语义必须一起理解：
+
+  ① **init 活着时是唯一收尸者**——exit 重挂写 `(1, init 当前世代)`，`wait4(-1)` 按
+  incarnation 匹配必然查得到；健康 init 面前不会出现 `(0,0)` 孤儿。
+  ② **表未满时无主僵尸仍占槽位**——这是惰性回收的代价：回收只在 `task_alloc_slot`
+  撞满表时逐个触发（回收一具、本调用即成），没有主动扫描。只要系统最终产生 fork
+  压力就会清理，fork 永远不会因此永久失败；init 死后的系统也不挂死，`ps` 里这些
+  孤儿的父 pid 就是 0（`ppid` 字段即 `parent_pid`，读到 0 = 无领养者，不是数据损坏）。
+  ③ **锁窗口是两阶段**：`(0,0)` 检测与 `T_EMBRYO` 占位在 `task_table_lock` 内完成，
+  地址空间销毁、释放内核栈、`task_free_slot`（自带同一把锁的外部函数）**全在放锁
+  之后**——占位挡住并发双回收，放锁避免自锁，`for(;;)` 重试兜住最后的领取。
+  占位勒死（T_EMBRYO）若在回收动作中段崩溃，槽位随之泄漏——但那时已 panic 停机，
+  内核把"抢救到一半 died"的生命线交给 panic 本身兜底，不再设计恢复路径。
 
 ### 4.2 fork / execve / exit
 
@@ -276,8 +293,9 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
   **再**销毁旧地址空间 → 关 `O_CLOEXEC` fd、清 `signal_pending` → 按 SysV ABI 摆
   `argc/argv/envp/auxv`。
 - `sys_exit`：关所有 fd → 撤控制台等待者 → **`fb_disown(current->pid)`（画屏归属的唯一
-  释放点，所有死法都经过这里）** → 孤儿重挂到 pid 1 → 给父发 `SIGCHLD` → `T_ZOMBIE`
-  → 出队 → 唤醒睡眠的父 → `schedule()`。
+  释放点，所有死法都经过这里）** → 孤儿重挂到 pid 1（垂死的 init 不能领养自己，僵尸也
+  不领养：两者落 `(0,0)` 标记，由 `task_alloc_slot` 满表时回收，见 §4.1）→ 给父发
+  `SIGCHLD` → `T_ZOMBIE` → 出队 → 唤醒睡眠的父 → `schedule()`。
 - `kernel_spawn`：第一个用户进程，类似 execve 但简化，结尾**切回 master PML4**
   （它跑在内核上下文里）。
 - `kernel/elf.c`：只接受静态 `ET_EXEC`；`e_entry` 必须落在 `[USER_BASE, USER_MAX_VMA)`；
@@ -788,11 +806,11 @@ smp_init():
 |---|---|---|---|
 | early | 25 | 359 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 51 | 1031 | 0 |
-| 合计 | 93 | 1827 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 52 | 1038 | 0 |
+| 合计 | 94 | 1834 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (93 cases, 1827 checks) [2 skipped]` 与
-`[selftest] 1827/1827 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**，
+汇总行 `[ktest] selftest PASS (94 cases, 1834 checks) [2 skipped]` 与
+`[selftest] 1834/1834 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**，
 `WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 在任何模式下都停机。
 
 套件按主题分组（24 个 suite）：`abi boot console cpu cred draw elf fat32 fb jrn kheap

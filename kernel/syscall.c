@@ -208,8 +208,8 @@ long sys_uname(struct lnxrm_utsname *u)
     memset(&k, 0, sizeof(k));
     strncpy(k.sysname, "lnxrm", sizeof(k.sysname) - 1);
     strncpy(k.nodename, "lnxrm", sizeof(k.nodename) - 1);
-    strncpy(k.release, "v0.08-TEST", sizeof(k.release) - 1);
-    strncpy(k.version, "Lnxrm v0.08-TEST " __DATE__ " " __TIME__, sizeof(k.version) - 1);
+    strncpy(k.release, "v0.09", sizeof(k.release) - 1);
+    strncpy(k.version, "Lnxrm v0.09 " __DATE__ " " __TIME__, sizeof(k.version) - 1);
     strncpy(k.machine, "x86-64", sizeof(k.machine) - 1);
     if (copy_to_user(u, &k, sizeof(k)) < 0) return LNXRM_EFAULT;
     return 0;

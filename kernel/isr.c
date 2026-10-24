@@ -237,6 +237,106 @@ void isr_common(struct intr_frame *f)
                             "(CR0.WP)\n");
             }
         }
+        if (f->intno == 14 && current) {
+            /* Capture the table state FIRST: the prints below cost serial
+             * milliseconds, and any CPU can write memory in that window.
+             * The snapshot is the closest thing to the fault moment. */
+            u64 cr3 = 0, snap_e4 = 0, snap_e3 = 0, snap_e2 = 0, snap_e1 = 0;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+            u64 sva = cr2;
+            u64 si4 = (sva >> 39) & 511, si3 = (sva >> 30) & 511;
+            u64 si2 = (sva >> 21) & 511, si1 = (sva >> 12) & 511;
+            u64 *sr4 = (u64 *)PHYS_TO_VIRT(current->pml4);
+            snap_e4 = sr4[si4];
+            if (snap_e4 & 1) {
+                u64 *sr3 = (u64 *)PHYS_TO_VIRT(snap_e4 & ~0xfffUL);
+                snap_e3 = sr3[si3];
+                if (snap_e3 & 1) {
+                    u64 *sr2 = (u64 *)PHYS_TO_VIRT(snap_e3 & ~0xfffUL);
+                    snap_e2 = sr2[si2];
+                    if (snap_e2 & 1) {
+                        u64 *sr1 = (u64 *)PHYS_TO_VIRT(snap_e2 & ~0xfffUL);
+                        snap_e1 = sr1[si1];
+                    }
+                }
+            }
+            kprintf("[exception] snapshot cr3=%p match=%d pml4[e]: %p %p %p %p\n",
+                    (void *)cr3, (int)(cr3 == current->pml4),
+                    (void *)snap_e4, (void *)snap_e3, (void *)snap_e2,
+                    (void *)snap_e1);
+            __asm__ volatile("mfence" ::: "memory");
+            kprintf("[exception] live-now gfns: %p %p %p %p\n",
+                    (void *)sr4[si4],
+                    (void *)(snap_e3 ? ((u64 *)PHYS_TO_VIRT(snap_e4 & ~0xfffUL))[si3] : 0),
+                    (void *)(snap_e2 ? ((u64 *)PHYS_TO_VIRT(snap_e3 & ~0xfffUL))[si2] : 0),
+                    (void *)(snap_e1 ? ((u64 *)PHYS_TO_VIRT(snap_e2 & ~0xfffUL))[si1] : 0));
+            kprintf("[exception] cr3=%p current->pml4=%p%s\n", (void *)cr3,
+                    (void *)current->pml4, cr3 == current->pml4 ? " (match)" : " (*MISMATCH*)");
+            /* page-table walk of cr2 under current->pml4, through the same
+             * high-half alias the C walkers use (a raw low-half read is the
+             * identity alias, which is not a guarantee of what the C walk
+             * actually reads). */
+            u64 idx4 = si4, idx3 = si3, idx2 = si2, idx1 = si1;
+            u64 *r4 = (u64 *)PHYS_TO_VIRT(current->pml4);
+            u64 e4 = r4[idx4];
+            u64 e2 = 0; /* L2 slot, kept out here for the leaf-counter */
+            kprintf("[exception] walk pml4[%u]=%p\n", (unsigned)idx4, (void *)e4);
+            if (e4 & 1) {
+                u64 *r3 = (u64 *)PHYS_TO_VIRT(e4 & ~0xfffUL);
+                u64 e3 = r3[idx3];
+                kprintf("[exception] walk pdp[%u]=%p\n", (unsigned)idx3, (void *)e3);
+                if (e3 & 1) {
+                    u64 *r2 = (u64 *)PHYS_TO_VIRT(e3 & ~0xfffUL);
+                    e2 = r2[idx2];
+                    kprintf("[exception] walk pd[%u]=%p\n", (unsigned)idx2, (void *)e2);
+                    if (e2 & 1) {
+                        u64 *r1 = (u64 *)PHYS_TO_VIRT(e2 & ~0xfffUL);
+                        kprintf("[exception] walk pt[%u]=%p\n", (unsigned)idx1,
+                                (void *)r1[idx1]);
+                        /* how much of this L1 page is alive: a wholesale
+                         * zeroing means the frame was repurposed (double
+                         * alloc / memset), a lone zero entry means a
+                         * precise unmap hit it */
+                        int alive = 0;
+                        for (int i = 0; i < 512; i++)
+                            alive += !!(r1[i] & 1);
+                        kprintf("[exception] L1@%p alive=%d/512\n",
+                                (void *)PHYS_TO_VIRT(e2 & ~0xfffUL), alive);
+                    }
+                }
+            }
+            extern u64 vmm_translate_in(u64 root, u64 va);
+            kprintf("[exception] vmm_translate_in=%p\n",
+                    (void *)vmm_translate_in(current->pml4, cr2));
+            /* hardware state around the walk: PCID leftovers, cache mode */
+            u64 cr0 = 0, cr4 = 0;
+            __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+            __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+            kprintf("[exception] cr3.low=%#lx cr0=%p (CD=%d NW=%d) cr4=%p "
+                    "(PCIDE=%d SMAP=%d PSE=%d PAE=%d)\n",
+                    (unsigned long)(cr3 & 0xfff), (void *)cr0,
+                    (int)(!!(cr0 & (1UL << 30))), (int)(!!(cr0 & (1UL << 29))),
+                    (void *)cr4, (int)(!!(cr4 & (1UL << 17))),
+                    (int)(!!(cr4 & (1UL << 21))), (int)(!!(cr4 & (1UL << 4))),
+                    (int)(!!(cr4 & (1UL << 5))));
+            if (e2 & 1) {
+                /* the same L1 read through BOTH mappings of the frame: WB
+                 * alias vs the boot identity map.  A disagreement means the
+                 * CPU is serving one of them a stale cache line.  Then a
+                 * WBINVD and one re-read says which side is the truth. */
+                u64 pa1 = e2 & ~0xfffUL;
+                volatile u64 *via_alias =
+                    (volatile u64 *)PHYS_TO_VIRT(pa1 + idx1 * 8);
+                volatile u64 *via_low = (volatile u64 *)(pa1 + idx1 * 8);
+                u64 a1 = *via_alias, l1 = *via_low;
+                __asm__ volatile("wbinvd" ::: "memory");
+                u64 a2 = *via_alias;
+                kprintf("[exception] leaf pa=%p pt[%u]: alias=%p low=%p; "
+                        "after wbinvd alias=%p\n",
+                        (void *)pa1, (unsigned)idx1, (void *)a1, (void *)l1,
+                        (void *)a2);
+            }
+        }
         if (current)
             kprintf("[exception] task pid=%u name=%s cs=%#lx ss=%#lx\n", current->pid,
                     current->name, f->cs, f->usss);
@@ -284,7 +384,7 @@ void isr_common(struct intr_frame *f)
         {
             u64 *sp = (u64 *)f;
             kprintf("[stack]");
-            for (int q = 22; q < 30; q++) kprintf(" %lx", sp[q]);
+            for (int q = 22; q < 44; q++) kprintf(" %lx", sp[q]);
             kprintf("\n");
         }
         panic("unrecoverable exception");

@@ -70,7 +70,7 @@ make CROSS=x86_64-linux-gnu-
 
 ### 3.1 结构与源文件发现
 
-根 `Makefile` 负责全局配置、对象装配、链接/镜像/运行/冒烟，并 `include` `arch/Makefile`、`kernel/Makefile`、`usr/Makefile` 三个片段（共享同一变量空间，不能单独 make）。三个片段各自用 `$(shell find ...)` 自动发现本目录源文件，所以：
+全仓库只有一个 `Makefile`（仓库根目录）：全局配置、对象清单、内核/汇编/用户态三套编译规则、链接/镜像/运行/冒烟都在里面。源文件用 `$(shell find ...)` 自动发现，所以：
 
 - 新增内核 `.c`（`kernel/` 任意子目录）或 `arch/*.c`：放进文件即可，不用改 Makefile；
 - 新增 `usr/*.c`：自动成为新用户程序并自动进磁盘镜像；
@@ -187,7 +187,7 @@ make smoke SMOKE_FLAGS="--no-build" # 复用 build/ 里现成产物
 
 - 强制 `KTEST=1`：smoke 校验的 `[ktest]` 标记只有该模式才有，`make KTEST=0 smoke` 不会把它带偏。
 - 单/双 CPU 各有独立标记集（双 CPU 要求 AP 打印 CR0/CR4、内核报 2 CPUs online；单 CPU 则反过来禁止出现 AP 行），所以**单 CPU 必须用 `--smp 1` 而不是 `--qemu-args "-smp 1"`**。
-- 完整串口记录在 `build/smoke/serial.log`（`--smp 1` 时是 `serial-smp1.log`，伪造盘的两次在 `serial-forged-*.log`），可直接核对内核自测行，如 `[ktest] selftest PASS (93 cases, 1827 checks)`。
+- 完整串口记录在 `build/smoke/serial.log`（`--smp 1` 时是 `serial-smp1.log`，伪造盘的两次在 `serial-forged-*.log`），可直接核对内核自测行，如 `[ktest] selftest PASS (94 cases, 1834 checks)`。
 - 阶段 6 用的是副本 `build/smoke/forged.img`，不碰 `build/disk.img`。
 
 手动判据（不跑 smoke 时）：串口出现 `[boot] ready in N ms` 与 `[ktest] selftest PASS`，且无 `[PANIC]`、无三重故障。
@@ -315,7 +315,7 @@ qemu-system-x86_64 ... -monitor stdio   # 与 -serial stdio 冲突，用 -serial
 | `patch_setup_jmp.py` 报找不到 `jmp 0x18:0xF00DFACE` | `setup.asm` 的哨兵跳转被改，或 `vmlinux.elf` 缺 `_start32`/`_start64` | `grep -n 'F00DFACE' arch/setup.asm`；`nm build/vmlinux.elf \| grep -E '_start(32\|64)'` |
 | `patch_bzimage.py` 断言失败 | `HdrS` 魔数或 `0x55AA` 被破坏、setup 补零逻辑被改、setup 缩到 2 KiB 以下 | `xxd -s 0x1f0 -l 32 build/bzImage` 查头部区域 |
 | 链接报 `undefined reference to '__stack_chk_fail'` | 某处没继承带 `-fno-stack-protector` 的标志集 | 检查该文件的编译规则是否用 `KERNFLAGS`/`USRFLAGS` |
-| 用户态链接报 `undefined reference to '_start'` | 链接没带 `crt0.o` | 确认走 `usr/Makefile` 的 `$(USER_ELFS)` 规则而非手写链接命令 |
+| 用户态链接报 `undefined reference to '_start'` | 链接没带 `crt0.o` | 确认走根 `Makefile` 的 `$(USER_ELFS)` 规则而非手写链接命令 |
 | 改了 `_start32`/`_start64` 后启动跳错地址 | 符号地址变了但 `setup.bin` 没重 patch | `rm -f build/setup.bin build/bzImage && make` |
 | 串口停在 `M` 之后无输出 | `console_init`/串口初始化问题，或 bootinfo 采集读到垃圾 | gdb 断 `start_kernel`，单步看 `console_init`/`kvprintf` 前后 |
 | 内核日志 `[vfs] no disk found` | IDE 探测失败（看 `[ide]` 日志），或镜像不是合法整盘 FAT32 | `rm build/disk.img` 重建；怀疑 `mkfs.vfat` 静默失败时去掉 Makefile 里的 stderr 抑制重跑 |

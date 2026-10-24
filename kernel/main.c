@@ -285,61 +285,21 @@ void start_kernel(void)
     if (bootinfo.fb.ok && bootinfo.fb.phys_addr) {
         u64 fb_bytes = (u64)bootinfo.fb.pitch * bootinfo.fb.height;
         pmm_reserve(bootinfo.fb.phys_addr, bootinfo.fb.phys_addr + fb_bytes);
-        /* fb_init() maps the LFB into the high-half PD slots
-         * [FB_PD_BASE, FB_PD_BASE + n).  Those PD entries are consumed by
-         * the framebuffer, so the physical pages they would normally alias
-         * become unreachable through PHYS_TO_VIRT() and must not be handed
-         * out as frames (a 1920x1080x32 LFB needs four slots = 8 MiB). */
+
         u64 fb_slots = (fb_bytes + 0x1FFFFFUL) >> 21;
         if (fb_slots > FB_PD_SLOTS) fb_slots = FB_PD_SLOTS;
         if (fb_slots)
             pmm_reserve((u64)FB_PD_BASE << 21, ((u64)FB_PD_BASE + fb_slots) << 21);
-        /* Same story, one window lower: the double-buffer back surface
-         * (framebuffer.h's FB_DB_*) is ordinary RAM reached through PD
-         * slots [97, 104), so the frames those slots would otherwise alias
-         * -- 194 MiB and up -- lose their high-half alias exactly like the
-         * LFB's do and must stay out of the buddy.
-         *
-         * Unlike the reserve above this one is the *whole* window, not the
-         * mode's share of it.  fb_back_init() maps page-at-a-time up to
-         * FB_DB_MAX_BYTES, and vmm_map_kernel_page() is willing to split
-         * whichever 2 MiB slot it lands on -- so any slot it might reach
-         * has to be filtered and reserved, or the split would replace the
-         * alias of frames the buddy is still handing out.  How much of the
-         * window the mode actually uses is decided later, by DISPI's pitch,
-         * which is not known yet here; reserving all of it costs memory but
-         * cannot disagree with what fb_init() ends up mapping. */
+
         pmm_reserve((u64)FB_DB_PD_BASE << 21,
                     ((u64)FB_DB_PD_BASE + FB_DB_SLOTS) << 21);
     }
 
-    /* Slot 96 is the VGA text window (entry64.S: PD_HI[96] -> PT 0x64000
-     * -> phys 0xB8000), so physical 192..194 MiB can never get a
-     * high-half alias.  Once RAM grows past 192 MiB (-m 256) those
-     * frames fall inside the buddy range: PHYS_TO_VIRT() on them would
-     * land on the VGA page and scribble it, so keep them out of the
-     * buddy.  No effect on small-RAM boots (above top_addr). */
     pmm_reserve(96UL << 21, 97UL << 21);
 
-    /* Two more ranges whose high-half alias slot is consumed by a fixed
-     * window, so PHYS_TO_VIRT() on them would land on something else and
-     * the frames must stay out of the buddy:
-     *   slot 128    (256..258 MiB)  -> DEV_VMA: the LAPIC/IOAPIC pages
-     *   slots 256..271 (512..544 MiB) -> KHEAP_VMA: filled with the heap
-     * vmm_init() skips slot 128 outright and overwrites 256..271 after the
-     * alias loop, but nothing reserved the frames behind them.  Harmless at
-     * -m 256 (the window ends below 256 MiB, so they were never handed
-     * out); live as soon as the buddy manages more, i.e. always on real
-     * hardware. */
     pmm_reserve(128UL << 21, 129UL << 21);
     pmm_reserve(256UL << 21, 272UL << 21);
 
-    /* Slot 108 (216..218 MiB) is ACPI_SCRATCH_VA's home (sys/acpi.h):
-     * vmm_init() keeps it out of the alias loop so acpi.c can re-point it
-     * at firmware table pages, so the frames behind it have no high-half
-     * alias either and must stay out of the buddy — same rule as the
-     * VGA/device windows above.  Live as soon as RAM passes 216 MiB,
-     * i.e. always on real hardware (-m 256 stays under it). */
     pmm_reserve(108UL << 21, 109UL << 21);
 
     pmm_init();
@@ -378,13 +338,6 @@ void start_kernel(void)
     else
         kprintf("[vfs] no disk found\n");
 
-    /* A disk that mounted is not a disk that can boot.  A FAT32 data disk
-     * with no /bin/init on it mounts perfectly and then has nothing to
-     * start -- the same dead end as no disk at all, one step later.  When
-     * that happens, or when there is no disk at all, fall back to the
-     * initramfs that `make INITRAMFS=` linked into this image.  A build
-     * without one carries an empty .initramfs section, vfs_mount_initramfs()
-     * answers ENOENT, and this changes nothing. */
     if (!vfs_root_ready() || !vfs_file_exists("/bin/init")) {
         if (vfs_mount_initramfs() == 0) kprintf("[vfs] initramfs mounted at /\n");
     }
@@ -394,8 +347,6 @@ void start_kernel(void)
     sched_init();
 
 #ifdef CONFIG_KTEST
-    /* Self-test stage 3 of 3: the scheduler's own task table and the root
-     * filesystem, while nothing else has run yet.  Then the verdict. */
     ktest_run(KTEST_LATE);
     ktest_summary();
 #endif

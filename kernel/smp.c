@@ -1,19 +1,3 @@
-/* SMP initialization: AP startup via INIT-SIPI-SIPI, per-CPU setup.
- *
- * Pure C since 2026-10-18 (the C++ smp.cpp + smp.hpp smp::Manager shell
- * were folded into this file and include/sys/smp.h).  The bring-up logic
- * gained three real-hardware fixes in the same move:
- *   1. APs are enumerated from the ACPI MADT (acpi.c) when available —
- *      probing APIC IDs 1..N only works on QEMU, where IDs are contiguous;
- *      real machines have topology-encoded IDs with holes and the old
- *      "2 consecutive failures -> stop" probe gave up before ever trying
- *      the second core (single-core boot on real hardware).
- *   2. A failed AP startup now sends a recovery INIT and clears the
- *      shared block, so a slow AP can never wake up during the NEXT
- *      attempt and consume that attempt's ap_id (two cores, one logical
- *      id).  The whole attempt — wait included — runs under smp_lock.
- *   3. cpu_table has a single initializer: ap_main itself.  The BSP no
- *      longer pre-fills slots for APs it has not started yet. */
 #include <sys/smp.h>
 #include <sys/apic.h>
 #include <sys/acpi.h>
@@ -213,14 +197,6 @@ void smp_init(void)
     s_next_cpu_id = 1;
     s_online_count = 1;
 
-    /* Two enumeration strategies:
-     *   MADT (acpi.c) — the architecturally correct list; required on real
-     *     hardware, where APIC IDs have topology-encoded holes the probe
-     *     below would give up on (2 consecutive failures -> stop);
-     *   probe — sequential IDs 1..N with the same 2-fail rule, kept for
-     *     boots without ACPI (and as the historical QEMU path).
-     * Logical CPU ids are handed out from s_next_cpu_id on SUCCESS only:
-     * a failed attempt never consumes a slot. */
     u32 ids[MAX_CPUS];
     u32 n = acpi_collect_ap_ids(ids, MAX_CPUS);
     u32 bsp_id = apic_get_id();
@@ -327,25 +303,8 @@ void ap_main(u32 ap_id)
 
     c->started = true;
 
-    /* Signal ready BEFORE any console output.  Console I/O must never
-     * sit on the AP-startup critical path: the BSP polls for `ready`
-     * with only AP_STARTUP_TIMEOUT_MS to spare, and a console char can
-     * cost milliseconds when the text/framebuffer aperture is UC (KVM
-     * turns every store into a VM exit; a real-machine UC LFB is the
-     * same story).  Printing first meant a slow console blew the whole
-     * budget, the BSP then fired its recovery INIT at THIS core while
-     * it was mid-kprintf holding print_lock -- and a core reset while
-     * holding the console lock wedges every later kprintf on every
-     * CPU.  With the signal first, a late console can only make the
-     * boot log slow, never the boot. */
     trampoline_signal_ready();
 
-    /* Receipt for the AP half of the mitigation: without this line only
-     * the BSP's cpu_init() prints its CR0/CR4, and a silently-skipped
-     * cpu_protect_init() on the AP path would be invisible in the boot
-     * log (SMEP is a set-and-enforce bit: user space can never observe
-     * it).  kprintf is print_lock-guarded, so the two APs cannot
-     * interleave. */
     {
         u64 c0, c4;
         __asm__ volatile("mov %%cr0,%0" : "=r"(c0));
@@ -356,12 +315,6 @@ void ap_main(u32 ap_id)
                 (int)cpu_has_smap());
     }
 
-    /* Local periodic tick: without it an AP would never quantum-preempt
-     * its current task and every preempt decision would depend on the
-     * BSP (GAP_ANALYSIS 4.6). Uses the period calibrated by the BSP in
-     * main.c — no PIT access here. jiffies stays BSP-owned (cpu.c).
-     * Arming and its log line come after the ready signal for the same
-     * reason as above. */
     lapic_timer_start(32, HZ);
 
     kprintf("[smp] AP%u online (APIC ID=%u)\n", ap_id, c->apic_id);
