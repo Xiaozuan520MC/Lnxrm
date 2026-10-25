@@ -1,0 +1,60 @@
+/* System call numbering (X-macro).
+ *
+ * Rules:
+ *  - Numbers are compact and contiguous: entry i is exactly i, with no
+ *    holes.  Anything the table does not name -- i.e. every number above
+ *    LNXRM_SYSCALL_LAST -- falls into the dispatcher's `default` arm and
+ *    answers LNXRM_ENOSYS (-38).
+ *  - New calls take the next number: append at the end and bump
+ *    LNXRM_SYSCALL_LAST in lnxrm_abi.h (the header rejects numbers past
+ *    it at compile time).
+ *  - Never renumber an existing entry from here on: user binaries are
+ *    built from this table and must keep calling the same slot for the
+ *    lifetime of the ABI.
+ *
+ * History: the table used to leave three holes for retired calls
+ * (21 getcpu, 31 getkey, 33 move).  The 0..30 renumbering compacted them
+ * away, so those old numbers now name the calls listed below -- only
+ * pre-rebuild binaries from that era would notice.  setuid took 31 in the
+ * T-031 round (the first number appended since the renumbering --
+ * appended, never renumbered, exactly as the rule above says), fb_flip
+ * took 32 for double buffering, sync took 33 (C27 persistence door), and
+ * kbd_get/inject/info took 34/35/36 for the keyboard I/O surface.
+ */
+LNXRM_SYS(read, 0)
+LNXRM_SYS(write, 1)
+LNXRM_SYS(open, 2)
+LNXRM_SYS(close, 3)
+LNXRM_SYS(lseek, 4)
+LNXRM_SYS(brk, 5)
+LNXRM_SYS(getdent, 6)
+LNXRM_SYS(dup2, 7)
+LNXRM_SYS(nanosleep, 8)
+LNXRM_SYS(getpid, 9)
+LNXRM_SYS(fork, 10)
+LNXRM_SYS(execve, 11)
+LNXRM_SYS(exit, 12)
+LNXRM_SYS(wait4, 13)
+LNXRM_SYS(kill, 14)
+LNXRM_SYS(uname, 15)
+LNXRM_SYS(sigaction, 16)
+LNXRM_SYS(sigprocmask, 17)
+LNXRM_SYS(getppid, 18)
+LNXRM_SYS(ps, 19)
+LNXRM_SYS(sigreturn, 20)
+LNXRM_SYS(diskinfo, 21)
+LNXRM_SYS(mkdir, 22)
+LNXRM_SYS(fb_info, 23)
+LNXRM_SYS(fb_clear, 24)
+LNXRM_SYS(fb_fill, 25)
+LNXRM_SYS(fb_char, 26)
+LNXRM_SYS(fb_puts, 27)
+LNXRM_SYS(unlink, 28)
+LNXRM_SYS(rmdir, 29)
+LNXRM_SYS(rename, 30)
+LNXRM_SYS(setuid, 31)
+LNXRM_SYS(fb_flip, 32)
+LNXRM_SYS(sync, 33)
+LNXRM_SYS(kbd_get, 34)
+LNXRM_SYS(kbd_inject, 35)
+LNXRM_SYS(kbd_info, 36)

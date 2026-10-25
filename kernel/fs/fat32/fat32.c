@@ -1,0 +1,432 @@
+/* FAT32 driver core: cached FAT table access, mount, and the locked
+ * fs_ops table.  Directory scanning lives in fat32_dir.c, file data in
+ * fat32_file.c and namespace changes in fat32_meta.c; shared types are
+ * in fat32_priv.h. */
+#include "fat32_priv.h"
+
+void *fat_priv; /* active mount or NULL */
+
+/* Global FAT32 lock: serialises cluster allocation,
+ * directory scans and FAT updates across CPUs.  Without it two tasks on
+ * different CPUs can allocate the same free cluster (cross-linking) or
+ * rewrite FAT/dirent sectors concurrently.  Lock order: fat -> cache -> driver. */
+spinlock_t fat_fs_lock = SPINLOCK_INIT;
+
+/* Corruption reporting is rate limited: a hostile image can trip these on
+ * every single operation, and an unbounded console flood is its own denial
+ * of service. */
+#define FAT_WARN_LIMIT 16
+
+static bool fat_warn_allowed(struct fat_mount *m)
+{
+    if (m->fat_warns >= FAT_WARN_LIMIT) return false;
+    m->fat_warns++;
+    return true;
+}
+
+static const char *fat_warn_tail(struct fat_mount *m)
+{ return m->fat_warns == FAT_WARN_LIMIT ? "; further FAT warnings suppressed" : ""; }
+
+static void fat_warn_entry(struct fat_mount *m, u32 clus, u32 val)
+{
+    if (!fat_warn_allowed(m)) return;
+    kprintf("[fat32] corrupt FAT entry: cluster %u -> 0x%08x%s\n", clus, val, fat_warn_tail(m));
+}
+
+static void fat_warn_start(struct fat_mount *m, u32 first)
+{
+    if (!fat_warn_allowed(m)) return;
+    kprintf("[fat32] chain starts at cluster %u, not a cluster of this volume%s\n", first,
+            fat_warn_tail(m));
+}
+
+static void fat_warn_steps(struct fat_mount *m, u32 clus, u32 budget)
+{
+    if (!fat_warn_allowed(m)) return;
+    kprintf("[fat32] chain walk hit its %u step budget at cluster %u "
+            "(cyclic or hostile FAT?)%s\n",
+            budget, clus, fat_warn_tail(m));
+}
+
+/* An I/O failure, named and rate-limited like the corruption reports above.
+ * Published so every layer of the driver can say *which* transfer died --
+ * "the write failed" is the only evidence a swallowed return value used to
+ * destroy (T-005). */
+void fat_warn_io(struct fat_mount *m, const char *op, u64 lba)
+{
+    if (!fat_warn_allowed(m)) return;
+    kprintf("[fat32] I/O error %s LBA %llu%s\n", op, lba, fat_warn_tail(m));
+}
+
+/* Follow the chain out of `clus`.  Only two kinds of entry are legal in a
+ * FAT: one that names a cluster of this volume, or an end-of-chain marker.
+ * A free entry (0), cluster 1, the reserved range 0x0FFFFFF0-7 and any
+ * cluster number past the end of the volume are all corruption, and are
+ * reported instead of followed -- returning an out-of-volume number would
+ * otherwise turn a forged FAT into a read past the end of the disk. */
+u32 fat_next_cluster(struct fat_mount *m, u32 clus)
+{
+    if (clus < 2 || clus >= m->max_cluster) return FAT_EOC;
+    u32 val = *(u32 *)&m->fat[clus * 4] & 0x0FFFFFFF;
+    if (cluster_is_eoc(val)) return val;
+    if (val >= 2 && val < m->max_cluster) return val;
+    fat_warn_entry(m, clus, val);
+    return FAT_EOC;
+}
+
+/* Longest walk this volume can legally need, capped by FAT_CHAIN_MAX_STEPS. */
+static u32 fat_chain_limit(struct fat_mount *m)
+{
+    return fat_chain_cap(m);
+}
+
+void fat_chain_start(struct fat_chain *ch, struct fat_mount *m, u32 first)
+{
+    ch->m = m;
+    ch->steps = fat_chain_limit(m);
+    ch->clus = FAT_EOC;
+    if (!first) return; /* empty file or directory: no chain at all */
+    if (first < 2 || first >= m->max_cluster) {
+        fat_warn_start(m, first);
+        return;
+    }
+    ch->clus = first;
+}
+
+bool fat_chain_more(struct fat_chain *ch)
+{
+    if (ch->clus < 2 || cluster_is_eoc(ch->clus)) return false;
+    if (!ch->steps) {
+        fat_warn_steps(ch->m, ch->clus, fat_chain_limit(ch->m));
+        return false;
+    }
+    return true;
+}
+
+void fat_chain_advance(struct fat_chain *ch)
+{
+    if (ch->steps) ch->steps--;
+    if (ch->clus >= 2 && !cluster_is_eoc(ch->clus))
+        ch->clus = fat_next_cluster(ch->m, ch->clus);
+}
+
+int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
+{
+    if (clus >= m->max_cluster) return LNXRM_EINVAL;
+    u32 old = *(u32 *)&m->fat[clus * 4];
+    *(u32 *)&m->fat[clus * 4] = (old & 0xF0000000) | (val & 0x0FFFFFFF);
+    /* write back the touched sector.  T-005: the result matters -- a silently
+     * lost FAT update is how two files end up owning the same cluster after
+     * the next remount, so the caller is told and the transfer is reported.
+     * The in-memory entry stays updated either way: it is what stops the next
+     * allocation scan from handing this cluster out again in the meantime. */
+    u64 off = clus * 4;
+    u64 lba = m->reserved_sectors + off / m->bytes_per_sector;
+    void *sec = &m->fat[off & ~(u64)(m->bytes_per_sector - 1)];
+    /* Through the journal: with a transaction open the after-image is only
+     * buffered (the commit record has to reach the log first, or a crash
+     * here would leave the FAT updated with no record to finish from), and
+     * with none open it is written direct -- mirroring into FAT#2, since
+     * fsck.fat compares both tables and "FATs differ" alone makes it exit
+     * nonzero -- exactly as this function did before the log existed.  The
+     * in-memory entry stays updated either way: it is what stops the next
+     * allocation scan from handing this cluster out again in the meantime. */
+    int wrc = fat_journal_add(m, lba, sec);
+    if (wrc) {
+        fat_warn_io(m, "write FAT", lba);
+        return wrc;
+    }
+    /* Track the FSInfo free-cluster summary across claim/release.  mkfs
+     * seeds it and fsck.fat verifies it ("Free cluster summary wrong" is an
+     * error), so never touching it turns any allocating session into a
+     * failing smoke gate too.  0xFFFFFFFF means "unknown" per spec, and an
+     * FSInfo sector with bad signatures is not ours to patch.  The read
+     * consults the open transaction first: several fat_set_entry() calls in
+     * one operation each nudge the count, and until the commit lands none of
+     * their edits are on the disk this sector would otherwise be read from. */
+    u32 oldv = old & 0x0FFFFFFF, newv = val & 0x0FFFFFFF;
+    if ((oldv == 0) != (newv == 0) && m->reserved_sectors > 1) {
+        u8 info[512];
+        bool have = fat_journal_read(m, 1, info);
+        if (!have) have = blk_io_read(m->dev, 1, 1, info) == 0;
+        if (have && *(u32 *)info == 0x41615252 && *(u32 *)&info[484] == 0x61417272) {
+            u32 *fc = (u32 *)&info[488];
+            if (*fc != 0xFFFFFFFF) {
+                *fc = (oldv == 0) ? (*fc ? *fc - 1 : 0) : *fc + 1;
+                if (fat_journal_add(m, 1, info))
+                    fat_warn_io(m, "write FSInfo", 1);
+            }
+        }
+    }
+    return 0;
+}
+
+u32 fat_find_free_cluster(struct fat_mount *m)
+{
+    for (u32 i = 2; i < m->max_cluster; i++)
+        if ((*(u32 *)&m->fat[i * 4] & 0x0FFFFFFF) == 0) return i;
+    return 0;
+}
+
+static int fat32_getdent_locked(void *mnt, void *dirnode, u64 *cookie, struct dirent_out *d)
+{
+    FAT_ENTER();
+    int r = fat32_getdent_impl(mnt, dirnode, cookie, d);
+    FAT_LEAVE();
+    return r;
+}
+
+static u64 fat_freespace_impl(void *mnt)
+{
+    struct fat_mount *m = fat_priv;
+    u64 free_clusters = 0;
+    for (u32 i = 2; i < m->max_cluster; i++)
+        if ((*(u32 *)&m->fat[i * 4] & 0x0FFFFFFF) == 0) free_clusters++;
+    return free_clusters * m->cluster_size;
+}
+
+/* --- locked wrappers: single global FS lock serialises all FAT32 ops --- */
+static int fat_lookup(void *mnt, const char *path, struct vnode *out)
+{
+    FAT_ENTER();
+    int r = fat_lookup_impl(mnt, path, out);
+    FAT_LEAVE();
+    return r;
+}
+
+static int fat_read(void *mnt, void *node, u64 off, void *ubuf, size_t n)
+{
+    FAT_ENTER();
+    int r = fat_read_impl(mnt, node, off, ubuf, n);
+    FAT_LEAVE();
+    return r;
+}
+
+/* --- mutation transactions ---------------------------------------------
+ * Directory and data sectors go through the write-back cache, and *nothing*
+ * used to flush it outside mount time: there is no sync syscall and no
+ * shutdown path, and eviction only helps if the LRU ever picks the slot -- a
+ * root-dir sector is re-hit by every path lookup, so it essentially never
+ * does.  mkdir/touch/rm died with QEMU and never reach disk.img, while
+ * fat_set_entry()'s FAT write is direct and *did* land, leaving the
+ * half-updated image fsck reports as "file contains a free cluster".
+ *
+ * The fix went further than the original flush: each mutating operation is
+ * now one journal transaction.  fat_journal_begin() opens it, the impl's
+ * metadata writes are buffered rather than applied, and fat_journal_commit()
+ * -- still under FAT_ENTER -- writes the records to the on-disk log, stamps
+ * the commit, applies everything home and flushes.  The whole operation
+ * lands as one unit, and if the machine dies anywhere inside that sequence
+ * the next mount finishes it from the log.  Commit runs on failure paths
+ * too: the impl may have claimed clusters or half-renamed a file before it
+ * gave up, and leaving those changes in RAM while the disk never sees them
+ * is exactly the divergence that hands the same cluster to two files. */
+static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
+{
+    FAT_ENTER();
+    fat_journal_begin(fat_priv);
+    int r = fat_write_impl(mnt, node, off, buf, n);
+    int c = fat_journal_commit(fat_priv);
+    FAT_LEAVE();
+    if (r < 0) return r;
+    return c < 0 ? c : r; /* a failed commit means the short count never landed */
+}
+
+static int fat_create(void *mnt, const char *path)
+{
+    FAT_ENTER();
+    fat_journal_begin(fat_priv);
+    int r = fat_create_impl(mnt, path);
+    int c = fat_journal_commit(fat_priv);
+    FAT_LEAVE();
+    return r ? r : c;
+}
+
+static int fat_mkdir(void *mnt, const char *path)
+{
+    FAT_ENTER();
+    fat_journal_begin(fat_priv);
+    int r = fat_mkdir_impl(mnt, path);
+    int c = fat_journal_commit(fat_priv);
+    FAT_LEAVE();
+    return r ? r : c;
+}
+
+static int fat_unlink(void *mnt, const char *path)
+{
+    FAT_ENTER();
+    fat_journal_begin(fat_priv);
+    int r = fat_unlink_impl(mnt, path);
+    int c = fat_journal_commit(fat_priv);
+    FAT_LEAVE();
+    return r ? r : c;
+}
+
+static int fat_rmdir(void *mnt, const char *path)
+{
+    FAT_ENTER();
+    fat_journal_begin(fat_priv);
+    int r = fat_rmdir_impl(mnt, path);
+    int c = fat_journal_commit(fat_priv);
+    FAT_LEAVE();
+    return r ? r : c;
+}
+
+static int fat_rename(void *mnt, const char *oldpath, const char *newpath)
+{
+    FAT_ENTER();
+    fat_journal_begin(fat_priv);
+    int r = fat_rename_impl(mnt, oldpath, newpath);
+    int c = fat_journal_commit(fat_priv);
+    FAT_LEAVE();
+    return r ? r : c;
+}
+
+static u64 fat_freespace(void *mnt)
+{
+    FAT_ENTER();
+    u64 r = fat_freespace_impl(mnt);
+    FAT_LEAVE();
+    return r;
+}
+
+static u64 fat_size(void *mnt, void *node)
+{
+    FAT_ENTER();
+    u64 r = fat_size_impl(mnt, node);
+    FAT_LEAVE();
+    return r;
+}
+
+static void fat_close_node(void *mnt, void *node)
+{
+    FAT_ENTER();
+    fat_close_node_impl(mnt, node);
+    FAT_LEAVE();
+}
+
+struct fs_ops fat32_ops = {
+    .lookup = fat_lookup,
+    .getdent = fat32_getdent_locked,
+    .read = fat_read,
+    .write = fat_write,
+    .size = fat_size,
+    .close_node = fat_close_node,
+    .create = fat_create,
+    .mkdir = fat_mkdir,
+    .unlink = fat_unlink,
+    .rmdir = fat_rmdir,
+    .rename = fat_rename,
+    .freespace = fat_freespace,
+};
+
+/* ---------------- mount ---------------- */
+void *fat_mount(struct blkdev *dev)
+{
+    u8 bpb[512];
+    if (blk_io_read(dev, 0, 1, bpb)) return NULL;
+
+    struct fat_mount *m = kmalloc(sizeof(*m));
+    if (!m) return NULL; /* T-004: mount reports failure, it does not die */
+    memset(m, 0, sizeof(*m));
+    m->dev = dev;
+    m->bytes_per_sector = *(u16 *)&bpb[11];
+    m->sectors_per_cluster = bpb[13];
+    m->reserved_sectors = *(u16 *)&bpb[14];
+    m->num_fats = bpb[16];
+    u32 fatsz16 = *(u16 *)&bpb[22];
+    u32 fatsz32 = *(u32 *)&bpb[36];
+    m->fatsz = fatsz16 ? fatsz16 : fatsz32;
+    m->root_cluster = *(u32 *)&bpb[44];
+    u32 totsec16 = *(u16 *)&bpb[19];
+    u32 totsec32 = *(u32 *)&bpb[32];
+    u32 totsec = totsec16 ? totsec16 : totsec32;
+
+    /* C38: a volume is FAT32 only when the BPB itself says so -- the boot
+     * signature, the filesystem type and a power-of-two cluster factor
+     * (the allocation and merge logic below divides and masks by it). */
+    if (bpb[510] != 0x55 || bpb[511] != 0xAA ||
+        memcmp(&bpb[82], "FAT32", 5) != 0 ||
+        !bpb[13] || (bpb[13] & (bpb[13] - 1)) != 0) {
+        kfree(m);
+        return NULL;
+    }
+
+    /* C29: every sector-sized buffer in the driver and the block cache
+     * moves exactly CACHE_SECTOR_SIZE bytes, so anything else is mounted
+     * only after it overflows -- reject here, at the only layer that sees
+     * both numbers. */
+    if (m->bytes_per_sector != dev->sector_size ||
+        m->bytes_per_sector != CACHE_SECTOR_SIZE ||
+        !m->sectors_per_cluster || !m->fatsz || !m->reserved_sectors ||
+        (m->num_fats != 1 && m->num_fats != 2) || m->root_cluster < 2 ||
+        (*(u16 *)&bpb[22] && bpb[13])) {
+        /* Not a valid FAT32 filesystem */
+        kfree(m);
+        return NULL;
+    }
+    u16 rootents = *(u16 *)&bpb[17];
+
+    /* totsec must not exceed the real device; a forged BPB could make
+     * cluster->LBA math run off the end of the disk. */
+    if (totsec && dev->num_sectors && totsec > dev->num_sectors) totsec = (u32)dev->num_sectors;
+
+    u32 fat_start = m->reserved_sectors;
+    u64 data_start = fat_start + (u64)m->num_fats * m->fatsz +
+                     (rootents * 32 + m->bytes_per_sector - 1) / m->bytes_per_sector;
+    if (data_start >= totsec) {
+        kfree(m);
+        return NULL;
+    }
+    m->data_start_lba = data_start;
+    m->max_cluster = totsec > data_start ? (totsec - data_start) / m->sectors_per_cluster + 2 : 2;
+    m->cluster_size = m->bytes_per_sector * m->sectors_per_cluster;
+
+    /* CRITICAL: clamp the cluster range to what the FAT table can hold.
+     * Without this, chain walks / allocation scans read & WRITE past the
+     * end of the cached FAT heap buffer, corrupting neighbouring objects
+     * (this was the source of the "mystery" function-pointer corruption). */
+    u32 fat_entries = m->fatsz * m->bytes_per_sector / 4;
+    if (m->max_cluster >= fat_entries) m->max_cluster = fat_entries ? fat_entries - 1 : 2;
+
+    /* The root directory cluster is turned into an LBA before any chain walk
+     * could object to it, so a BPB that names a cluster past the end of the
+     * volume must kill the mount here. */
+    if (m->root_cluster >= m->max_cluster) {
+        kprintf("[fat32] reject %s: root cluster %u outside volume "
+                "(data clusters 2..%u)\n",
+                dev->name, m->root_cluster, m->max_cluster - 1);
+        kfree(m);
+        return NULL;
+    }
+
+    m->fat_bytes = (u64)m->fatsz * m->bytes_per_sector;
+    /* The whole FAT is loaded into RAM up front.  On the 64 MiB test image that
+     * is a couple of hundred kilobytes and invisible; on a real volume it can be
+     * hundreds of megabytes.  Say how much before starting, otherwise the log
+     * stops at "trying FAT32" and a machine that is merely busy looks wedged. */
+    kprintf("[fat32] %s: loading FAT, %llu sectors (%llu MiB)\n", dev->name, (u64)m->fatsz,
+            m->fat_bytes >> 20);
+    m->fat = kmalloc(m->fat_bytes);
+    if (!m->fat || blk_io_read(dev, fat_start, m->fatsz, m->fat)) {
+        kfree(m->fat);
+        kfree(m);
+        return NULL;
+    }
+
+    /* Lay out the journal in the unused reserved sectors and roll forward
+     * any transaction the last session committed but did not get to apply.
+     * It runs after the FAT load on purpose: replay rewrites FAT sectors,
+     * and m->fat is the image every chain walk and allocation scan below
+     * reads, so the two have to be brought to the same state here, before
+     * anything can look at either. */
+    fat_journal_mount(m);
+
+    kprintf("[fat32] mounted %s: %u MiB, %u B/sector x %u/cluster, "
+            "root=%u\n",
+            dev->name, totsec * m->bytes_per_sector >> 20, m->bytes_per_sector,
+            m->sectors_per_cluster, m->root_cluster);
+
+    fat_priv = m;
+    return m;
+}
