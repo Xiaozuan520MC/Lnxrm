@@ -178,8 +178,8 @@ SYSTEST_TAGS = [
     ("unknown.99 = -ENOSYS", br"unknown\.99=-38"),
     # 钉住内核回显的 "unknown syscall N" 再等 -38：过去只等一个 -38，
     # 当 33 成为合法编号（sync）时会跨行误匹配到下一条的 -38 而假通过。
-    ("past.37 = -ENOSYS", br"past\.37=[\s\S]{0,60}?unknown syscall 37[\s\S]{0,60}?-38"),
-    ("past.38 = -ENOSYS", br"past\.38=[\s\S]{0,60}?unknown syscall 38[\s\S]{0,60}?-38"),
+    ("past.39 = -ENOSYS", br"past\.39=[\s\S]{0,60}?unknown syscall 39[\s\S]{0,60}?-38"),
+    ("past.40 = -ENOSYS", br"past\.40=[\s\S]{0,60}?unknown syscall 40[\s\S]{0,60}?-38"),
     ("open.fd >= 0", br"open\.fd=\d+"),
     ("read.after.seek = 15", br"read\.after\.seek=15"),
     ("read.at.end = tail only", br"read\.at\.end=[1-9]\d*"),
@@ -202,6 +202,18 @@ SYSTEST_TAGS = [
     ("user kbd_get refused", br"user\.kbd\.get=-13"),
     ("user kbd_inject refused", br"user\.kbd\.inject=-13"),
     ("user kbd_info open", br"user\.kbd\.info=0"),
+    # mouse 37-38: the aux pointer's read-only surface.  Headless boot,
+    # so the ring must still be empty; like the kbd block above this is
+    # only refused-as-user / answered-as-root, no inject exists.
+    ("mouse info returns 0", br"mouse\.info\.ret=0"),
+    ("mouse ring empty at systest", br"mouse\.info\.pending0=0"),
+    ("mouse capacity > 0", br"mouse\.info\.capacity=[1-9]\d*"),
+    ("mouse counters sane", br"mouse\.info\.sane=1"),
+    ("mouse.get on empty ring = -EAGAIN", br"mouse\.get\.empty=-11"),
+    ("mouse ring empty after get", br"mouse\.info\.pending1=0"),
+    ("mouse aux reset acked", br"mouse\.info\.inited=1"),
+    ("user mouse_get refused", br"user\.mouse\.get=-13"),
+    ("user mouse_info open", br"user\.mouse\.info=0"),
     # T-030: cred tiers visible through ps (idle=kxld=2, init=root=1)
     ("ps idle kind = kxld", br"ps\.kind\.idle=2"),
     ("ps init kind = root", br"ps\.kind\.init=1"),
@@ -725,32 +737,6 @@ def run_shell_steps(report, guest, args):
                    b"[PANIC]" not in region)
     else:
         report.add("shell: send 'systest'", False, "stdin closed")
-
-    # /bin/kbd: the human-facing keyboard probe.  `kbd test` synthesizes
-    # 4 keys through kbd_inject and drains them through kbd_get; while it
-    # runs nobody else reads stdin, so the shell loses nothing.  The wait
-    # pattern is the test's LAST line, so the next step's cursor cannot
-    # match `kbd test`'s own output.
-    if guest.send("kbd test"):
-        region_start = guest.cursor
-        m = guest.wait(br"kbd\.info\.after\.pending=\d", args.timeout)
-        report.add("shell: kbd test completed", m is not None,
-                   "kbd info.after.pending missing")
-        region = guest.region(region_start)
-        for label, pat in [
-            ("kbd inject = 4", br"kbd\.inject=4"),
-            ("kbd drain = 4", br"kbd\.drain\.n=4"),
-            ("kbd roundtrip ok", br"kbd\.roundtrip=1"),
-            ("kbd drained to EAGAIN", br"kbd\.eagain\.after=-11"),
-        ]:
-            report.add("kbd test %s" % label,
-                       re.search(pat, region) is not None, "pattern not found")
-        report.add("kbd ran clean", b"command not found" not in region and
-                   b"[PANIC]" not in region)
-    else:
-        report.add("shell: send 'kbd test'", False, "stdin closed")
-
-    step("kbd info", br"kbd\.info\.pending=0", "kbd info one-shot snapshot")
 
     tail_bytes = bytes(guest.buf)[-4096:]
     report.add("console still alive at shutdown", b"[PANIC]" not in tail_bytes)

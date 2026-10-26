@@ -186,6 +186,12 @@ static void ps2_kbd_init(void)
     kprintf("[kbd] PS/2 ready, IRQ1 -> vector 33\n");
 }
 
+/* PS/2 mouse: i8042 aux probe + IOAPIC IRQ12 (vector 44).  Runs FIRST so
+ * the whole init is a no-IRQ zone: its config read rides the keyboard
+ * channel while IRQ1 is still unrouted, and aux probe replies cannot be
+ * stolen by the IRQ1 handler yet. */
+extern void ps2_mouse_init(void);
+
 /* COM1 serial: IOAPIC IRQ4 (vector 36) routing + rx interrupt. */
 static void serial_irq_init(void)
 {
@@ -324,6 +330,7 @@ void start_kernel(void)
     /* Map framebuffer into kernel VA (needs pmm + vmm ready). */
     if (bootinfo.fb.ok && bootinfo.fb.phys_addr) fb_init();
 
+    ps2_mouse_init();
     ps2_kbd_init();
     serial_irq_init();
 

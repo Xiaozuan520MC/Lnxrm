@@ -18,8 +18,9 @@
  * pre-rebuild binaries from that era would notice.  setuid took 31 in the
  * T-031 round (the first number appended since the renumbering --
  * appended, never renumbered, exactly as the rule above says), fb_flip
- * took 32 for double buffering, sync took 33 (C27 persistence door), and
- * kbd_get/inject/info took 34/35/36 for the keyboard I/O surface.
+ * took 32 for double buffering, sync took 33 (C27 persistence door),
+ * kbd_get/inject/info took 34/35/36 for the keyboard I/O surface, and
+ * mouse_get/info took 37/38 for the PS/2 aux pointer (2026-10-26).
  */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
@@ -58,3 +59,5 @@ LNXRM_SYS(sync, 33)
 LNXRM_SYS(kbd_get, 34)
 LNXRM_SYS(kbd_inject, 35)
 LNXRM_SYS(kbd_info, 36)
+LNXRM_SYS(mouse_get, 37)
+LNXRM_SYS(mouse_info, 38)

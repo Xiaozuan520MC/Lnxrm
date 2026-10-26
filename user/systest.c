@@ -596,6 +596,12 @@ int main(int argc, char **argv)
             struct lnxrm_kbd_info ku = {0};
             say("user.kbd.info", kkbd_info(&ku));        /* 0 */
 
+            /* mouse_get pops single-shot pointer state (CAP_SYS_ADMIN
+             * for consuming it), mouse_info stays the open reader. */
+            say("user.mouse.get", kmouse_get(0));        /* -13 */
+            struct lnxrm_mouse_info mu = {0};
+            say("user.mouse.info", kmouse_info(&mu));    /* 0 */
+
             kexit(0);
         }
 
@@ -930,6 +936,29 @@ int main(int argc, char **argv)
             say("kbd.info.pending1",
                 kkbd_info(&ki) == 0 ? (long)ki.pending : -1);
         }
+    }
+
+    /* ---- mouse 37-38: the aux pointer's read-only surface ----
+     * Headless boot: no aux bytes exist, so the ring stays empty; the
+     * same typed-ahead tolerance as the kbd block (skip, never drain)
+     * keeps real hardware honest too. */
+    {
+        struct lnxrm_mouse_info mi = {0};
+        struct lnxrm_mouse_state ev = {0};
+        say("mouse.info.ret", kmouse_info(&mi));
+        say("mouse.info.pending0", mi.pending);
+        say("mouse.info.capacity", mi.capacity);
+        say("mouse.info.sane",
+            mi.pending <= mi.capacity && mi.dropped <= mi.packets_total &&
+            mi.moved_total <= mi.packets_total);
+        if (mi.pending != 0) {
+            say("mouse.skip", 1); /* a real pointer: leave its events alone */
+        } else {
+            say("mouse.get.empty", kmouse_get(&ev)); /* -11: nothing pending */
+            say("mouse.info.pending1",
+                kmouse_info(&mi) == 0 ? (long)mi.pending : -1);
+        }
+        say("mouse.info.inited", mi.inited);
     }
 
     say("systest.done", 1);

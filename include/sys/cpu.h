@@ -128,6 +128,15 @@ long kbd_get_byte(void);  /* 0..255 key code, LNXRM_EAGAIN when empty */
 long kbd_inject_bytes(const char *kbuf, u32 len); /* keys accepted */
 void kbd_stats(struct lnxrm_kbd_info *k);         /* counters snapshot */
 
+/* mouse syscalls 37-38 land in kernel/drivers/ps2mouse.c; same split. */
+struct lnxrm_mouse_state;
+struct lnxrm_mouse_info;
+void ps2_mouse_init(void);
+void ms_feed_byte(u8 b); /* ktest drives synthetic packets past the IRQ */
+long mouse_pop(struct lnxrm_mouse_state *out); /* 0 ok, -1 empty */
+u32 ms_pending(void);    /* events buffered right now */
+void ms_stats(struct lnxrm_mouse_info *m); /* counters snapshot */
+
 extern volatile u64 jiffies;
 #define HZ 100
 

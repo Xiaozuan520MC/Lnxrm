@@ -43,7 +43,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  36
+#define LNXRM_SYSCALL_LAST  38
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
@@ -191,6 +191,36 @@ struct lnxrm_kbd_info {
 };
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_kbd_info) == 32, "kbd_info ABI");
+
+/* mouse_get (37): one decoded PS/2 packet.  Deltas are the 9-bit signed
+ * values the three-byte stream carried (overflow packets push 0, never
+ * garbage); buttons are bit0 left, bit1 middle, bit2 right. */
+struct lnxrm_mouse_state {
+    int32_t dx;
+    int32_t dy;
+    uint32_t buttons;
+    uint32_t reserved; /* room to grow without breaking the ABI */
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_mouse_state) == 16, "mouse ABI");
+
+/* mouse_info (38): the aux-port counters a pointer probe wants.  Mirrors
+ * lnxrm_kbd_info: pending is what a mouse_get would answer, capacity the
+ * ring's usable size, and the rest is monotonic bookkeeping -- `inited`
+ * says ps2_mouse_init() saw a real reset/ack probe (headless QEMU and
+ * mouse-less machines answer 0). */
+struct lnxrm_mouse_info {
+    uint32_t pending;        /* events buffered right now */
+    uint32_t capacity;       /* ring capacity in events */
+    uint32_t packets_total;  /* events ever accepted into the ring */
+    uint32_t moved_total;    /* events with a nonzero delta */
+    uint32_t resyncs;        /* packets lost to a corrupt stream */
+    uint32_t dropped;        /* events lost to a full ring */
+    uint32_t inited;         /* aux reset probe succeeded */
+    uint32_t reserved[1];
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_mouse_info) == 32, "mouse_info ABI");
 
 /* ps: one fixed-size record per task, written into the caller's buffer. */
 enum lnxrm_task_state {

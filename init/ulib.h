@@ -112,6 +112,12 @@ static inline long kkbd_inject(const char *s, u32 len)
 static inline long kkbd_info(struct lnxrm_kbd_info *k)
 { return syscall1(SYS_kbd_info, (long)k); }
 
+static inline long kmouse_get(struct lnxrm_mouse_state *m)
+{ return syscall1(SYS_mouse_get, (long)m); }
+
+static inline long kmouse_info(struct lnxrm_mouse_info *m)
+{ return syscall1(SYS_mouse_info, (long)m); }
+
 /* Drop (or, as root, set) this process's uid.  Root may name any uid;
  * naming a uid other than 0 clears the tier to user and every capability
  * with it -- irreversible from there, which is what makes the T-031

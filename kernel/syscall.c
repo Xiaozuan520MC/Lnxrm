@@ -308,6 +308,31 @@ static long sys_kbd_info(struct lnxrm_kbd_info *uinfo)
     return 0;
 }
 
+/* ---- mouse syscalls (37-38) ----
+ * mouse_get pops one decoded PS/2 packet; like kbd_get the events are
+ * single-shot state, so it rides CAP_SYS_ADMIN.  Validate the 16-byte
+ * receiver first (EFAULT on NULL/bad -- even with an empty ring, per the
+ * EFAULT-on-bad-pointer rule), then pop, then copy.
+ * mouse_info is the open counter reader, exactly kbd_info. */
+static long sys_mouse_get(struct lnxrm_mouse_state *um)
+{
+    if (!um) return LNXRM_EFAULT;
+    if (!user_ptr_ok((u64)um, sizeof(*um))) return LNXRM_EFAULT;
+    struct lnxrm_mouse_state m;
+    if (mouse_pop(&m) != 0) return LNXRM_EAGAIN;
+    if (copy_to_user(um, &m, sizeof(m)) < 0) return LNXRM_EFAULT;
+    return 0;
+}
+
+static long sys_mouse_info(struct lnxrm_mouse_info *uinfo)
+{
+    struct lnxrm_mouse_info info;
+    if (!uinfo) return LNXRM_EFAULT;
+    ms_stats(&info);
+    if (copy_to_user(uinfo, &info, sizeof(info)) < 0) return LNXRM_EFAULT;
+    return 0;
+}
+
 /* Copy a NUL-terminated path out of user space and run a path syscall on it. */
 static long path_syscall(u64 upath, long (*fn)(const char *))
 
@@ -473,6 +498,14 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         break;
     case SYS_kbd_info:
         ret = sys_kbd_info((struct lnxrm_kbd_info *)f->rdi);
+        break;
+    case SYS_mouse_get:
+        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "mouse_get")) != 0)
+            break;
+        ret = sys_mouse_get((struct lnxrm_mouse_state *)f->rdi);
+        break;
+    case SYS_mouse_info:
+        ret = sys_mouse_info((struct lnxrm_mouse_info *)f->rdi);
         break;
     default:
         /* Anything the table does not name: numbers above LNXRM_SYSCALL_LAST. */
