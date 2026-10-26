@@ -419,7 +419,7 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
 | 34 | `kbd_get` | 非阻塞取一个键（0..255），空则 `EAGAIN`；`CAP_SYS_ADMIN` | `kernel/isr.c` |
 | 35 | `kbd_inject` | 代打键序列进输入环（唤醒 waiter），≤256 字节；`CAP_SYS_ADMIN` | `kernel/syscall.c` |
 | 36 | `kbd_info` | 键盘/输入环计数快照（32 字节 `lnxrm_kbd_info`，两道门都不过） | `kernel/isr.c` |
-| 37 | `mouse_get` | 非阻塞弹一个 PS/2 指针事件（16 字节 `lnxrm_mouse_state`，空则 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/syscall.c` |
+| 37 | `mouse_get` | 非阻塞弹一个 PS/2 指针事件（16 字节 `lnxrm_mouse_state`：`dx/dy/buttons/wheel`，空则 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/syscall.c` |
 | 38 | `mouse_info` | aux 事件环计数快照（32 字节 `lnxrm_mouse_info`，两道门都不过） | `kernel/drivers/ps2mouse.c` |
 
 图形相关共 6 个：`fb_info`/`fb_clear`/`fb_fill`/`fb_char`/`fb_puts`（23–27）与 `fb_flip`(32)。
@@ -647,20 +647,29 @@ kernel/fs/
   挂死——所有回复都带预算轮询）。`ps2_mouse_init()` 排在 `ps2_kbd_init()` **之前**：
   探测全程没有任何已注册中断，配置命令字节（走键盘通道）与 aux 回包都读不到 race；
   探测序列 `0xA8（使能 aux 口）→ 配置字节 bit1 置 1 / bit5 清 0 → 0xFF 复位（期望
-  0xFA/0xAA/0x00）→ 0xF6 默认值 → 0xF4 流式上报 → 最后才挂 IRQ12 向量 44`。三字节标准包
-  `{LB,MB,RB,1,Xs,Ys,Xov,Yov}, dx, dy`：9 位符号在 flags 里，溢出包强制 delta=0
-  （不给用户垃圾值），flags 缺 `0x08` 一致位即失步丢弃并计 `resyncs`。IRQ12 handler
+  0xFA/0xAA/0x00）→ 0xF6 默认值 → **滚轮探测**（rate 三元组 `200/200/10`、`200/200/80`、
+  `200/100/80` 各跟一次 `0xF2`：回 id `0x03`/`0x04` 即 4 字节 wheel 模式，都无应答保持
+  3 字节；仍在无中断窗口内，回复全带预算）→ 0xF4 流式上报 → 最后才挂 IRQ12 向量 44`。
+  3 字节标准包 `{LB,MB,RB,1,Xs,Ys,Xov,Yov}, dx, dy`：9 位符号在 flags 里，溢出包强制
+  delta=0（不给用户垃圾值），flags 缺 `0x08` 一致位即失步丢弃并计 `resyncs`；PS/2 线上
+  y 正=上，解码出口取负统一成屏幕向（dy 正=下，wheel 正=下滚）；4 字节包
+  第 4 字节是 4 位符号扩展滚动 delta（-8..7），QEMU 探测器认 `200/200/80` 与
+  `200/100/80` 两对三元组。IRQ12 handler
   按状态寄存器的 AUX 位过滤（键盘字节留给 IRQ1 handler），单中断内至多倒 32 字节。
-- 鼠标整面 = 64 槽事件环（容量 63，满即丢弃并 `dropped`）+ `ms_stats` 计数器
-  `{pending, capacity, packets_total, moved_total, resyncs, dropped, inited}`；
-  语义对 kbd 环逐项镜像，取走即消费。`mouse_get(37)` 门（`CAP_SYS_ADMIN`）在指针校验
+- 鼠标整面 = 64 槽事件环（容量 63，满即丢弃并 `dropped`，事件多带 `wheel`，
+  3 字节模式恒 0）+ `ms_stats` 计数器 `{pending, capacity, packets_total, moved_total,
+  resyncs, dropped, inited}`；语义对 kbd 环逐项镜像，取走即消费。**内核不带屏上
+  指针**——屏上有没有光标、怎么画，由用户态读事件流自行决定。`mouse_get(37)` 门（`CAP_SYS_ADMIN`）在指针校验
   之前——`EFAULT` 对 NULL/坏指针**在空环时也先答**（refuse-then-pop-then-copy）；
   `mouse_info(38)` 只读全放行。内核侧由 `kernel/drivers/ps2mouse.c` 提供
   `mouse_pop/ms_feed_byte`，`ms_feed_byte` 就是 ktest 驱动合成包、锁住确定性的入口。
 - `ktest/t_mouse.c`（LATE 两例，USER_BASE+0xE000 独立 VA 页）：`syscall_probe` 走真
   分发面——空环 `EAGAIN`、空环也先答 `EFAULT` 的坏指针、跨页未映射、9 位符号
-  （+3/-2/-1）、双溢出包 delta=0、失步字节记账、63 容量 + 第 64 个事件如实丢弃 +
-  FIFO 取回空。
+  解包并统一成屏幕向（PS/2 线上 y 正=上，出口取负：dy 正=下，dx 正=右，wheel 正=下滚）、
+  双溢出包 delta=0、失步字节记账、63 容量 + 第 64 个事件如实丢弃 +
+  FIFO 取回空；两种 framing 都被显式驱动（3 字节段 + 4 字节滚轮段含第 4 字节符号
+  扩展、溢出、sanity 位不漏进 `buttons`），收尾 `ms_set_packet_bytes()`
+  恢复实时模式。
 
 ### 7.3 IDE 与 AHCI
 
@@ -879,11 +888,11 @@ smp_init():
 |---|---|---|---|
 | early | 25 | 371 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 66 | 1786 | 0 |
-| 合计 | 108 | 2594 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 66 | 1799 | 0 |
+| 合计 | 108 | 2607 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (108 cases, 2594 checks) [2 skipped]` 与
-`[selftest] 2594/2594 pass [1 warn]`——两者以实机 boot 日志为准，此表是
+汇总行 `[ktest] selftest PASS (108 cases, 2607 checks) [2 skipped]` 与
+`[selftest] 2607/2607 pass [1 warn]`——两者以实机 boot 日志为准，此表是
 2026-10-26（mouse 37/38 之后）的快照，后续加用例先改这里；那个 warn 是
 用例自己打的**故意告警**，`WARN` 只计数永不判负，`ASSERT` 失败计失败，
 `BUG_ON` 在任何模式下都停机。
@@ -911,7 +920,7 @@ ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入
 - LATE 阶段另搜 6 条报告行（块缓存 LRU、写后读一致、FAT 区不缓存、journal 先写日志 +
   重放），因为 `.ktest` 段内的先后顺序是编译器的事。
 - 负面判据：日志不得出现 `WARN(`、`2097151`、`4294967295`、`[PANIC]`。
-- 当前 `make smoke` **219/219**；transcript 写 `build/smoke/serial.log`
+- 当前 `make smoke` **203/203**；transcript 写 `build/smoke/serial.log`
   （非默认 smp 档位写 `serial-smpN.log`，互不覆盖）。
 - 日志里出现的 `[fat32] I/O error` 是错误注入用例**故意**打的，不是回归。
 

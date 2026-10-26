@@ -3,16 +3,18 @@
  * The controller splits the ports by the status register's AUX bit: IRQ12
  * (IOAPIC wire 12 -> vector 44) carries aux reads only.  Every reply below
  * is bounded, so a mouse-less machine degrades to inited=0 instead of
- * hanging the boot.  Packets are the standard 3-byte stream:
+ * hanging the boot.  Packets are the standard 3-byte stream
  *   [0] {LB,MB,RB,1,Xs,Ys,Xov,Yov}, [1] dx low 8, [2] dy low 8
  * with the 9-bit sign in the flags; an overflow packet forces the delta
- * to 0 so no garbage deltas ever reach users.
+ * to 0 so no garbage deltas ever reach users.  The IntelliMouse probe
+ * (rate triples 200/200/10, 200/200/80, 200/100/80; 0xF2 then answers
+ * id 0x03 or 0x04) switches to the 4-byte
+ * stream whose 4th byte is a sign-extended 4-bit wheel delta.
  *
- * The whole surface is the ring plus the counters -- no fb cursor.  KTest
- * drives complete packets through ms_feed_byte(), the exact path the IRQ
- * takes, which keeps headless boots deterministic (real aux traffic can't
- * appear in them, so the ring starts empty and the sole producer is the
- * test). (2026-10-26) */
+ * ms_feed_byte() lets ktest drive complete packets without any IRQ,
+ * which keeps headless boots deterministic (real aux traffic can't
+ * appear in them, so the ring starts empty and the sole producer is
+ * the test). (2026-10-26) */
 #include <types.h>
 #include <io.h>
 #include <console.h>
@@ -30,9 +32,15 @@
  * stream overflows it after ~0.6 s unread -- events are honestly dropped. */
 #define MSR_SZ 64
 
+/* Packet length: 3 bytes standard, 4 in IntelliMouse wheel mode (the 4th
+ * byte bits 0..3 are the signed wheel delta).  Set by the 0xF2 identify
+ * probe; ms_set_packet_bytes() lets ktest drive both framings. */
+static int ms_bytes = 3;
+
 struct ms_event {
     int dx, dy;
     u32 buttons;
+    int wheel;
 };
 
 static struct ms_event msring[MSR_SZ];
@@ -44,7 +52,7 @@ static spinlock_t ms_lock = SPINLOCK_INIT;
 /* Packet reassembly state.  Only ms_feed_byte() writers, which run under
  * the same lock the ring does -- the ISR and a ktest caller cannot race
  * a half-assembled packet. */
-static u8 ms_pkt[3];
+static u8 ms_pkt[4];
 static int ms_npkt;
 
 static u32 ms_count(volatile u32 *c)
@@ -59,7 +67,17 @@ u32 ms_pending(void)
     return (w - r) % MSR_SZ;
 }
 
-static void ms_push(int dx, int dy, u32 buttons)
+int ms_bytes_per_packet(void)
+{
+    return ms_bytes;
+}
+
+void ms_set_packet_bytes(int n) /* ktest framing control; init sets it once */
+{
+    if (n == 3 || n == 4) ms_bytes = n;
+}
+
+static void ms_push(int dx, int dy, u32 buttons, int wheel)
 {
     u64 flags;
     spin_lock_irqsave(&ms_lock, &flags);
@@ -72,6 +90,7 @@ static void ms_push(int dx, int dy, u32 buttons)
     msring[w].dx = dx;
     msring[w].dy = dy;
     msring[w].buttons = buttons;
+    msring[w].wheel = wheel;
     __atomic_store_n(&ms_w, (w + 1) % MSR_SZ, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&ms_packets, 1u, __ATOMIC_RELAXED);
     if (dx || dy) __atomic_add_fetch(&ms_moved, 1u, __ATOMIC_RELAXED);
@@ -80,7 +99,16 @@ static void ms_push(int dx, int dy, u32 buttons)
 
 /* One byte down the exact path the ISR rides: a flags byte must carry the
  * 0x08 sanity bit or the stream is desynced and the byte is discarded
- * (counted); a complete packets becomes one ring event. */
+ * (counted); a complete packet (ms_bytes long) becomes one ring event and
+ * one cursor nudge.  In wheel mode the 4th byte carries a sign-extended
+ * 4-bit scroll delta; its upper bits (horizontal wheel on exotic devices)
+ * are ignored. */
+static int ms_wheel_decode(u8 b)
+{
+    int w = b & 0x0F;
+    return w >= 8 ? w - 16 : w;
+}
+
 void ms_feed_byte(u8 b)
 {
     u64 flags;
@@ -97,7 +125,7 @@ void ms_feed_byte(u8 b)
         return;
     }
     ms_pkt[ms_npkt++] = b;
-    if (ms_npkt < 3) {
+    if (ms_npkt < ms_bytes) {
         spin_unlock_irqrestore(&ms_lock, flags);
         return;
     }
@@ -107,8 +135,11 @@ void ms_feed_byte(u8 b)
     int dy = ms_pkt[2] - (f & 0x20 ? 256 : 0);
     if (f & 0x40) dx = 0;
     if (f & 0x80) dy = 0;
+    dy = -dy; /* PS/2 wire: positive y = up; our exit is screen-space (down) */
+    u32 buttons = f & 7;
+    int wheel = ms_bytes == 4 ? ms_wheel_decode(ms_pkt[3]) : 0;
     spin_unlock_irqrestore(&ms_lock, flags);
-    ms_push(dx, dy, f & 7);
+    ms_push(dx, dy, buttons, wheel);
 }
 
 /* mouse_get 37's kernel half: pop one decoded event, 0 or empty. */
@@ -127,12 +158,12 @@ long mouse_pop(struct lnxrm_mouse_state *out)
     out->dx = e.dx;
     out->dy = e.dy;
     out->buttons = e.buttons;
-    out->reserved = 0;
+    out->wheel = e.wheel;
     return 0;
 }
 
 /* mouse_info 38's kernel half: a counters snapshot, same slackness as
- * kbd_stats -- a concurrent SMP pop may skew one field, never a lie. */
+ * kbd_stats -- a concurrent SMP pop may skew one field, never turn a lie. */
 void ms_stats(struct lnxrm_mouse_info *m)
 {
     if (!m) return;
@@ -143,7 +174,6 @@ void ms_stats(struct lnxrm_mouse_info *m)
     m->resyncs = ms_count(&ms_resyncs);
     m->dropped = ms_count(&ms_dropped);
     m->inited = ms_count(&ms_inited);
-    m->reserved[0] = 0;
 }
 
 /* ---- i8042 aux plumbing ---- */
@@ -226,6 +256,36 @@ static void mouse_irq_handler(struct intr_frame *f)
     }
 }
 
+/* IntelliMouse family probe.  The impossible-in-practice rate triple
+ * 200/200/x switches a wheel mouse to a 4-byte reporting mode; vendors
+ * disagree about x, so a few triples are offered and 0xF2 identifies the
+ * live one afterwards: id 3 = wheel mouse, id 4 = "Explorer" -- both send
+ * the 4-byte packet with the wheel byte.  QEMU's detector accepts
+ * 200/200/80 and 200/100/80.  Every reply is bounded: an unresponsive or
+ * plain 3-button device just stays 3-byte. */
+static void ms_probe_wheel(void)
+{
+    static const u8 tries[3][3] = {
+        {200, 200, 10},  /* MS IntelliMouse */
+        {200, 200, 80},  /* MS IntelliMouse Explorer, QEMU IMEX */
+        {200, 100, 80},  /* wheel clones, QEMU IMPS/2 */
+    };
+    for (int i = 0; i < 3 && ms_bytes == 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            aux_cmd(0xF3);
+            if (aux_ack(0xFA, ACK_BUDGET_FAST)) return; /* device went quiet */
+            aux_cmd(tries[i][j]);
+            if (aux_ack(0xFA, ACK_BUDGET_FAST)) return;
+        }
+        aux_cmd(0xF2);
+        u8 id;
+        if (aux_ack(0xFA, ACK_BUDGET_FAST) == 0 && aux_read(ACK_BUDGET_FAST, &id) == 0 &&
+            (id == 0x03 || id == 0x04)) {
+            ms_bytes = 4;
+        }
+    }
+}
+
 void ps2_mouse_init(void)
 {
     i8042_flush();
@@ -250,6 +310,9 @@ void ps2_mouse_init(void)
 
     aux_cmd(0xF6); /* sane defaults */
     if (aux_ack(0xFA, ACK_BUDGET_FAST)) goto fail;
+
+    ms_probe_wheel();
+
     aux_cmd(0xF4); /* enable streaming: packets may start any moment */
     if (aux_ack(0xFA, ACK_BUDGET_FAST)) goto fail;
 
@@ -260,7 +323,8 @@ void ps2_mouse_init(void)
     irq_install(12, mouse_irq_handler);
 
     __atomic_store_n(&ms_inited, 1u, __ATOMIC_RELAXED);
-    kprintf("[mouse] PS/2 aux ready, IRQ12 -> vector 44\n");
+    kprintf("[mouse] PS/2 aux ready, IRQ12 -> vector 44, %d-byte packets%s\n", ms_bytes,
+            ms_bytes == 4 ? " (wheel)" : "");
     return;
 
 fail:

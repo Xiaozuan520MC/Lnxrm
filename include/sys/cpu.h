@@ -136,6 +136,8 @@ void ms_feed_byte(u8 b); /* ktest drives synthetic packets past the IRQ */
 long mouse_pop(struct lnxrm_mouse_state *out); /* 0 ok, -1 empty */
 u32 ms_pending(void);    /* events buffered right now */
 void ms_stats(struct lnxrm_mouse_info *m); /* counters snapshot */
+int ms_bytes_per_packet(void); /* 3 or 4 (wheel mode), set by the init probe */
+void ms_set_packet_bytes(int n); /* ktest framing control */
 
 extern volatile u64 jiffies;
 #define HZ 100
