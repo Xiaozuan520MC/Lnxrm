@@ -26,3 +26,4 @@ ISO 额外要 grub-mkrescue + grub-pc-bin；镜像要 dosfstools（mkfs.vfat）�
   docs/BUILD.md          构建、运行、调试、排障
   docs/CODEBASE.md       代码结构与各子系统契约
   docs/GAP_ANALYSIS.md   当前开放缺陷、能力差距、修复优先级
+

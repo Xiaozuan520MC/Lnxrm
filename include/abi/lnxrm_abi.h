@@ -192,14 +192,17 @@ struct lnxrm_kbd_info {
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_kbd_info) == 32, "kbd_info ABI");
 
-/* mouse_get (37): one decoded PS/2 packet.  Deltas are the 9-bit signed
- * values the three-byte stream carried (overflow packets push 0, never
- * garbage); buttons are bit0 left, bit1 middle, bit2 right. */
+/* mouse_get (37): one decoded PS/2 packet.  Deltas are screen-space
+ * (positive x = right, positive y = down): the stream's 9-bit signed
+ * values, with y negated at the exit -- PS/2 wires positive y as *up*
+ * (overflow packets push 0, never garbage).  Buttons are bit0 left,
+ * bit1 middle, bit2 right.  Wheel is the IntelliMouse 4-byte mode's
+ * scroll delta (-8..7, positive = scroll down), 0 in 3-byte mode. */
 struct lnxrm_mouse_state {
     int32_t dx;
     int32_t dy;
     uint32_t buttons;
-    uint32_t reserved; /* room to grow without breaking the ABI */
+    int32_t wheel;
 };
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_mouse_state) == 16, "mouse ABI");
