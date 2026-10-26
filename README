@@ -5,7 +5,7 @@ Unix 风格小系统。C/ASM 两语言，无第三方库，全程零警告构建
 
 构建与运行
 
-依赖：gcc（x86_64 freestanding）、nasm、binutils、python3、qemu-system-x86_64；
+依赖：gcc、nasm、binutils、python3、qemu-system-x86_64；
 ISO 额外要 grub-mkrescue + grub-pc-bin；镜像要 dosfstools（mkfs.vfat）与 mtools。
 
   make            构建 build/bzImage（KTEST=1 make 为带自测的变体）
