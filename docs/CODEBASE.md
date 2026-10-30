@@ -41,7 +41,8 @@ arch/                 架构相关：汇编、CPU 状态、链接脚本
   kernel.ld           单一连续 .image 段（VMA 0xffffffff80100000 / LMA 0x100000）+ .bss + 启动栈
 include/              全部头文件，本目录没有实现文件
   abi/                lnxrm_abi.h（跨态结构体/错误码/信号号）+ lnxrm_syscalls.def（编号 X-macro）
-  sys/                sched cred vfs cpu apic smp acpi percpu spinlock protect ktest
+  sys/                sched cred vfs cpu apic smp acpi percpu spinlock protect
+                      ktest input
   mm/                 mm.h（pmm/kheap/vmm 接口与常量）、pagefault.h
   其余                 types.h boot.h console.h framebuffer.h disk.h elf.h io.h pci.h
                       font8x16.h fat32_priv.h
@@ -50,6 +51,7 @@ kernel/               内核 C 实现
   syscall.c           分发、能力门/归属门、brk/kill/uname/diskinfo/setuid
   task.c sched.c      进程生命周期 / 调度与自旋锁 / 信号 isr.c elf.c apic.c acpi.c
   signal.c            信号投递、handler 投递、sigreturn
+  input_event.c       统一输入事件队列（39/40 的 63 槽环，叠加在生产者上）
   smp.c               AP 拉起与 ap_main
   percpu.c protect.c framebuffer.c print.c selftest.c
   mm/                 pmm.c(buddy) kheap.c(分箱堆) vmm.c(页表) pagefault.c(#PF 分发)
@@ -57,9 +59,9 @@ kernel/               内核 C 实现
   fs/fat32/           fat32.c fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
   drivers/            pci.c ide.c ahci.c uart.c ps2mouse.c
   lib/string.c        memcpy memset strcmp strcpy strlen
-ktest/                启动自测：ktest.c 框架 + 22 个 t_*.c 用例文件
+ktest/                启动自测：ktest.c 框架 + 24 个 t_*.c 用例文件
 init/                 用户态运行库（crt0.S + ulib.c/h），链接进每个用户程序
-user/                 16 个用户程序，一个 .c 一个二进制
+user/                 17 个用户程序，一个 .c 一个二进制
 scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_test.py
 ```
 
@@ -75,7 +77,7 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
 | `NR_FDS` | 16 | `include/types.h` |
 | `KSTACK_SIZE` | 32768 | `include/sys/sched.h` |
 | `LNXRM_NR_SIGNALS` | 32 | `include/abi/lnxrm_abi.h` |
-| `LNXRM_SYSCALL_LAST` | 38（编号 0–38 共 39 个） | `include/abi/lnxrm_abi.h` |
+| `LNXRM_SYSCALL_LAST` | 40（编号 0–40 共 41 个） | `include/abi/lnxrm_abi.h` |
 | `CACHE_ENTRIES` | 64 | `include/disk.h` |
 | `MAX_MOUNTS` | 4 | `kernel/fs/vfs.c` |
 | `HZ` | 100 | `include/sys/cpu.h` |
@@ -378,7 +380,7 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
   `1 / (nr <= LNXRM_SYSCALL_LAST)` 做逐编号编译期校验：加了超界编号却忘了改宏，编译直接失败。
 - 未知编号（≥33）落进 `default` 分支，打印一行 `[sys] unknown syscall …` 后返回 `-38`。
 
-### 5.2 33 项总表（编号 0–32，连续无空洞）
+### 5.2 41 项总表（编号 0–40，连续无空洞）
 
 | # | 名字 | 用途 | 实现文件 |
 |---|---|---|---|
@@ -421,14 +423,19 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
 | 36 | `kbd_info` | 键盘/输入环计数快照（32 字节 `lnxrm_kbd_info`，两道门都不过） | `kernel/isr.c` |
 | 37 | `mouse_get` | 非阻塞弹一个 PS/2 指针事件（16 字节 `lnxrm_mouse_state`：`dx/dy/buttons/wheel`，空则 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/syscall.c` |
 | 38 | `mouse_info` | aux 事件环计数快照（32 字节 `lnxrm_mouse_info`，两道门都不过） | `kernel/drivers/ps2mouse.c` |
+| 39 | `input_pop` | 统一输入事件队列出一个 24 字节事件（`KEY`/`REL`/`BTN`/`WHEEL`，成功回 1，空则 `EAGAIN`）；键值含原始按键 → `CAP_SYS_ADMIN` | `kernel/input_event.c` |
+| 40 | `input_info` | 统一队列计数快照（32 字节 `lnxrm_input_info`，分类型计数之和恒等 `pushed_total`，两道门都不过） | `kernel/input_event.c` |
 
 图形相关共 6 个：`fb_info`/`fb_clear`/`fb_fill`/`fb_char`/`fb_puts`（23–27）与 `fb_flip`(32)。
 指针输入共 2 个消费口（`mouse_get`）+ 1 个只读口（`mouse_info`），结构同 kbd 三件套。
+统一输入事件队列（39–40）再把两个生产者的**已解码结果**合并成一条流：`KEY` 只出自
+IRQ1 扫描码解码（`kbd_inject(35)` 是合成终端输入，刻意不进队列），`REL`/`BTN`/`WHEEL`
+出自 aux 包尾，是叠加消费口而非改道——34–38 的环、语义、门原样保留。
 
 ### 5.3 两道门与其它检查点
 
 - `cap_gate(cap, capname, what)`（`kernel/syscall.c`）：`ps`/`diskinfo`/`kbd_get`/`kbd_inject`/
-  `mouse_get` 过 `CAP_SYS_ADMIN`（前四个动的是共享资源），`fb_clear/fill/char/puts/flip`
+  `mouse_get`/`input_pop` 过 `CAP_SYS_ADMIN`（前四个动的是共享资源），`fb_clear/fill/char/puts/flip`
   过 `CAP_FB`；拒绝统一回 `LNXRM_EACCES = -13` 并打一行
   `[cap] denied <call>: pid … lacks CAP_*`。
 - `fb_owner_gate(what)`：紧接在能力门**之后**，5 个绘制 / 发布 case 各多一道归属门——
@@ -688,6 +695,49 @@ kernel/fs/
   扩展、溢出、sanity 位不漏进 `buttons`），收尾 `ms_set_packet_bytes()`
   恢复实时模式。
 
+**统一输入事件队列（2026-10-30）**：`kernel/input_event.c` + `include/sys/input.h`，
+把上面两条生产者的**已解码结果**汇成一条 63 槽流（24 字节 `lnxrm_input_event`，
+2026-10-30 号 ABI：`seq/type/a/b/flags/resv`；`type=INPUT_EV_KEY/REL/BTN/WHEEL`，
+`flags` 只在 KEY 上携带 `INPUT_MOD_SHIFT/CAPS`——字符本身已是变换结果，flags 是
+配方）：
+- **叠加，不改道**：console 环与 msring 原样保留，`kbd_process_sc` 尾部追加一个
+  `input_push_key()`，`ms_feed_byte` 包尾追加一个 `input_push_mouse()`，两个旧环
+  与新队列互不知晓、各自计数。34–38 的门与语义全部不动。
+- KEY 只出自 IRQ1 扫描码解码（kmap/kmap_shift/caps 状态机产物；E0 扩展键与
+  break 不产事件）；`kbd_inject(35)` 是合成终端输入，**不进**统一队列；串口 RX
+  字节流保持 console 专属，是否并入是扩展点。鼠标一包最多三事件，固定次序
+  BTN→REL→WHEEL：BTN 仅掩码变化（prev_buttons 去重，基线跟随线信号不看队列
+  余量——今天的按下不能因队列满而变成明天的弹起）；REL 仅 dx‖dy；WHEEL 仅非 0；
+  全零且无变化的包是静默。
+- 满即丢新、如实计数（与 kbd/ms 环一致），`input_event_pop` 非阻塞弹一颗；
+  seq 队内单调（每收受一个 +1，pushed_total 恒等于分类型计数和）。
+- `input_pop(39)` 门 `CAP_SYS_ADMIN`（KEY 事件携带原始键值，等价 mouse_get 的
+  单发态门）在指针校验之前，`EFAULT` 空队时也先答，成功回 **1**（读出的颗数，
+  read() 风格），空回 `EAGAIN`；`input_info(40)` 只读全放行（32 字节
+  `lnxrm_input_info`：`capacity/pending/pushed_total/dropped/keys/rel/btn/wheel`）。
+- ktest 用例有 `input_inject()`（内核内部，绕过所有 producer 策略、verbatim
+  收受，seq/resv 仍由队列做主）与 `kbd_inject_scancode()`（ktest 把扫描码喂进
+  **真解码路径**，但刻意不碰 `kbd_scans`——那是"硬件搬过的字节"计数器，注入不是
+  硬件，与 kbd_inject 35 的口径一致）。
+- `user/evq.c`（`evq`）：轮询 39/40 的演示程序，逐事件打印（KEY 的 `a`/mods、
+  REL/BTN/WHEEL 的载荷），ESC 或 64 颗退出并展示 `input_info`，非 root 得
+  `-13` 提示。
+- `ktest/t_input.c`（LATE 四例，USER_BASE+0xF000 独立 VA 页；t_kbd/t_mouse 与
+  本文件的先后由链接序决定，所以每例都以计数快照开场、以归还旧环开场时借
+  的东西收尾——console 环清空、msring 清空、shift/caps 偶数次归位）：
+  ①分发面（drain 后的空问答 `EAGAIN`/全坏指针 `EFAULT`、`input_inject+probe`
+  的 24 字节回读、info 形状与分类型和恒等、各 EFAULT 扫）；
+  ②键盘路径（真扫描码：shift 下压不产生、break 不产生、修饰变 flags
+  `[SHIFT|0|CAPS|0]`，**kbd_inject 35 不进队列**，console 侧逐字核对、kbd_scans
+  零变化、pushed +5 / keys +4 精确记账）；
+  ③鼠标路径（一包→事件数精确：BTN 仅变化、REL 仅移动、WHEEL 仅滚动、零包静默、
+  释放包走纯 0x08、REL 与 WHEEL 同包次序、8 事件/分类型 delta 全对账，msring
+  7 包原样回读且与新消费者无关）；
+  ④队列全貌（`input_inject` 63 颗四类型铺满→第 64 颗如实丢弃、pending 钉死
+  63、旧环零扰动、FIFO 逐颗 1:1 且 seq 严格 +1、清空后立刻再装）。
+- smoke 的 `systest` 两段相应扩展：降权用户 `user.input.pop=-13`/`user.input.info=0`，
+  根态 `input.info.ret=0`、`capacity=63`、`sane=1`、`sum=1`、空队 `input.pop.empty=-11`。
+
 ### 7.3 IDE 与 AHCI
 
 | 驱动 | 要点 |
@@ -894,7 +944,7 @@ smp_init():
 
 ### 9.1 内核自测（`ktest/`）
 
-框架与用例分离：`ktest/ktest.c` + **22 个 `t_*.c`**；用 `KTEST(suite, stage, fn)`
+框架与用例分离：`ktest/ktest.c` + **24 个 `t_*.c`**；用 `KTEST(suite, stage, fn)`
 注册进 `.ktest` 段，按 `KTEST_EARLY / KTEST_MM / KTEST_LATE` 三阶段在 `start_kernel`
 里跑（位置见《启动》的 bring-up 顺序）。编译开关 `KTEST=1`；`make smoke` 会强制
 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
@@ -903,24 +953,24 @@ smp_init():
 
 | 阶段 | cases | checks | failed |
 |---|---|---|---|
-| early | 25 | 371 | 0 |
+| early | 25 | 375 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 73 | 2226 | 0 |
-| 合计 | 115 | 3034 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 77 | 3103 | 0 |
+| 合计 | 119 | 3915 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (115 cases, 3034 checks) [2 skipped]` 与
-`[selftest] 3034/3034 pass [1 warn]`——两者以实机 boot 日志为准，此表是
-2026-10-30（fatfile/mbr 边界批次之后）的快照，后续加用例先改这里；那个 warn 是
+汇总行 `[ktest] selftest PASS (119 cases, 3915 checks) [2 skipped]` 与
+`[selftest] 3915/3915 pass [1 warn]`——两者以实机 boot 日志为准，此表是
+2026-10-30（统一输入事件队列 39/40 批次之后）的快照，后续加用例先改这里；那个 warn 是
 用例自己打的**故意告警**，`WARN` 只计数永不判负，`ASSERT` 失败计失败，
 `BUG_ON` 在任何模式下都停机。
 
-套件按主题分组（27 个 suite）：`abi boot blkcache blkio console cpu cred draw elf
-fatfile fb jrn kbd kheap ktest lib lock mbr mouse oom pmm prop syscall task usercopy vfs
-vmm`，覆盖 ABI 布局与
+套件按主题分组（29 个 suite）：`abi blkcache blkio boot console cpu cred draw elf
+fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mouse oom pmm prop syscall
+task usercopy vfs vmm`，覆盖 ABI 布局与
 编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、
 ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、
 系统调用分发的指针门（坏指针回 `EFAULT`、位置/目录 cookie 不被坏指针消耗）、
-信号与任务、VFS/FAT32。
+信号与任务、VFS/FAT32、键盘/鼠标/统一输入事件队列。
 
 ### 9.2 端到端冒烟（`scripts/smoke_test.py`，`make smoke`）
 
@@ -933,12 +983,13 @@ ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入
   marker，另加一条**负向断言**（`-smp 1` 时日志里不得出现 AP marker）。
 - 用户态判据 `SYSTEST_TAGS` **106 条**正则（`uname.ret=0`、`unknown.99=-38`、
   `ps.kind.idle=2`、`kill.init.term=-13`、`kbd.roundtrip=1`、
-  `mouse.get.empty=-11` 之类），外加 `systest.done=1`。键盘（`kbd0` 注入→读回）与
+  `mouse.get.empty=-11`、统一队列的 `input.info.sane=1`/`input.info.sum=1`/
+  `input.pop.empty=-11` 之类），外加 `systest.done=1`。键盘（`kbd0` 注入→读回）与
   鼠标（空环只读探针）的自检都在 systest 进程内完成，不依赖额外 /bin 工具。
 - LATE 阶段另搜 6 条报告行（块缓存 LRU、写后读一致、FAT 区不缓存、journal 先写日志 +
   重放），因为 `.ktest` 段内的先后顺序是编译器的事。
 - 负面判据：日志不得出现 `WARN(`、`2097151`、`4294967295`、`[PANIC]`。
-- 当前 `make smoke` **203/203**；transcript 写 `build/smoke/serial.log`
+- 当前 `make smoke` **205/205**；transcript 写 `build/smoke/serial.log`
   （非默认 smp 档位写 `serial-smpN.log`，互不覆盖）。
 - 日志里出现的 `[fat32] I/O error` 是错误注入用例**故意**打的，不是回归。
 
@@ -949,7 +1000,9 @@ ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入
 内存记账与配额段、画屏归属段（三层 fork：抢屏 → 撞墙 → 持有者退出），键盘段
 （`kbd_info` 空环快照 + `kbd_get` 的 `EAGAIN` + 注入 `kbd0` 的注入/读回/清空 + 降权
 拒绝回执），鼠标段（`mouse_info` 空环快照 + 只读 `EAGAIN` 探针 + 降权拒绝回执，
-真实指针在环里时打 `mouse.skip` 不去碰事件），末尾打 `systest.done=1`。由 smoke 的
+真实指针在环里时打 `mouse.skip` 不去碰事件），统一队列段（`input_info` 空环快照 +
+`capacity=63`/`sane`/`sum` 恒等 + 空队 `input_pop` 的 `EAGAIN` 探针 + 降权拒绝回执），
+末尾打 `systest.done=1`。由 smoke 的
 `shell` 阶段在串口上驱动。
 
 ## 10. 关键不变式

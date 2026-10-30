@@ -19,6 +19,7 @@
 #include <io.h>
 #include <console.h>
 #include <sys/cpu.h>
+#include <sys/input.h>
 #include <sys/apic.h>
 #include <sys/spinlock.h>
 #include <abi/lnxrm_abi.h>
@@ -140,6 +141,10 @@ void ms_feed_byte(u8 b)
     int wheel = ms_bytes == 4 ? ms_wheel_decode(ms_pkt[3]) : 0;
     spin_unlock_irqrestore(&ms_lock, flags);
     ms_push(dx, dy, buttons, wheel);
+    /* 39: the same decoded packet feeds the unified queue, which keeps
+     * its own BTN-changed baseline and its own counters (see
+     * input_event.c for what a packet means there). */
+    input_push_mouse(dx, dy, buttons, wheel);
 }
 
 /* mouse_get 37's kernel half: pop one decoded event, 0 or empty. */

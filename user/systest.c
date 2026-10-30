@@ -602,6 +602,14 @@ int main(int argc, char **argv)
             struct lnxrm_mouse_info mu = {0};
             say("user.mouse.info", kmouse_info(&mu));    /* 0 */
 
+            /* unified queue 39-40: KEY events carry the raw decoded keys,
+             * so consuming them gates exactly like kbd_get/mouse_get; the
+             * counter reader stays open. */
+            struct lnxrm_input_event evu = {0};
+            say("user.input.pop", kinput_pop(&evu));  /* -13 */
+            struct lnxrm_input_info iu = {0};
+            say("user.input.info", kinput_info(&iu)); /* 0 */
+
             kexit(0);
         }
 
@@ -959,6 +967,23 @@ int main(int argc, char **argv)
                 kmouse_info(&mi) == 0 ? (long)mi.pending : -1);
         }
         say("mouse.info.inited", mi.inited);
+    }
+
+    /* ---- input 39-40: the unified queue over both producers ----
+     * Headless boot still produces nothing for it (the harness types
+     * console bytes with kbd_inject, which never enters this queue), so
+     * the same empty-and-tolerant shape as the kbd/mouse blocks: usable
+     * size, per-type sum == pushed_total, an EAGAIN on the first pop. */
+    {
+        struct lnxrm_input_info ii = {0};
+        struct lnxrm_input_event ev = {0};
+        say("input.info.ret", kinput_info(&ii));
+        say("input.info.capacity", ii.capacity);
+        say("input.info.sane",
+            ii.pending <= ii.capacity && ii.dropped <= ii.pushed_total);
+        say("input.info.sum",
+            (long)(ii.keys + ii.rel + ii.btn + ii.wheel) == (long)ii.pushed_total);
+        say("input.pop.empty", kinput_pop(&ev)); /* -11: nothing produced */
     }
 
     say("systest.done", 1);

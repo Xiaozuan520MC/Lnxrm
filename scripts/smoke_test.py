@@ -178,8 +178,10 @@ SYSTEST_TAGS = [
     ("unknown.99 = -ENOSYS", br"unknown\.99=-38"),
     # 钉住内核回显的 "unknown syscall N" 再等 -38：过去只等一个 -38，
     # 当 33 成为合法编号（sync）时会跨行误匹配到下一条的 -38 而假通过。
-    ("past.39 = -ENOSYS", br"past\.39=[\s\S]{0,60}?unknown syscall 39[\s\S]{0,60}?-38"),
-    ("past.40 = -ENOSYS", br"past\.40=[\s\S]{0,60}?unknown syscall 40[\s\S]{0,60}?-38"),
+    # 39/40 在 2026-10-30（统一输入队列 input_pop/info）成为真编号，钉号
+    # 随表尾走：systest 的 past 表总是 LAST+1..+3，这里跟着同一个表尾。
+    ("past.41 = -ENOSYS", br"past\.41=[\s\S]{0,60}?unknown syscall 41[\s\S]{0,60}?-38"),
+    ("past.42 = -ENOSYS", br"past\.42=[\s\S]{0,60}?unknown syscall 42[\s\S]{0,60}?-38"),
     ("open.fd >= 0", br"open\.fd=\d+"),
     ("read.after.seek = 15", br"read\.after\.seek=15"),
     ("read.at.end = tail only", br"read\.at\.end=[1-9]\d*"),

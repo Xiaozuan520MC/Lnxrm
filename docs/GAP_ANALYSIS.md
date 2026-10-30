@@ -5,9 +5,11 @@
 > **与一个稳健内核之间的能力差距**、**先修什么**。
 > 构建与运行见 BUILD.md；代码结构、文件清单与特性介绍见 CODEBASE.md。
 >
-> 已核对的基线：系统调用 39 个（0–38 连续无空洞），其中图形 6 个
-> （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)）；
-> ktest 115 cases / 3034 checks（2 skipped，1 条刻意告警）；`make smoke` 203/203；`make` 零警告。
+> 已核对的基线：系统调用 41 个（0–40 连续无空洞），其中图形 6 个
+> （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)），
+> 输入 4 个（`kbd_get/inject/info` 34–36、`mouse_get/info` 37–38）加统一队列
+> `input_pop/info` 39–40；ktest 119 cases / 3915 checks（2 skipped，1 条刻意告警）；
+> `make smoke` 205/205（默认 `-smp 2`，`--smp 1` 同数）；`make` 零警告。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文**只收仍然开放的条目**，
 > 不重排编号；半修的条目在「后果」列注明现状；已关闭的缺陷不复述。
@@ -26,14 +28,14 @@
 | 进程与信号 | 3 | `fork/execve/wait4/brk/kill`、`sigaction/sigprocmask/sigreturn`、`parent` 存 (pid, 世代) 并经 `task_parent()` 解析；无 CPU 时间限制 |
 | 调度 | 3 | 每 CPU 运行队列、按空闲/队列长度的负载均衡、每 CPU 本地 LAPIC tick；队列实为 push-front LIFO（C62）、内核态不可抢占、无优先级/nice |
 | SMP | 3 | ACPI MADT 枚举 + xAPIC/x2APIC 双路访问、AP 本地时钟与共享标定；全局锁 + 轮询 I/O 使延迟敏感场景不可用 |
-| 系统调用 / ABI | 3 | 39 个编号（0..38）全部实现，用户指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；缺 `mmap`/时间类/`stat`/`pipe` |
+| 系统调用 / ABI | 3 | 41 个编号（0..40）全部实现，用户指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；缺 `mmap`/时间类/`stat`/`pipe` |
 | 并发正确性 | 2 | 终端打印锁、任务表锁、fd 引用计数、console 多等待者链表已就位；仍有跨设备 I/O 的两层 irqsave（C7/C10）、`pick_next` 无锁读（C4） |
 | 设备驱动 | 2 | PS/2 键盘与鼠标中断驱动（IRQ1→键盘环、IRQ12→aux 事件环，串口 RX 中断已接）、AHCI 走 DMA + `clflush`/`mfence` + UC 映射、完成判定补查 `PxTFD.ERR`；AHCI/IDE 纯轮询无中断（C49）、多盘只注册第一块（C51），IDE 无 LBA48 命令（C53） |
 | 文件系统 | 3 | FAT32 + on-disk redo journal（mount 时 replay，`ktest/t_journal.c`）+ 时间戳 LRU 块缓存 + 簇链步数预算；边界批次已收口（目录游标 C30、LFN 260 字符 C31、FAT 容量拒绝 C32、末条目可达 C33、短名终止符 C34、MBR 范围与 EBR 链 C36），目录结束符同时改回规范字义（0x00 止看，0x05 是别名转义/活记录）；vnode 泄漏（C40）已修；剩 mount 数据下传（C39）与分区注册（C28） |
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
-| 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
+| 用户态 | 2 | 17 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
 | 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 115/3034（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 203/203（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
+| 测试 | 3 | ktest 119/3915（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入、统一输入队列四例）、`make smoke` 205/205（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -185,7 +187,7 @@
 | `stat` / `fstat` | `ls` 只有 dirent 一个元数据来源：无大小、时间戳、类型判定 | 把 `vnode` 字段落成 ABI 结构，约 2 天 |
 | `gettimeofday` / `clock_gettime` | 用户程序完全无法测量时间（只能睡）；per-CPU 时钟源与 TSC 标定已就绪 | 约 100 行 |
 | `chdir` / `getcwd` / `umask` | 没有进程工作目录，相对路径靠用户态硬拼 | 约 1 天 |
-| `fcntl` / `poll` / `select` | 无法做非阻塞**多路**等待，`console_read` 是单读者阻塞；非阻塞输入只补了单键探针（`kbd_get` 34）与指针事件探针（`mouse_get` 37） | 约 2–3 天 |
+| `fcntl` / `poll` / `select` | 无法做非阻塞**多路**等待，`console_read` 是单读者阻塞；非阻塞输入只补了单键探针（`kbd_get` 34）、指针事件探针（`mouse_get` 37）与统一队列单事件探针（`input_pop` 39，成功回 1、空回 `EAGAIN`） | 约 2–3 天 |
 | `chmod` / `link` / `symlink` | FAT32 无权限位与硬链接，软链可做 | 按需，各半天 |
 | 固定容量：`NR_TASKS 64`、`NR_FDS 16`、`MAX_MOUNTS 4`、缓存 64 槽 | 编译期常量，用满即失败且诊断有限 | 动态扩容或可配置，约 1 天 |
 

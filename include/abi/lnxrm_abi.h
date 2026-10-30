@@ -43,7 +43,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  38
+#define LNXRM_SYSCALL_LAST  40
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
@@ -224,6 +224,68 @@ struct lnxrm_mouse_info {
 };
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_mouse_info) == 32, "mouse_info ABI");
+
+/* ---- unified input event queue (39-40) ----
+ * One stream a compositor can read instead of per-device calls: the
+ * keyboard decode path (real IRQ1 scancodes only -- kbd_inject 35 types
+ * on the console the old way and deliberately never enters this queue),
+ * the relative mouse deltas, button transitions and the wheel.  24 bytes,
+ * no pointers, copied whole across every syscall.
+ *
+ * Per field:
+ *  - seq: the queue's event counter, first event 1, strictly increasing
+ *    for every accepted event (a REL+BTN batch hands out consecutive
+ *    numbers in emission order).
+ *  - type: INPUT_EV_*, never 0 -- a zeroed struct always means "no
+ *    event", which a caller that memsets its receiver can trust.
+ *  - a/b: the payload (KEY: the decoded character; REL: screen-space
+ *    dx,dy; BTN: the button mask after the change; WHEEL: signed scroll).
+ *  - flags: INPUT_MOD_* for KEY -- why the map produced this character.
+ *    The character is already transformed; these are the recipe, for
+ *    programs that act on the transformation itself (a text editor's
+ *    cursor word-motions, a shell's history).  0 for the other types.
+ *  - resv: zero forever, room to grow without breaking the ABI. */
+enum input_event_type {
+    INPUT_EV_NONE  = 0, /* zeroed struct: no event */
+    INPUT_EV_KEY   = 1, /* a is the decoded character */
+    INPUT_EV_REL   = 2, /* a,b: dx,dy, screen-space (x right, y down) */
+    INPUT_EV_BTN   = 3, /* a: the button mask, bit0 left bit1 middle
+                         * bit2 right -- the PS/2 flags byte's own f&7 */
+    INPUT_EV_WHEEL = 4, /* a: signed scroll delta, positive = down */
+};
+
+#define INPUT_MOD_SHIFT 0x1u /* shift was held when the key decoded */
+#define INPUT_MOD_CAPS  0x2u /* capslock was on -- why the letter is upper */
+#define INPUT_MOD_MASK  0x3u /* everything a producer may ever set */
+
+struct lnxrm_input_event {
+    uint32_t seq;
+    uint32_t type;
+    int32_t a;
+    int32_t b;
+    uint32_t flags;
+    uint32_t resv;
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_input_event) == 24, "input event ABI");
+
+/* input_info (40): the unified queue's counters, the same shape and the
+ * same honesty as kbd_info (36) and mouse_info (38): capacity/pending
+ * describe the 63 slots, pushed_total/dropped the acceptance bookkeeping,
+ * and keys/rel/btn/wheel count every accepted event per type -- so their
+ * sum is exactly pushed_total. */
+struct lnxrm_input_info {
+    uint32_t capacity;
+    uint32_t pending;
+    uint32_t pushed_total;
+    uint32_t dropped;
+    uint32_t keys;
+    uint32_t rel;
+    uint32_t btn;
+    uint32_t wheel;
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_input_info) == 32, "input_info ABI");
 
 /* ps: one fixed-size record per task, written into the caller's buffer. */
 enum lnxrm_task_state {

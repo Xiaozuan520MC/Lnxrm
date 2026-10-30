@@ -2,6 +2,7 @@
 #include <sys/vfs.h>
 #include <sys/sched.h>
 #include <sys/cpu.h>
+#include <sys/input.h>
 #include <sys/protect.h>
 #include <console.h>
 #include <mm/mm.h>
@@ -333,6 +334,35 @@ static long sys_mouse_info(struct lnxrm_mouse_info *uinfo)
     return 0;
 }
 
+/* ---- unified input event queue syscalls (39-40) ----
+ * input_pop reads the one stream a compositor wants -- keyboard makes,
+ * mouse deltas, button transitions, wheel -- over both existing producers
+ * at once (see include/sys/input.h and kernel/input_event.c).  The raw
+ * keys inside are exactly what kbd_get 34 refused to hand a plain user,
+ * so the same CAP_SYS_ADMIN gate rides along, in the same order: gate
+ * first, then the 24-byte receiver check (EFAULT on a bad pointer even
+ * with an empty queue), then pop, then copy.  Success answers 1 -- one
+ * event -- like a read() answers a byte count; an empty queue is EAGAIN.
+ * input_info is the open counter reader, exactly kbd_info/mouse_info. */
+static long sys_input_pop(struct lnxrm_input_event *ue)
+{
+    if (!ue) return LNXRM_EFAULT;
+    if (!user_ptr_ok((u64)ue, sizeof(*ue))) return LNXRM_EFAULT;
+    struct lnxrm_input_event e;
+    if (input_event_pop(&e) != 0) return LNXRM_EAGAIN;
+    if (copy_to_user(ue, &e, sizeof(e)) < 0) return LNXRM_EFAULT;
+    return 1;
+}
+
+static long sys_input_info(struct lnxrm_input_info *uinfo)
+{
+    struct lnxrm_input_info info;
+    if (!uinfo) return LNXRM_EFAULT;
+    input_event_stats(&info);
+    if (copy_to_user(uinfo, &info, sizeof(info)) < 0) return LNXRM_EFAULT;
+    return 0;
+}
+
 /* Copy a NUL-terminated path out of user space and run a path syscall on it. */
 static long path_syscall(u64 upath, long (*fn)(const char *))
 
@@ -506,6 +536,14 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         break;
     case SYS_mouse_info:
         ret = sys_mouse_info((struct lnxrm_mouse_info *)f->rdi);
+        break;
+    case SYS_input_pop:
+        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "input_pop")) != 0)
+            break;
+        ret = sys_input_pop((struct lnxrm_input_event *)f->rdi);
+        break;
+    case SYS_input_info:
+        ret = sys_input_info((struct lnxrm_input_info *)f->rdi);
         break;
     default:
         /* Anything the table does not name: numbers above LNXRM_SYSCALL_LAST. */

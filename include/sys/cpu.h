@@ -127,6 +127,7 @@ u32 kbd_pending(void);    /* keys buffered right now */
 long kbd_get_byte(void);  /* 0..255 key code, LNXRM_EAGAIN when empty */
 long kbd_inject_bytes(const char *kbuf, u32 len); /* keys accepted */
 void kbd_stats(struct lnxrm_kbd_info *k);         /* counters snapshot */
+void kbd_inject_scancode(u8 sc); /* ktest: one scancode down the real decode path */
 
 /* mouse syscalls 37-38 land in kernel/drivers/ps2mouse.c; same split. */
 struct lnxrm_mouse_state;

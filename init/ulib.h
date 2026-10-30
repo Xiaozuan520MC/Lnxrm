@@ -118,6 +118,16 @@ static inline long kmouse_get(struct lnxrm_mouse_state *m)
 static inline long kmouse_info(struct lnxrm_mouse_info *m)
 { return syscall1(SYS_mouse_info, (long)m); }
 
+/* unified input event queue 39-40: one stream over both input producers
+ * (keyboard makes with their modifier flags, relative motion, button
+ * changes, wheel) -- the compositor's read surface.  pop answers 1 and
+ * fills the 24-byte event, EAGAIN when empty, EACCES without
+ * CAP_SYS_ADMIN (raw keys ride inside); info is the open reader. */
+static inline long kinput_pop(struct lnxrm_input_event *e)
+{ return syscall1(SYS_input_pop, (long)e); }
+static inline long kinput_info(struct lnxrm_input_info *i)
+{ return syscall1(SYS_input_info, (long)i); }
+
 /* Drop (or, as root, set) this process's uid.  Root may name any uid;
  * naming a uid other than 0 clears the tier to user and every capability
  * with it -- irreversible from there, which is what makes the T-031

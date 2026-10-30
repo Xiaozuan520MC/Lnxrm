@@ -21,6 +21,8 @@
  * took 32 for double buffering, sync took 33 (C27 persistence door),
  * kbd_get/inject/info took 34/35/36 for the keyboard I/O surface, and
  * mouse_get/info took 37/38 for the PS/2 aux pointer (2026-10-26).
+ * input_pop/info took 39/40 for the unified input event queue over both
+ * producers' decode paths (2026-10-30).
  */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
@@ -61,3 +63,5 @@ LNXRM_SYS(kbd_inject, 35)
 LNXRM_SYS(kbd_info, 36)
 LNXRM_SYS(mouse_get, 37)
 LNXRM_SYS(mouse_info, 38)
+LNXRM_SYS(input_pop, 39)
+LNXRM_SYS(input_info, 40)

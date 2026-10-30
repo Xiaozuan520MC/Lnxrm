@@ -1,5 +1,6 @@
 /* Interrupt dispatch: exception reporting, IRQ routing, IPI dispatch. */
 #include <sys/cpu.h>
+#include <sys/input.h>
 #include <sys/apic.h>
 #include <io.h>
 #include <console.h>
@@ -69,6 +70,14 @@ static void kbd_process_sc(u8 sc)
         else if (capslock_on && c >= 'A' && c <= 'Z')
             c = c - 'A' + 'a';
         input_push(c);
+        /* 39: the unified queue gets the same decoded character plus the
+         * recipe (which modifiers were engaged) -- the character is
+         * already transformed, the flags say *why*.  Break codes left at
+         * the `release` return above, and extended (E0) keys keep console
+         * behaviour only: their codes are not ASCII a terminal renders. */
+        input_push_key((int)c,
+                       (u32)(shift_pressed ? INPUT_MOD_SHIFT : 0) |
+                           (u32)(capslock_on ? INPUT_MOD_CAPS : 0));
     }
 }
 
@@ -81,6 +90,16 @@ void kbd_irq_handler(struct intr_frame *f)
 {
     u8 sc = inb(KBD_DATA);
     __atomic_add_fetch(&kbd_scans, 1u, __ATOMIC_RELAXED);
+    kbd_process_sc(sc);
+}
+
+/* ktest plumbing: one scancode byte down the exact decode path an IRQ1
+ * byte takes (the state machine included: shift, capslock, the E0
+ * prefix, break codes).  Deliberately *not* a bump of kbd_scans -- that
+ * counter means "bytes the hardware carried" (the headless detector), and
+ * injection is not hardware, exactly as kbd_inject 35 leaves it alone. */
+void kbd_inject_scancode(u8 sc)
+{
     kbd_process_sc(sc);
 }
 
