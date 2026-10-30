@@ -557,19 +557,27 @@ kernel/fs/
 （C29/C38）；spc/fatsz/reserved 非零、`num_fats ∈ {1,2}`、`root_cluster >= 2`）→ 算
 `data_start_lba` 与 `max_cluster` → **把整个 FAT `kmalloc` 到内存**。
 
-**目录槽模型**（C23）：可用槽 = 从未用过的尾槽（0x00）、已删除记录（0xE5）与
-末标记（0x05，认领时把"目录结束点"推后一位）；其余首字节都是活记录。写端两处
-认领（create/mkdir 的 `parent_entry_add()` 取首个可用槽；rename 的 `dir_claim_run()`
-取连续可用槽段）从此共享同一判定，0x05 不再被一边当空槽、一边当活记录。槽不够时
+**目录槽模型**（C23）：可用槽 = 从未用过的尾槽（0x00，终止符本身）与已删除记录
+（0xE5）；其余首字节都是活记录——包括 0x05：规范的 8.3 别名里 0x05 是 0xE5 的转义，
+而 LFN 第五片的首字节恰是序号 5。写端两处认领（create/mkdir 的 `parent_entry_add()`
+取首个可用槽；rename 的 `dir_claim_run()` 取连续可用槽段）从此共享同一判定。槽不够时
 先 `dir_chain_extend()` 扩展目录链（分配簇→尾部链接→整簇清零，失败即自回滚），再在新
-簇落位——目录永不再因满而 `ENOSPC`（只有卷真满才回）。末标记必须活过每次落位：
-目录链**最后一个槽**从不可认领，认领者宁可先扩链。**扫描端不受此改动影响**：跳过
-0x00/0xE5 继续把链走完（坏链/自环照样被步数预算拦下并告警），只在 0x05 处停——
-带尾巴的伪造目录链不会被安静吞掉。
+簇落位——目录永不再因满而 `ENOSPC`（只有卷真满才回）。终止符必须活过每次落位：
+目录链**最后一个槽**从不可认领，认领者宁可先扩链。**扫描端**（本批改回规范字义）：
+止于 0x00——规范的目录结束符，不再跑满整条链；藏在尾槽之后的残留字节再也浮不出伪
+记录。坏簇/自环照样被步数预算或自环即断拦下并告警。
 
-**LFN 读验证**（C17）：一个长名 run 由带 0x40 位、序号最高的记录开启，之后各记录必须
+**目录游标**（C30）：getdent 的 cookie 是 `(簇<<32)|字节偏移` 的物理恢复点
+（`DIRIT_START=0`、`DIRIT_END=(u64)-1` 出在 `include/fat32_priv.h`），引擎按扇区
+步进（32 字节记录不跨 512 扇区），整簇级跳过零设备读。一条 readdir 从头到尾的扇区
+查找计数 ≈ 链内扇区数 + 条目数（实测 `dir 3 clusters, one walk = 39 lookups
+(bound 46)`）——不再是每次 getdent 从首簇重扫的 O(n²)；坏/越界 cookie 一律回
+"已结束"而不是编造条目。
+
+**LFN 读验证**（C17/C31）：一个长名 run 由带 0x40 位、序号最高的记录开启，之后各记录必须
 带同一别名 checksum 且序号严格递减；缺失/乱序/异 checksum 即弃用整个 run，回落 8.3
-别名。`lfn_reset()` 整段清零 256 字节缓冲，残留在缓冲里的栈垃圾进不了名字。
+别名。拼接缓冲 260 字符 + 终止符（261 字节，C31），`lfn_reset()` 整段清零，残留在
+缓冲里的栈垃圾进不了名字。
 
 **写路径**：元数据（目录项 / FAT / FSInfo）走 redo 日志事务，文件数据字节走写回缓存。
 写需求先按 `off + n` 做 u64 回卷感知合并（C16），`alloc_chain` 再以
@@ -597,13 +605,22 @@ kernel/fs/
   完成后置 CLEAN。失败语义：只可能泄漏簇、不交叉链接。
 
 **簇链安全**：`FAT_CHAIN_MAX_STEPS` 限制步数，`fat_chain_limit = MIN(上限, 数据簇数)`；
-非法首簇直接拒绝并告警；链有环 / 越界只报告不跟随。
+非法首簇直接拒绝并告警；坏 FAT 项只报告不跟随，长环由步数预算拦下，
+**单簇自环**（cell 指回自己的簇）在 `fat_chain_advance` 里当即断链 + `chain loop`
+告警——数据读取会合法地"回放同一簇"直到字节量耗尽，永远触不到步数预算，靠这一检测
+第一时间暴露。挂载前还有两项容量守门（C32/C33）：卷 FAT 表项数 > 2^28 直接
+`[fat32] reject …`（设备恰发一个扇区），`max_cluster` 是独占上限（最后的 FAT 格可达）。
 
 ### 6.7 挂载顺序与回退
 
 1. `vfs_try_mount_disk()` 按 `blk_list[]` 依次试每块盘：先"整盘 FAT32"，失败再试
    "MBR 分区表"（`mbr.c` 把分区包成 `struct part_dev`，读写转发 `blk_io_*`）。
-2. 根没就绪或缺 `/bin/init` → `vfs_mount_initramfs()` 用镜像里的 newc cpio 当根；
+2. `mbr.c`（C36）解析期就该把坏输入掐死：签名 55AA 必须；每个表项验
+   `lba + count <= 盘容量`，越界（含 count==0）条目报 `[mbr] … outside the disk`
+   后丢弃而不是往下传；EBR 链真正遍历——表 0 是相对 `ebr+rel` 的逻辑分区，
+   表 1 是相对前移的下一段链接，链上限 32 段，`include/disk.h` 的
+   `MBR_MAX_PARTITIONS` = 4 主 + 32 逻辑。
+3. 根没就绪或缺 `/bin/init` → `vfs_mount_initramfs()` 用镜像里的 newc cpio 当根；
    没有 `INITRAMFS=` 的构建带空 `.initramfs` 段，行为不变。
 
 ## 7. 驱动
@@ -888,17 +905,18 @@ smp_init():
 |---|---|---|---|
 | early | 25 | 371 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 66 | 1799 | 0 |
-| 合计 | 108 | 2607 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 73 | 2226 | 0 |
+| 合计 | 115 | 3034 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (108 cases, 2607 checks) [2 skipped]` 与
-`[selftest] 2607/2607 pass [1 warn]`——两者以实机 boot 日志为准，此表是
-2026-10-26（mouse 37/38 之后）的快照，后续加用例先改这里；那个 warn 是
+汇总行 `[ktest] selftest PASS (115 cases, 3034 checks) [2 skipped]` 与
+`[selftest] 3034/3034 pass [1 warn]`——两者以实机 boot 日志为准，此表是
+2026-10-30（fatfile/mbr 边界批次之后）的快照，后续加用例先改这里；那个 warn 是
 用例自己打的**故意告警**，`WARN` 只计数永不判负，`ASSERT` 失败计失败，
 `BUG_ON` 在任何模式下都停机。
 
-套件按主题分组（26 个 suite）：`abi boot console cpu cred draw elf fat32 fb jrn kbd kheap
-ktest lib lock mouse oom pmm prop syscall task usercopy vfs vmm blkcache blkio`，覆盖 ABI 布局与
+套件按主题分组（27 个 suite）：`abi boot blkcache blkio console cpu cred draw elf
+fatfile fb jrn kbd kheap ktest lib lock mbr mouse oom pmm prop syscall task usercopy vfs
+vmm`，覆盖 ABI 布局与
 编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、
 ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、
 系统调用分发的指针门（坏指针回 `EFAULT`、位置/目录 cookie 不被坏指针消耗）、

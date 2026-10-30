@@ -33,6 +33,13 @@ static void fat_warn_entry(struct fat_mount *m, u32 clus, u32 val)
     kprintf("[fat32] corrupt FAT entry: cluster %u -> 0x%08x%s\n", clus, val, fat_warn_tail(m));
 }
 
+static void fat_warn_loop(struct fat_mount *m, u32 clus)
+{
+    if (!fat_warn_allowed(m)) return;
+    kprintf("[fat32] chain loop: cluster %u points at itself (cyclic FAT?)%s\n", clus,
+            fat_warn_tail(m));
+}
+
 static void fat_warn_start(struct fat_mount *m, u32 first)
 {
     if (!fat_warn_allowed(m)) return;
@@ -106,8 +113,17 @@ bool fat_chain_more(struct fat_chain *ch)
 void fat_chain_advance(struct fat_chain *ch)
 {
     if (ch->steps) ch->steps--;
+    u32 prev = ch->clus;
     if (ch->clus >= 2 && !cluster_is_eoc(ch->clus))
         ch->clus = fat_next_cluster(ch->m, ch->clus);
+    /* A cell that points back at its own cluster can never end: the walk
+     * replays that cluster forever while a file's byte count keeps the
+     * loop looking legitimate.  Cut the chain here and say so instead --
+     * the fat_chain budget only catches longer cycles. */
+    if (ch->clus == prev && !cluster_is_eoc(ch->clus)) {
+        fat_warn_loop(ch->m, prev);
+        ch->clus = FAT_EOC;
+    }
 }
 
 int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
@@ -382,12 +398,32 @@ void *fat_mount(struct blkdev *dev)
     m->max_cluster = totsec > data_start ? (totsec - data_start) / m->sectors_per_cluster + 2 : 2;
     m->cluster_size = m->bytes_per_sector * m->sectors_per_cluster;
 
+    /* C32: FAT entry arithmetic in 64 bits.  fatsz * bytes_per_sector
+     * overflows a 32-bit product long before either field does, and the
+     * old u32 `fat_entries` then clamped every volume whose FAT crossed
+     * 4 GiB to half its true size.  FAT32's own cluster count stops at
+     * 2^28-11, so anything leaning on a bigger table is not a FAT32
+     * volume even if the BPB says so -- refuse it here, with a reason,
+     * instead of dying later on a kmalloc the log cannot explain. */
+    u64 fat_entries = (u64)m->fatsz * m->bytes_per_sector / 4;
+    if (fat_entries > (1u << 28)) {
+        kprintf("[fat32] reject %s: FAT too large, %llu entries is not a "
+                "FAT32 volume (cap 2^28)\n",
+                dev->name, fat_entries);
+        kfree(m);
+        return NULL;
+    }
+
     /* CRITICAL: clamp the cluster range to what the FAT table can hold.
      * Without this, chain walks / allocation scans read & WRITE past the
      * end of the cached FAT heap buffer, corrupting neighbouring objects
      * (this was the source of the "mystery" function-pointer corruption). */
-    u32 fat_entries = m->fatsz * m->bytes_per_sector / 4;
-    if (m->max_cluster >= fat_entries) m->max_cluster = fat_entries ? fat_entries - 1 : 2;
+    /* C33: the bound is exclusive -- cluster N lives in FAT cell N, so
+     * cells 0..fat_entries-1 make every cluster < fat_entries addressable,
+     * including the very last cell.  The old `fat_entries - 1` left the
+     * final cell of every volume permanently unreachable. */
+    if ((u64)m->max_cluster > fat_entries)
+        m->max_cluster = fat_entries ? (u32)fat_entries : 2;
 
     /* The root directory cluster is turned into an LBA before any chain walk
      * could object to it, so a BPB that names a cluster past the end of the

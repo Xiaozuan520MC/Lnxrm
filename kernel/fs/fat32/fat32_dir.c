@@ -10,6 +10,14 @@ void fat_short_to_name(const u8 *sn, u8 ntres, char out[13])
      * had no long-name record came out in lower case. */
     bool lower_base = (ntres & FAT_NTRES_LOWER_BASE) != 0;
     bool lower_ext = (ntres & FAT_NTRES_LOWER_EXT) != 0;
+    /* A stored first byte of 0x05 carries a literal 0xE5 (spec's 0x05
+     * escape); deliver the real character, never the raw byte. */
+    u8 snbuf[11];
+    if (sn[0] == 0x05) {
+        memcpy(snbuf, sn, 11);
+        snbuf[0] = 0xE5;
+        sn = snbuf;
+    }
     int o = 0;
     for (int i = 0; i < 8 && sn[i] != ' '; i++)
         out[o++] = lower_base ? ascii_tolower((char)sn[i]) : (char)sn[i];
@@ -27,17 +35,22 @@ bool fat_name_eq_short(const char *want, const struct fat_dirent *e)
     /* Compare as u8 on both sides: e->name[] holds raw bytes, and casting a
      * byte >= 0x80 to (signed) char before ascii_toupper() makes the left
      * side negative while s[i] holds the same byte as u8 -- so a name with
-     * any high-bit byte (a non-ASCII 8.3 alias) never matched itself. */
+     * any high-bit byte (a non-ASCII 8.3 alias) never matched itself.
+     * fat_alias_eq then unwraps the 0x05 escape on both sides. */
+    u8 a[11];
     for (int i = 0; i < 11; i++)
-        if ((u8)ascii_toupper((char)e->name[i]) != s[i]) return false;
-    return true;
+        a[i] = (u8)ascii_toupper((char)e->name[i]);
+    return fat_alias_eq(a, s);
 }
 
 /* iterate dirents of a directory chain with LFN reconstruction.
  * fn returns nonzero to stop. ctx passed through. */
 #define LFN_SEQ_MAX 20 /* FAT caps a long name at 20 * 13 = 260 chars */
 struct lfn_state {
-    char longname[256];
+    /* C31: 261 = 260 name bytes (20 full pieces) + the terminator.  The
+     * old 256 made the last piece of a full run unwritable, so names in
+     * [257, 260] silently fell back to the 8.3 alias. */
+    char longname[261];
     int total;    /* seq of the marked record == number of pieces */
     int expect;   /* seq number the next unmarked record must carry */
     int name_end; /* highest byte written: the real name length */
@@ -57,99 +70,141 @@ static void lfn_reset(struct lfn_state *lf)
     lf->sum = 0;
 }
 
-int fat_scan_dir(struct fat_mount *m, u32 dirclus, dirent_cb cb, void *ctx)
+/* Directory cursor handed back in the getdent cookie (C30):
+ * (cluster << 32) | offset of the *next* record to examine.  DIRIT_START =
+ * from the beginning of the directory, DIRIT_END = the listing has ended.
+ * The old cookie was a sequential index and made every getdent rescan the
+ * directory from its first cluster -- O(n²) device traffic per ls. */
+
+int fat_scan_dir_at(struct fat_mount *m, u32 dirclus, u64 resume, dirent_cb cb, void *ctx)
 {
     u8 *buf = cluster_buf_alloc(m);
     if (!buf) return LNXRM_ENOMEM; /* T-004: a dry heap ends the scan */
     struct lfn_state lf;
     lfn_reset(&lf);
 
+    /* C30: sectors, not clusters.  A 32-byte dirent never crosses a
+     * 512-byte sector, so the scan steps sector by sector -- a resume
+     * reads only the sectors the cursor has not served yet, one lookup
+     * each, instead of re-reading whole clusters per call.  m->fat is in
+     * RAM, so chain advancement is arithmetic: skipped clusters cost no
+     * device read.  LFN state starts fresh at a resume, which is exact,
+     * because a long-name run always sits contiguously right before its
+     * own 8.3 record -- the next entry's pieces can never lie at or
+     * before the cursor. */
+    u32 start_clus = (u32)(resume >> 32);
+    u32 start_off = (u32)resume;
+    bool skipping = resume != DIRIT_START;
+    u32 eps = m->bytes_per_sector / DIRENT_SIZE;
+
     struct fat_chain ch;
     for (fat_chain_start(&ch, m, dirclus); fat_chain_more(&ch); fat_chain_advance(&ch)) {
         u32 c = ch.clus;
-        /* T-005: an unreadable cluster ends the scan with an error.  Reading
-         * on would walk whatever the buffer held before (uninitialised heap
-         * on the first cluster) and hand it to `cb` as directory entries --
-         * "not found" out of data that was never read. */
-        int rc = fat_read_cluster(m, cluster_lba(m, c), buf);
-        if (rc) {
-            fat_warn_io(m, "read dir", cluster_lba(m, c));
-            kfree(buf);
-            return rc;
+        u32 from_sec = 0, first_i = 0;
+        if (skipping) {
+            if (c != start_clus) continue; /* O(1): no read, no scan */
+            skipping = false;
+            /* The cursor names a byte offset, so the first sector it still
+             * wants is only entered at its own slot -- resuming from 32
+             * (second entry) must NOT rescan the sector's first entry, or
+             * a 1-sector cluster re-delivers entry 0 forever and never
+             * reaches the second one. */
+            from_sec = start_off / m->bytes_per_sector; /* may be the end */
+            first_i = (start_off % m->bytes_per_sector) / DIRENT_SIZE;
         }
-        for (u32 off = 0; off < m->cluster_size; off += DIRENT_SIZE) {
-            struct fat_dirent *e = (struct fat_dirent *)(buf + off);
-            if (e->name[0] == ENT_END) goto done;
-            if (!entry_used(e)) {
-                /* Deleted entry: any LFN run around it is orphaned. */
-                lfn_reset(&lf);
-                continue;
+        /* T-005: an unreadable sector ends the scan with an error.  Reading
+         * on would walk whatever the buffer held before (uninitialised heap
+         * on the first sector) and hand it to `cb` as directory entries --
+         * "not found" out of data that was never read. */
+        u64 clba = cluster_lba(m, c);
+        for (u32 sec = from_sec; sec < m->sectors_per_cluster; sec++) {
+            int rc = fat_read_sector(m, clba + sec, buf);
+            if (rc) {
+                fat_warn_io(m, "read dir", clba + sec);
+                kfree(buf);
+                return rc;
             }
-            if ((e->attr & ATTR_LFN) == ATTR_LFN) {
-                /* LFN entry: assemble UTF16 pieces (stored in reverse
-                 * order); access through a raw byte pointer because the
-                 * pieces span past the 11-byte short-name array */
-                const u8 *raw = (const u8 *)e;
-                int seq = raw[0] & 0x1F;
-                bool marked = (raw[0] & 0x40) != 0;
-                if (marked) {
-                    /* First record of a run (highest seq).  An unterminated
-                     * run from before is dropped, never extended into it. */
-                    if (lf.total) lfn_reset(&lf);
-                    if (seq >= 1 && seq <= LFN_SEQ_MAX) {
-                        lf.total = seq;
-                        lf.expect = seq - 1;
-                        lf.sum = raw[13];
-                    }
-                } else {
-                    /* C17: a run only continues with the same alias
-                     * checksum and strictly descending sequence numbers;
-                     * a hole (or a checksum of a stranger) is corruption:
-                     * reset and let the 8.3 record fall back to its alias. */
-                    if (!lf.total || seq < 1 || seq != lf.expect || lf.sum != raw[13]) {
-                        lfn_reset(&lf);
-                        continue;
-                    }
-                    lf.expect = seq - 1;
-                }
-                if (!lf.total) continue;
-                char piece[14];
-                int pi = 0;
-                static const int off[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
-                for (int k = 0; k < 13; k++) {
-                    u16 ch = (u16)(raw[off[k]] | (raw[off[k] + 1] << 8));
-                    /* 0xFFFF (and 0x0000) pad the final piece. */
-                    if (ch == 0xFFFF || ch == 0) break;
-                    piece[pi++] = (char)ch;
-                }
-                piece[pi] = 0;
-                size_t base = (size_t)(seq - 1) * 13;
-                if (base + pi >= sizeof(lf.longname)) {
-                    lfn_reset(&lf); /* longer than the buffer: use the alias */
+            for (u32 i = (sec == from_sec ? first_i : 0); i < eps; i++) {
+                u32 off = (sec * eps + i) * DIRENT_SIZE;
+                struct fat_dirent *e = (struct fat_dirent *)(buf + i * DIRENT_SIZE);
+                /* 0x00 terminates the directory (only ever in the tail); a
+                 * fifth long-name piece opens with 0x05 and must scan on. */
+                if (e->name[0] == ENT_END) goto done;
+                if (!entry_used(e)) {
+                    /* Deleted entry: any LFN run around it is orphaned. */
+                    lfn_reset(&lf);
                     continue;
                 }
-                memcpy(&lf.longname[base], piece, pi);
-                if ((int)(base + pi) > lf.name_end) lf.name_end = (int)(base + pi);
-                continue;
-            }
-            if (e->attr & ATTR_VOLUME) continue;
+                if ((e->attr & ATTR_LFN) == ATTR_LFN) {
+                    /* LFN entry: assemble UTF16 pieces (stored in reverse
+                     * order); access through a raw byte pointer because the
+                     * pieces span past the 11-byte short-name array */
+                    const u8 *raw = (const u8 *)e;
+                    int seq = raw[0] & 0x1F;
+                    bool marked = (raw[0] & 0x40) != 0;
+                    if (marked) {
+                        /* First record of a run (highest seq).  An
+                         * unterminated run from before is dropped, never
+                         * extended into it. */
+                        if (lf.total) lfn_reset(&lf);
+                        if (seq >= 1 && seq <= LFN_SEQ_MAX) {
+                            lf.total = seq;
+                            lf.expect = seq - 1;
+                            lf.sum = raw[13];
+                        }
+                    } else {
+                        /* C17: a run only continues with the same alias
+                         * checksum and strictly descending sequence
+                         * numbers; a hole (or a checksum of a stranger) is
+                         * corruption: reset and let the 8.3 record fall
+                         * back to its alias. */
+                        if (!lf.total || seq < 1 || seq != lf.expect ||
+                            lf.sum != raw[13]) {
+                            lfn_reset(&lf);
+                            continue;
+                        }
+                        lf.expect = seq - 1;
+                    }
+                    if (!lf.total) continue;
+                    char piece[14];
+                    int pi = 0;
+                    static const int poff[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+                    for (int k = 0; k < 13; k++) {
+                        u16 chr = (u16)(raw[poff[k]] | (raw[poff[k] + 1] << 8));
+                        /* 0xFFFF (and 0x0000) pad the final piece. */
+                        if (chr == 0xFFFF || chr == 0) break;
+                        piece[pi++] = (char)chr;
+                    }
+                    piece[pi] = 0;
+                    size_t base = (size_t)(seq - 1) * 13;
+                    if (base + pi >= sizeof(lf.longname)) {
+                        lfn_reset(&lf); /* longer than the buffer: use the alias */
+                        continue;
+                    }
+                    memcpy(&lf.longname[base], piece, pi);
+                    if ((int)(base + pi) > lf.name_end) lf.name_end = (int)(base + pi);
+                    continue;
+                }
+                if (e->attr & ATTR_VOLUME) continue;
 
-            char shortn[13];
-            fat_short_to_name(e->name, e->ntres, shortn);
-            const char *nm = shortn;
-            char assembled[256];
-            /* C17: the long name is only trusted when the run is complete
-             * and its checksum matches this very record's alias. */
-            if (lf.total && lf.expect == 0 && lf.name_end > 0 &&
-                lf.sum == fat_lfn_checksum(e->name)) {
-                memcpy(assembled, lf.longname, (size_t)lf.name_end);
-                assembled[lf.name_end] = 0;
-                nm = assembled;
-            }
-            lfn_reset(&lf);
-            if (cb(nm, e, c, off, ctx)) {
-                kfree(buf);
-                return 1;
+                char shortn[13];
+                fat_short_to_name(e->name, e->ntres, shortn);
+                const char *nm = shortn;
+                char assembled[261]; /* C31: same bound as the piece buffer */
+                /* C17: the long name is only trusted when the run is
+                 * complete and its checksum matches this very record's
+                 * alias. */
+                if (lf.total && lf.expect == 0 && lf.name_end > 0 &&
+                    lf.sum == fat_lfn_checksum(e->name)) {
+                    memcpy(assembled, lf.longname, (size_t)lf.name_end);
+                    assembled[lf.name_end] = 0;
+                    nm = assembled;
+                }
+                lfn_reset(&lf);
+                if (cb(nm, e, c, off, ctx)) {
+                    kfree(buf);
+                    return 1;
+                }
             }
         }
     }
@@ -157,6 +212,10 @@ done:
     kfree(buf);
     return 0;
 }
+
+/* Full scan from the directory start -- the name-lookup path. */
+int fat_scan_dir(struct fat_mount *m, u32 dirclus, dirent_cb cb, void *ctx)
+{ return fat_scan_dir_at(m, dirclus, DIRIT_START, cb, ctx); }
 
 int fat_scan_find_cb(const char *name, const struct fat_dirent *e, u32 dirclus, u32 off,
                      void *ctx)
@@ -177,10 +236,14 @@ int fat_scan_find_cb(const char *name, const struct fat_dirent *e, u32 dirclus, 
  * error was indistinguishable from a missing file. */
 int fat_resolve_path(struct fat_mount *m, const char *path, struct resolve *r)
 {
-    r->found = false;
+    /* C34: zero the whole answer up front -- callers pass stack structs and
+     * used to be on the hook for clearing them (one of five did), so the
+     * uninitialised tail of the name copy leaked caller-stack bytes into
+     * every resolve. */
+    memset(r, 0, sizeof(*r));
     r->dir_cluster = m->root_cluster;
     while (*path == '/') path++;
-    if (!*path) return 1; /* root itself */
+    if (!*path) return 1; /* root itself: no record, dir_cluster says home */
 
     char comp[56];
     const char *p = path;
@@ -204,7 +267,9 @@ int fat_resolve_path(struct fat_mount *m, const char *path, struct resolve *r)
             r->dir_cluster = cur;
             r->ent_clus = fc.dirclus;
             r->ent_off = fc.off;
-            strncpy(r->name, comp, sizeof(r->name) - 1);
+            /* C34: full copy, terminator included -- comp was built with
+             * one, and len can be exactly sizeof(name)-1 long. */
+            memcpy(r->name, comp, len + 1);
             r->found = true;
             return 1;
         }
@@ -218,17 +283,17 @@ int fat_resolve_path(struct fat_mount *m, const char *path, struct resolve *r)
             r->ent_clus = fc.dirclus;
             r->ent_off = fc.off;
             r->found = true;
-            strncpy(r->name, comp, sizeof(r->name) - 1);
+            memcpy(r->name, comp, len + 1); /* C34: terminator included */
             return 1;
         }
     }
 }
 
 struct iter_ctx {
-    u64 target, seen;
     char name[56];
     u8 type;
     u64 ino;
+    u32 dirclus, off; /* C30: where the delivered record physically sits */
     bool hit;
 };
 
@@ -243,39 +308,48 @@ static int scan_iter_cb(const char *name, const struct fat_dirent *e, u32 dirclu
 {
     struct iter_ctx *c = v;
     if (name[0] == '.') return 0;
-    if (c->seen++ == c->target) {
-        strncpy(c->name, name, sizeof(c->name) - 1);
-        c->name[sizeof(c->name) - 1] = 0;
-        c->type = (e->attr & ATTR_DIR) ? 4 : 8;
-        c->ino = fat_ino(dirclus, off);
-        c->hit = true;
-        return 1;
-    }
-    return 0;
+    strncpy(c->name, name, sizeof(c->name) - 1);
+    c->name[sizeof(c->name) - 1] = 0;
+    c->type = (e->attr & ATTR_DIR) ? 4 : 8;
+    c->ino = fat_ino(dirclus, off);
+    c->dirclus = dirclus;
+    c->off = off;
+    c->hit = true;
+    return 1;
 }
 
-/* Fill `d` with the entry at index `cookie`.
- * T-005 contract (same three-way answer as fat_scan_dir): 1 = entry filled,
- * 0 = the directory is exhausted, negative = the read failed.  The old shape
- * answered "end of directory" and "the disk refused" with the same negative
- * value, so a dead disk could not be told from a finished listing. */
+/* One readdir step over the physical cursor.  T-005 contract (same
+ * three-way answer as fat_scan_dir): 1 = `d` filled, 0 = the directory is
+ * exhausted, negative = the read failed and the cookie stays put, so the
+ * next call re-reports instead of claiming a clean end. */
 int fat_dir_iter(struct dir_iter *it, struct dirent_out *d)
 {
     struct fat_mount *m = fat_priv;
     struct resolve *r = it->node;
     u32 dc = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
-    u64 want_idx = it->cookie >> 8;
-    u8 seen_exhausted = it->cookie & 1;
-    struct iter_ctx ctx = {.target = want_idx, .ino = 0};
+    u64 resume = it->cookie;
 
-    if (seen_exhausted) return 0;
-    int rc = fat_scan_dir(m, dc, scan_iter_cb, &ctx);
-    if (rc < 0) return rc; /* T-005: I/O error, not "end of directory" */
-    if (!ctx.hit) {
-        it->cookie |= 1;
+    if (resume == DIRIT_END) return 0;
+    /* Only a cursor this writer could have produced may resume.  The value
+     * never crosses the syscall ABI, but refusing a malformed one is
+     * cheaper than inventing directory data from it. */
+    if (resume != DIRIT_START &&
+        ((u32)resume % DIRENT_SIZE || (u32)resume > m->cluster_size)) {
+        it->cookie = DIRIT_END;
         return 0;
     }
-    it->cookie = ((want_idx + 1) << 8) | seen_exhausted;
+
+    struct iter_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    int rc = fat_scan_dir_at(m, dc, resume, scan_iter_cb, &ctx);
+    if (rc < 0) return rc; /* T-005: I/O error, not "end of directory" */
+    if (!ctx.hit) {
+        it->cookie = DIRIT_END; /* walked the remainder: sticky end */
+        return 0;
+    }
+    /* The cursor opens the door *after* the delivered record.  The next
+     * entry's LFN pieces (if any) start exactly there. */
+    it->cookie = ((u64)ctx.dirclus << 32) | (ctx.off + DIRENT_SIZE);
     strncpy(d->name, ctx.name, sizeof(d->name) - 1);
     d->type = ctx.type;
     d->ino = ctx.ino;

@@ -175,7 +175,7 @@ qemu-system-x86_64 [--enable-kvm] -machine q35 -m 256 -smp 2 \
 | 3 artifacts | 静态检查 `bzImage` 头（boot flag、`HdrS`、`setup_sects`、`syssize` 与 `setup.bin` 大小互证） | `vmlinux.elf` 关键符号与入口地址、`disk.img` 大小与 `fsck.vfat`、`/bin` 内容、每个用户 ELF 是 ET_EXEC/静态/入口在用户基址 |
 | 4 boot | 无头 QEMU 启动，按顺序等串口标记 | e820 → pmm/vmm → CR0.WP+SMEP+SMAP → 磁盘容量 64 MiB → FAT32 日志与挂载 → `[ktest]` 各阶段 0 failed → `selftest PASS` → pid 1 → AP 标记 → `[boot] ready` → shell 提示符；另有反向检查：无 `[PANIC]`、无 FAIL、selftest 计数自洽、无全 1 磁盘容量 |
 | 5 shell | 通过串口驱动 `ls`/`cat`/`kill`，跑 `systest` | 逐条匹配 `systest` 的 `tag=value` 输出直到 `systest.done=1` |
-| 6 forged FAT | 造镜像副本、伪造 `/CYC` 的 FAT 链（自环、越界项），再启动并读它 | 驱动必须报出损坏且 shell 仍返回，不许跟着坏链走死 |
+| 6 forged FAT | 造镜像副本、在 `/CYC` 内放文件并伪造**该文件**的 FAT 链（目录链不伪造——正确的目录扫描止于 0x00 终止符，伪造目录链本来就不会被跟随），再启动并读它 | 驱动必须报出损坏（自环的 `chain loop`、越界的 `corrupt FAT entry`）且 shell 仍返回，不许跟着坏链走死 |
 
 用法与产物：
 
@@ -187,7 +187,7 @@ make smoke SMOKE_FLAGS="--no-build" # 复用 build/ 里现成产物
 
 - 强制 `KTEST=1`：smoke 校验的 `[ktest]` 标记只有该模式才有，`make KTEST=0 smoke` 不会把它带偏。
 - 单/双 CPU 各有独立标记集（双 CPU 要求 AP 打印 CR0/CR4、内核报 2 CPUs online；单 CPU 则反过来禁止出现 AP 行），所以**单 CPU 必须用 `--smp 1` 而不是 `--qemu-args "-smp 1"`**。
-- 完整串口记录在 `build/smoke/serial.log`（`--smp 1` 时是 `serial-smp1.log`，伪造盘的两次在 `serial-forged-*.log`），可直接核对内核自测行，如 `[ktest] selftest PASS (108 cases, 2607 checks)`。
+- 完整串口记录在 `build/smoke/serial.log`（`--smp 1` 时是 `serial-smp1.log`，伪造盘的两次在 `serial-forged-*.log`），可直接核对内核自测行，如 `[ktest] selftest PASS (115 cases, 3034 checks)`。
 - 阶段 6 用的是副本 `build/smoke/forged.img`，不碰 `build/disk.img`。
 
 手动判据（不跑 smoke 时）：串口出现 `[boot] ready in N ms` 与 `[ktest] selftest PASS`，且无 `[PANIC]`、无三重故障。

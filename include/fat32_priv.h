@@ -151,9 +151,16 @@ struct fat_dirent {
 #define ATTR_DIR     0x10
 #define ATTR_ARCHIVE 0x20
 #define ATTR_LFN     0x0F
-#define ENT_FREE     0x00
-#define ENT_E5       0xE5
-#define ENT_END      0x05
+/* FAT-standard slot first-byte states: 0x00 is an unused slot and the
+ * directory terminator (it only ever sits in the tail), 0xE5 is deleted,
+ * anything else is live.  0x05 is live too: the spec re-uses it to carry a
+ * literal 0xE5 character in an 8.3 alias, and the fifth piece of a
+ * long-name run legitimately begins with its sequence number 5.  Keying
+ * end-of-directory on 0x05 while scanning on past 0x00 cut a 20-piece
+ * long name right at piece five and let records stranded behind the real
+ * terminator surface as phantom names. */
+#define ENT_END      0x00 /* scanners stop here; claims may take the slot */
+#define ENT_E5       0xE5 /* deleted: scanners skip it, claims may reuse  */
 
 /* Sector I/O through the write-back cache.  Contract (T-005): returns 0 or
  * LNXRM_EIO, never a driver-specific code -- callers propagate the value
@@ -316,7 +323,24 @@ static inline void *cluster_buf_alloc(struct fat_mount *m)
 { return kmalloc(m->cluster_size ? m->cluster_size : 4096); }
 
 static inline bool entry_used(const struct fat_dirent *e)
-{ return e->name[0] != ENT_FREE && e->name[0] != ENT_E5; }
+{ return e->name[0] != ENT_END && e->name[0] != ENT_E5; }
+
+/* Compare an 8.3 alias against a wanted short name, byte 0 case
+ * sensitivity untouched: a stored first byte of 0x05 is the spec's
+ * escape for a literal 0xE5, so an entry written with the escape still
+ * matches the name the user typed. */
+static inline bool fat_alias_eq(const u8 stored[11], const u8 want[11])
+{
+    for (int i = 0; i < 11; i++) {
+        u8 a = stored[i], b = want[i];
+        if (i == 0) {
+            if (a == 0x05) a = 0xE5;
+            if (b == 0x05) b = 0xE5;
+        }
+        if (a != b) return false;
+    }
+    return true;
+}
 
 /* Cluster / FAT table access (fat32.c). */
 u32 fat_next_cluster(struct fat_mount *m, u32 clus);
@@ -359,6 +383,13 @@ struct resolve {
  * could not be read.  A failed read is never folded into "0 = not found":
  * the caller would answer ENOENT/empty for data it never got to see. */
 int fat_scan_dir(struct fat_mount *m, u32 dirclus, dirent_cb cb, void *ctx);
+/* C30: same walk started at the getdent cursor `resume` -- (cluster << 32)
+ * | offset of the next record to examine.  All-ones or garbage answers
+ * "ended"; clusters before the cursor cost no device read.  Meant for the
+ * readdir path; the name-lookup path keeps calling fat_scan_dir(). */
+#define DIRIT_START 0ULL
+#define DIRIT_END   ((u64)-1)
+int fat_scan_dir_at(struct fat_mount *m, u32 dirclus, u64 resume, dirent_cb cb, void *ctx);
 int fat_scan_find_cb(const char *name, const struct fat_dirent *e, u32 dirclus, u32 off,
                      void *ctx);
 /* resolve a path to {parent_dir_cluster, dirent copy, name}.
@@ -373,6 +404,10 @@ int fat32_getdent_impl(void *mnt, void *dirnode, u64 *cookie, struct dirent_out 
 
 /* Locked fs_ops implementations (fat32_file.c / fat32_meta.c). */
 int fat_lookup_impl(void *mnt, const char *path, struct vnode *out);
+/* Mount the volume behind `dev` (or NULL when the BPB is refused).
+ * Boot-only entry point; the ktest boundary cases forge volumes and
+ * exercise it directly, so it is exported here, not in a public header. */
+void *fat_mount(struct blkdev *dev);
 int fat_read_impl(void *mnt, void *node, u64 off, void *ubuf, size_t n);
 u64 fat_size_impl(void *mnt, void *node);
 void fat_close_node_impl(void *mnt, void *node);

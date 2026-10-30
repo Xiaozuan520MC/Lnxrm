@@ -699,7 +699,7 @@ static void test_prop_path(void)
  * worked out here from the contract (base stops at the first space, an
  * extension exists only if byte 8 is not a space, the separator dot lands
  * exactly between them, the NT case bits act per half, nothing follows the
- * terminator).  The match half: when the base is one contiguous run with no
+ * terminator, and the spec's 0x05 escape delivers its 0xE5 literal).  The match half: when the base is one contiguous run with no
  * embedded dot -- the only shape that survives name_to_short()'s split -- the
  * display name must match the entry it came from, and neither case nor an
  * extension longer than the three characters 8.3 stores may change an answer.
@@ -765,7 +765,11 @@ static void test_prop_fat_name(void)
         bool lower_base = (ntres & FAT_NTRES_LOWER_BASE) != 0;
         bool lower_ext = (ntres & FAT_NTRES_LOWER_EXT) != 0;
         for (int i = 0; i < b; i++) {
-            char want = lower_base ? ascii_tolower((char)sn[i]) : (char)sn[i];
+            /* the spec's alias escape: a stored first byte of 0x05 carries
+             * a literal 0xE5 and renders as 0xE5, never as the raw byte */
+            u8 c = (u8)sn[i];
+            if (i == 0 && c == 0x05) c = 0xE5;
+            char want = lower_base ? ascii_tolower((char)c) : (char)c;
             prop_check((u8)o.out[i] == (u8)want, "base byte ignores the NT bit", (u8)o.out[i],
                        (u8)want);
         }

@@ -32,6 +32,48 @@ static int part_write(struct blkdev *dev, u64 lba, u32 count, const void *buf)
     return blk_io_write(pd->parent, pd->start_lba + lba, count, buf);
 }
 
+/* C36: hard ceiling on the extended-partition chain walked at parse time.
+ * A legal EBR chain always moves forward through the disk, so the bound is
+ * about hostile tables, not real layouts. */
+#define EBR_CHAIN_MAX 32
+
+/* Record one validated entry in `out`.  `idx` is only for the log line.
+ * Returns false (and prints why) when the entry lies off the disk or is
+ * empty-sized -- C36: range violations die here, not at I/O time. */
+static bool mbr_take(struct blkdev *dev, struct mbr_info *out, u8 status, u8 type, u64 lba,
+                     u32 count, const char *idx)
+{
+    if (count == 0 || lba + count > dev->num_sectors) {
+        kprintf("[mbr] %s %s lba=%llu+%u outside the disk (%llu sectors) "
+                "-- dropped\n",
+                idx, mbr_type_name(type), lba, count, dev->num_sectors);
+        return false;
+    }
+    if (out->part_count >= MBR_MAX_PARTITIONS) {
+        kprintf("[mbr] %s dropped: partition table full (%d)\n", idx, MBR_MAX_PARTITIONS);
+        return false;
+    }
+    out->parts[out->part_count].type = type;
+    out->parts[out->part_count].lba_first = (u32)lba;
+    out->parts[out->part_count].sectors_count = count;
+    out->parts[out->part_count].is_extended =
+        (type == PART_TYPE_EXTENDED || type == PART_TYPE_EXT_LBA);
+    kprintf("[mbr] %s: status=0x%02X type=0x%02X (%s) lba=%llu sectors=%u (%llu MB)\n", idx,
+            status, type, mbr_type_name(type), lba, count, (u64)count / 2048);
+    out->part_count++;
+    return true;
+}
+
+/* Read one EBR-sector table entry out of a raw MBR/EBR sector. */
+static struct mbr_entry *mbr_slot(const u8 *sector, int slot)
+{
+    return (struct mbr_entry *)(sector + MBR_PARTITION_TABLE_OFFSET +
+                                slot * MBR_PARTITION_ENTRY_SIZE);
+}
+
+static bool mbr_is_ext(u8 type)
+{ return type == PART_TYPE_EXTENDED || type == PART_TYPE_EXT_LBA; }
+
 int mbr_parse(struct blkdev *dev, struct mbr_info *out)
 {
     u8 sector[512];
@@ -64,27 +106,65 @@ int mbr_parse(struct blkdev *dev, struct mbr_info *out)
 
     kprintf("[mbr] signature OK (0xAA55)\n");
 
-    /* Parse partition table */
-    for (int i = 0; i < MBR_MAX_PARTITIONS; i++) {
-        struct mbr_entry *e = (struct mbr_entry *)(sector + MBR_PARTITION_TABLE_OFFSET +
-                                                   i * MBR_PARTITION_ENTRY_SIZE);
-
+    /* Parse the primary table. */
+    u32 ext_lba = 0;
+    for (int i = 0; i < 4; i++) {
+        struct mbr_entry *e = mbr_slot(sector, i);
         if (e->type == PART_TYPE_NONE) continue;
+        char idx[16];
+        /* no snprintf in the kernel: "partition <slot>" by hand */
+        memcpy(idx, "partition ", 10);
+        idx[10] = (char)('0' + i);
+        idx[11] = 0;
+        if (!mbr_take(dev, out, e->status, e->type, e->lba_first, e->sectors_count, idx))
+            continue;
+        if (e->status & 0x80) out->boot_ind = out->part_count - 1;
+        if (mbr_is_ext(e->type) && !ext_lba) ext_lba = e->lba_first;
+    }
 
-        out->parts[out->part_count].type = e->type;
-        out->parts[out->part_count].lba_first = e->lba_first;
-        out->parts[out->part_count].sectors_count = e->sectors_count;
-        out->parts[out->part_count].is_extended =
-            (e->type == PART_TYPE_EXTENDED || e->type == PART_TYPE_EXT_LBA);
+    /* C36: extended partitions hold a chain of EBRs, one logical
+     * partition each in that EBR's entry 0 and a forward link in entry 1
+     * relative to the EBR itself.  The old parser stopped at the primaries,
+     * so every logical partition was silently invisible. */
+    u32 ebr = ext_lba;
+    for (u32 depth = 0; ebr && depth < EBR_CHAIN_MAX; depth++) {
+        if ((u64)ebr >= dev->num_sectors || blk_io_read(dev, ebr, 1, sector)) {
+            kprintf("[mbr] EBR at sector %u unreadable -- chain cut\n", ebr);
+            break;
+        }
+        if (*(u16 *)(sector + 510) != MBR_SIGNATURE) {
+            kprintf("[mbr] EBR at sector %u: no signature -- chain cut\n", ebr);
+            break;
+        }
+        /* no snprintf: "ebr<chain depth>" by hand */
+        char idx[16];
+        memcpy(idx, "ebr", 3);
+        u32 d = depth;
+        int li = 3;
+        do {
+            idx[li++] = (char)('0' + d % 10);
+            d /= 10;
+        } while (d);
+        idx[li] = 0;
 
-        if (e->status & 0x80) out->boot_ind = out->part_count;
-
-        u64 part_size_mb = (u64)e->sectors_count / 2048;
-        kprintf("[mbr] partition %d: status=0x%02X type=0x%02X (%s) lba=%u sectors=%u (%llu MB)\n",
-                i, e->status, e->type, mbr_type_name(e->type), e->lba_first, e->sectors_count,
-                part_size_mb);
-
-        out->part_count++;
+        struct mbr_entry *l = mbr_slot(sector, 0), *n = mbr_slot(sector, 1);
+        if (l->type != PART_TYPE_NONE)
+            mbr_take(dev, out, l->status, l->type, (u64)ebr + l->lba_first, l->sectors_count,
+                     idx);
+        if (n->type != PART_TYPE_NONE && !mbr_is_ext(n->type)) {
+            /* some tools put stray data in the link slot: not a chain */
+            kprintf("[mbr] EBR at sector %u: entry 1 is not a link -- chain cut\n", ebr);
+            break;
+        }
+        u32 next = (n->type == PART_TYPE_NONE || !mbr_is_ext(n->type)) ? 0 : n->lba_first;
+        if (!next) break;
+        /* A link is relative, so it can only point forward; a "forward"
+         * hop that leaves the disk is a hostile table, cut here. */
+        if ((u64)ebr + next >= dev->num_sectors) {
+            kprintf("[mbr] EBR link at sector %u leaves the disk -- chain cut\n", ebr);
+            break;
+        }
+        ebr += next;
     }
 
     kprintf("[mbr] found %d partition(s), boot=%d\n", out->part_count, out->boot_ind);

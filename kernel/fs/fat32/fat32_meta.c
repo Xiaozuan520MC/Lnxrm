@@ -47,9 +47,9 @@ static int parent_dir_init(struct fat_mount *m, const char *path, struct parent_
 }
 
 /* C23: one claimable-slot rule for both writers.  A slot is free when its
- * first byte is ENT_FREE (0x00, never-used tail), ENT_E5 (deleted) or
- * ENT_END (0x05, the end marker a claim pushes forward).  Everything
- * else -- 0x05-as-alias bytes excluded -- is a live record. */
+ * first byte is ENT_END (0x00, the never-used tail a claim shortens) or
+ * ENT_E5 (deleted).  Everything else is a live record, including the 0x05
+ * alias escape and the 0x05 first byte of long-name piece five. */
 
 /* Claim slot (lba, doff): read the owning sector, fill the record and
  * write it back.  Returns 0 or LNXRM_EIO when a step failed (T-005): the
@@ -167,7 +167,7 @@ static int parent_entry_add(struct fat_mount *m, u32 pdir, const char *name, u8 
             u32 last_doff = m->bytes_per_sector - DIRENT_SIZE;
             for (u32 doff = 0; doff <= last_doff; doff += DIRENT_SIZE) {
                 u8 first = pbuf[doff];
-                if (first != ENT_FREE && first != ENT_E5 && first != ENT_END) continue;
+                if (first != ENT_END && first != ENT_E5) continue;
                 /* never take the directory's very last slot: the 0x00 end
                  * marker must outlive every claim */
                 if (cc == lastc && s == m->sectors_per_cluster - 1 && doff == last_doff)
@@ -276,7 +276,7 @@ static int dirent_locate(struct fat_mount *m, u32 dirclus, const u8 sn[11],
         }
         for (u32 off = 0; off < m->cluster_size; off += DIRENT_SIZE) {
             struct fat_dirent *e = (struct fat_dirent *)(buf + off);
-            if (e->name[0] == ENT_FREE) goto out;
+            if (e->name[0] == ENT_END) goto out;
             if (!entry_used(e)) {
                 nrun = 0; /* deleted record: any run around it is broken */
                 continue;
@@ -288,7 +288,7 @@ static int dirent_locate(struct fat_mount *m, u32 dirclus, const u8 sn[11],
                 nrun++;
                 continue;
             }
-            if (!memcmp(e->name, sn, 11)) {
+            if (fat_alias_eq(e->name, sn)) {
                 out->pos = p;
                 out->de = *e;
                 out->n_lfn = nrun > LFN_ENTRIES_MAX ? LFN_ENTRIES_MAX : nrun;
@@ -306,10 +306,10 @@ out:
 }
 
 /* Claim `need` consecutive free records inside `dirclus`.  C23: the same
- * claimable rule parent_entry_add() uses -- 0x00 tail, 0xE5 deleted and
- * the 0x05 end marker are free, any live record ends every run.  The
- * directory's very last slot is protected (the end marker stays), so a
- * run that needs it grows the chain first and rescans.
+ * claimable rule parent_entry_add() uses -- 0x00 tail and 0xE5 deleted are
+ * free, any live record ends every run.  The directory's very last slot is
+ * protected (the 0x00 terminator stays), so a run that needs it grows the
+ * chain first and rescans.
  * Returns 0 with out[0..need-1] filled, or LNXRM_EINVAL / LNXRM_EIO /
  * LNXRM_ENOSPC.  Nothing is written: the caller owns the claimed slots. */
 static int dir_claim_run(struct fat_mount *m, u32 dirclus, int need, struct dirent_pos *out)
@@ -337,8 +337,8 @@ static int dir_claim_run(struct fat_mount *m, u32 dirclus, int need, struct dire
             for (u32 off = 0; off < m->cluster_size && nrun < need; off += DIRENT_SIZE) {
                 struct fat_dirent *e = (struct fat_dirent *)(buf + off);
                 u8 first = e->name[0];
-                if (c == lastc && off == last_off) break; /* end marker stays */
-                if (first != ENT_FREE && first != ENT_E5 && first != ENT_END) {
+                if (c == lastc && off == last_off) break; /* terminator stays */
+                if (first != ENT_END && first != ENT_E5) {
                     nrun = 0; /* a live record ends the run */
                     continue;
                 }
@@ -488,7 +488,7 @@ int fat_rmdir_impl(void *mnt, const char *path)
             for (u32 doff = 0; doff <= m->bytes_per_sector - DIRENT_SIZE; doff += DIRENT_SIZE) {
                 struct fat_dirent *e = (struct fat_dirent *)(dbuf + doff);
                 if (e->name[0] == ENT_END) goto done_check;
-                if (e->name[0] == ENT_FREE || e->name[0] == ENT_E5) continue;
+                if (e->name[0] == ENT_E5) continue;
                 entry_count++;
                 /* . and .. are allowed */
                 if (e->name[0] == '.' && (e->name[1] == ' ' || e->name[1] == '.')) continue;
@@ -641,7 +641,7 @@ static int dir_dotdot(struct fat_mount *m, u32 clus, u32 *out)
     }
     for (u32 off = 0; off <= m->bytes_per_sector - DIRENT_SIZE; off += DIRENT_SIZE) {
         struct fat_dirent *e = (struct fat_dirent *)(buf + off);
-        if (e->name[0] == ENT_FREE) break;
+        if (e->name[0] == ENT_END) break;
         if (!entry_used(e) || (e->attr & ATTR_LFN) == ATTR_LFN) continue;
         if (e->name[0] == '.' && e->name[1] == '.' && e->name[2] == ' ') {
             *out = ((u32)e->fstclushi << 16) | e->fstcluslo;
@@ -666,7 +666,7 @@ static int dir_set_dotdot(struct fat_mount *m, u32 clus, u32 parent)
     }
     for (u32 off = 0; off <= m->bytes_per_sector - DIRENT_SIZE; off += DIRENT_SIZE) {
         struct fat_dirent *e = (struct fat_dirent *)(buf + off);
-        if (e->name[0] == ENT_FREE) return 0;
+        if (e->name[0] == ENT_END) return 0;
         if (!entry_used(e) || (e->attr & ATTR_LFN) == ATTR_LFN) continue;
         if (e->name[0] == '.' && e->name[1] == '.' && e->name[2] == ' ') {
             u32 dd = dotdot_store(m, parent);

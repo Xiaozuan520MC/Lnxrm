@@ -755,6 +755,25 @@ def fat_layout(path):
             struct.unpack_from("<I", b, 44)[0])
 
 
+def _entry_cluster(path, dirclus, name):
+    """First cluster of a directory entry `name` inside cluster `dirclus`."""
+    _, data, spc, _ = fat_layout(path)
+    with open(path, "rb") as f:
+        f.seek((data + (dirclus - 2) * spc) * 512)
+        blob = f.read(spc * 512)
+    for off in range(0, len(blob), 32):
+        e = blob[off:off + 32]
+        if e[0] == 0x00:
+            break
+        # skip LFN (0x0F), volume (0x08) and directory (0x10) records
+        if e[11] & 0x1F:
+            continue
+        if bytes(e[:11]).strip() == name:
+            return struct.unpack_from("<H", e, 26)[0] | \
+                   (struct.unpack_from("<H", e, 20)[0] << 16)
+    return None
+
+
 def subdir_cluster(path, name):
     """First cluster of a subdirectory of the root, or None."""
     _, data, spc, root = fat_layout(path)
@@ -772,7 +791,13 @@ def subdir_cluster(path, name):
 
 
 def build_forged_image(value_for):
-    """Copy the rootfs, add /CYC and forge its FAT entry.
+    """Copy the rootfs, add /CYC with a file, and forge that file's FAT entry.
+
+    The directory chain of /CYC is clean on purpose: a correct FAT32 driver
+    stops a directory scan at the 0x00 terminator, so a forged directory
+    chain would never even be followed.  The file's data chain is the one
+    that actually gets walked (by cat /CYC/zzz.tst), so that is the cell
+    the forge targets.
 
     value_for(cluster) yields the 32-bit value written into FAT[cluster].
     Returns (image path, cluster) or (None, reason)."""
@@ -788,15 +813,25 @@ def build_forged_image(value_for):
     clus = subdir_cluster(img, b"CYC")
     if not clus:
         return None, "/CYC not visible after mmd"
+    tmp = os.path.join(SMOKE_DIR, "zzz.bin")
+    with open(tmp, "wb") as f:
+        f.write(b"FORGED CHAIN DATA\n" * 480)
+    rc, out = sh(["mcopy", "-i", img, tmp, "::CYC/zzz.tst"])
+    if rc != 0:
+        return None, "mcopy ::CYC/zzz.tst failed: " + tail(out, 5)
+    fclus = _entry_cluster(img, clus, b"ZZZ     TST")
+    if not fclus:
+        return None, "::CYC/zzz.tst not visible after mcopy"
     fat0 = fat_layout(img)[0]
     with open(img, "r+b") as f:
-        f.seek(fat0 + clus * 4)
-        f.write(struct.pack("<I", value_for(clus) & 0x0FFFFFFF))
-    return img, clus
+        f.seek(fat0 + fclus * 4)
+        f.write(struct.pack("<I", value_for(fclus) & 0x0FFFFFFF))
+    return img, fclus
 
 
 FORGED_CASES = [
-    ("self-loop", lambda c: c, br"\[fat32\] chain walk hit its \d+ step budget"),
+    ("self-loop", lambda c: c,
+     br"\[fat32\] chain (loop: cluster \d+ points at itself|walk hit its \d+ step budget)"),
     ("out-of-volume entry", lambda c: 0x00FFFFF0, br"\[fat32\] corrupt FAT entry"),
 ]
 
@@ -822,7 +857,7 @@ def phase_forged_fat(report, args):
                                "no shell prompt")
                     dump_tail(guest)
                     continue
-                guest.send("cat /CYC/zzz")
+                guest.send("cat /CYC/zzz.tst")
                 report.add("forged FAT reported (%s)" % label,
                            guest.wait(warn, args.timeout) is not None,
                            "driver stayed silent about the forged entry")

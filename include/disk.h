@@ -38,8 +38,9 @@ struct mbr_entry {
 #define PART_TYPE_LINUX      0x83 /* ext2/ext3/ext4 */
 #define PART_TYPE_LINUX_SWAP 0x82
 
-/* Max partitions we track */
-#define MBR_MAX_PARTITIONS 4
+/* Max partitions we track: the MBR's 4 primaries plus one logical per EBR
+ * along the bounded chain mbr_parse() walks (see EBR_CHAIN_MAX in mbr.c). */
+#define MBR_MAX_PARTITIONS (4 + 32)
 
 struct mbr_info {
     struct blkdev *dev;

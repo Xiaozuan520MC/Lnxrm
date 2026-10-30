@@ -7,7 +7,7 @@
 >
 > 已核对的基线：系统调用 39 个（0–38 连续无空洞），其中图形 6 个
 > （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)）；
-> ktest 108 cases / 2607 checks（2 skipped）；`make smoke` 203/203；`make` 零警告。
+> ktest 115 cases / 3034 checks（2 skipped，1 条刻意告警）；`make smoke` 203/203；`make` 零警告。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文**只收仍然开放的条目**，
 > 不重排编号；半修的条目在「后果」列注明现状；已关闭的缺陷不复述。
@@ -29,11 +29,11 @@
 | 系统调用 / ABI | 3 | 39 个编号（0..38）全部实现，用户指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；缺 `mmap`/时间类/`stat`/`pipe` |
 | 并发正确性 | 2 | 终端打印锁、任务表锁、fd 引用计数、console 多等待者链表已就位；仍有跨设备 I/O 的两层 irqsave（C7/C10）、`pick_next` 无锁读（C4） |
 | 设备驱动 | 2 | PS/2 键盘与鼠标中断驱动（IRQ1→键盘环、IRQ12→aux 事件环，串口 RX 中断已接）、AHCI 走 DMA + `clflush`/`mfence` + UC 映射、完成判定补查 `PxTFD.ERR`；AHCI/IDE 纯轮询无中断（C49）、多盘只注册第一块（C51），IDE 无 LBA48 命令（C53） |
-| 文件系统 | 2 | FAT32 + on-disk redo journal（mount 时 replay，`ktest/t_journal.c`）+ 时间戳 LRU 块缓存 + 簇链步数预算；静默损坏三件已修（C19/C20/C21：truncate 落盘 + 写回按槽位定位 + 不匹配即 EIO 回滚），vnode 泄漏（C40）已修，仍有目录 O(n²) 扫描（C30） |
+| 文件系统 | 3 | FAT32 + on-disk redo journal（mount 时 replay，`ktest/t_journal.c`）+ 时间戳 LRU 块缓存 + 簇链步数预算；边界批次已收口（目录游标 C30、LFN 260 字符 C31、FAT 容量拒绝 C32、末条目可达 C33、短名终止符 C34、MBR 范围与 EBR 链 C36），目录结束符同时改回规范字义（0x00 止看，0x05 是别名转义/活记录）；vnode 泄漏（C40）已修；剩 mount 数据下传（C39）与分区注册（C28） |
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
 | 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
 | 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 108/2607（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 203/203（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
+| 测试 | 3 | ktest 115/3034（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入）、`make smoke` 203/203（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -58,12 +58,6 @@
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
 | C28 | `kernel/fs/vfs.c:660`；`kernel/fs/mbr.c` | 分区设备从不 `blk_register`，`diskinfo` 看不到分区；`blk_count` 满 8 之后新设备进不了 `blk_list` 却仍会顶掉 `blk_first` | 分区注册 + 满槽一致处理，约 1 天 |
-| C30 | `kernel/fs/fat32/fat32_dir.c:230-245` | 每次 getdent 都从目录首簇重扫（cookie 只存条目索引）：`ls` 是 O(n²) 磁盘读 | cookie 改为簇 + 偏移游标，约 1 天 |
-| C31 | `kernel/fs/fat32/fat32_dir.c:39` | `longname[256]` 小于 LFN 上限 260 字符：247+ 字符文件名被静默截断 | 缓冲扩到 261 字节并处理末字符，几行 |
-| C32 | `kernel/fs/fat32/fat32.c:358` | `u32 fat_entries`：FAT 表超过 4 GiB 时表项数溢出，`max_cluster` 被砍半 | 改 u64 + 挂载期拒绝，几行 |
-| C33 | `kernel/fs/fat32/fat32.c:359` | `max_cluster = fat_entries - 1` 被当作开区间消费：最后一个 FAT 条目永远不可达 | 统一口径 + 一条用例，半天 |
-| C34 | `kernel/fs/fat32/fat32_dir.c:177,189`；`fat32_file.c:8` | `strncpy(dst, src, sizeof-1)` 从不写最后一个字节，而调用方的 `struct resolve` 未初始化：长度恰好等于上限时字符串无终止符 | 末字节显式置 0 + `resolve` memset，几行 |
-| C36 | `kernel/fs/mbr.c` `mbr_parse()` | 扩展分区（EBR 链）从不遍历，只认 4 个主表项；条目 `lba + count` 不在解析时校验，越界要等 I/O 才暴露 | 解析期校验范围；EBR 要么遍历要么显式拒绝，约 1 天 |
 | C39 | `kernel/fs/fat32/fat32_file.c:15,32` | vnode 的 `mnt_data` 仍是 `(void*)1` 哨兵，`fat_freespace` 没有调用者：mount 间接层是装饰，多挂载没有基础 | 挂载数据真正下传（与 C47 一起做），约 2 天 |
 
 ### 2.3 VFS 与文件语义
@@ -214,7 +208,7 @@
 | 跑自己写的 `user/` 程序 | 安全 | `sigreturn` 恢复内核保存的帧（不读用户栈，CS/SS 不经用户之手）；ELF 装载七项校验；syscall 指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；表外编号回 `ENOSYS`；用户态异常只杀进程；`kprintf` 格式串全是字面量且无 `%n` |
 | 跑不完全信任的用户程序 | 不安全 | 权限止于 `uid` + 3 个能力位（无 gid / 文件属主 / CPU 限额 / 沙箱）；内核全程关中断加一把全局 FS 锁，一个 bug 可拖死整机；内核镜像可写可执行、无栈保护、无 KASLR |
 | 挂载可信磁盘 | 基本安全 | on-disk redo journal + mount replay，故障注入覆盖提交点前后两个窗口，块缓存时间戳 LRU，簇链有步数预算；静默损坏三件已修（C19/C20/C21：`O_TRUNC` 落盘、写回按槽位定位、找不到 dirent 即 EIO 回滚）；vnode 泄漏（C40）已修；脏页三道同步门已就位（C27：BSP tick 每秒 / 普通文件 close / panic try 回写，外加 `SYS_sync(33)`；崩溃窗口从 32 KiB 收窄到「上次同步以来写过扇区」） |
-| 挂载不可信或可能损坏的磁盘 | 不安全 | 簇链步数预算（`FAT_CHAIN_MAX_STEPS`）不再无限挂死，但有界长走仍持有 irqsave 锁；BPB 三项校验（55AA / `"FAT32"` / 簇因子 2 的幂）与目录槽判定已统一（C38/C23），边界仍靠 C30/C32/C36 等条目 |
+| 挂载不可信或可能损坏的磁盘 | 不安全 | 簇链步数预算（`FAT_CHAIN_MAX_STEPS`）+ 单簇自环即断（本批新增）拦住坏链挂钩；BPB 三项校验（55AA / `"FAT32"` / 簇因子 2 的幂）、目录游标（C30）、LFN 长度（C31）、FAT 容量（C32/C33）、短名终止符（C34）、MBR 范围与 EBR 链（C36）、目录结束符回归规范字义（0x00 止看，尾槽后的残留字节浮不出伪记录）均已收口；仍不安全是因为有界长走持 irqsave 锁、无 checksum、目录条目内容仍逐扇区信任读回 |
 | 硬件缓解 | 已开但不完整 | `EFER.NXE`、`CR0.WP`、`CR4.WP`、`SMEP`、`SMAP` 全部置位，BSP 与 AP 都走 `cpu_protect_init()`，启动日志打印 `EFER.NXE` 并有 ktest 钉点；缺 KASLR、KPTI、canary、内核 W^X、IST |
 | 横向定位 | 与 `xv6` 同档 | 同为简单权限模型、同无 KASLR；`sigreturn`、ELF 解析、`copy_user` 三处比常见教学实现更严谨 |
 
@@ -225,7 +219,7 @@
 一行一项，按依赖顺序排列；括号内引用第 2、3 节的编号。
 
 1. 几行级止血：空文件 `write 0`（C35）、`getdent` 小缓冲忙等（C44）、vnode 泄漏（C40）、写路径访问模式（C41）——已收口（2026-10-25），见已落地段。
-2. 边界与校验：目录游标（C30）、MBR 范围与 EBR（C36）——`bytes_per_sector` 缓冲（C29）、BPB 校验（C38）、目录槽判定与目录链扩展（C23）已收口，LFN 校验（C17）同批。
+2. 边界与校验：目录游标（C30）、LFN 长度（C31）、FAT 容量（C32/C33）、短名终止符（C34）、MBR 范围与 EBR（C36）——同批收口（2026-10-30），含把目录结束符改回规范字义（0x00 止看 / 0x05 视活记录）与 smoke 伪造盘改造，见溯源段。
 3. 锁与抢占：先 C7（锁外做 I/O），再 C10（请求队列），然后 C62/C4（RR 与队列读），最后 3.6 的内核态抢占与 syscall 关中断——每一步都要有 smoke 兜底。
 4. 验证面：smoke 矩阵化（C68：ISO、内存档位、q35+KVM、双盘）+ 连跑抖动门（OBS-1），再上 CI（3.5）。
 5. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
@@ -243,4 +237,6 @@
 >
 > 已落地（供溯源）：C27 — 脏页与持久化同步（2026-10-25）：崩溃窗口从「最多丢 64 扇区（32 KiB）」收窄到「自上次同步以来写过的扇区」。三道门共用一个 `blk_cache_sync_all()`（扫全部 64 槽，写回每个脏扇区；写回失败保持脏——丢唯一拷贝才是错，最后一个错误上抛）：**定时**（BSP tick 每秒 `blk_cache_tick`，刻意在 panic 期与 `current == NULL` 时静默——boot 自测全程无任务且计时器晚于 ktest 才启动，计数断言保持确定性）、**close**（普通文件最后一个 fd 关闭即同步；目录/字符设备无数据不触发）、**panic**（`blk_cache_sync_all_try()` + 新增 `spin_trylock_irqsave`：panic 路径对其持有的任何锁都不等待，仍能走到 `hlt`——丢字节换死锁才是真损失）。新增 `SYS_sync`（33 号，按紧凑表规则在末尾追加，`LNXRM_SYSCALL_LAST` 同步调至 33；编译期守护自动覆盖），userland `init/ulib.h` 增 `ksync()`，systest 走 `sync.ret=0` 冒烟。ktest `test_sync_hands_dirty_sectors_to_the_device`（t_cache）：新鲜 mkfs 上先经驱动层直读证明暂存扇区尚未落盘，一次 sync 后写回/设备写计数 ≥1 且直读与暂存逐字节相同（实测 2 次写回 = 数据扇区 + dirent），二次 sync 写回/设备写计数零增长。
 
-> 已落地（供溯源）：C17/C23/C29/C38 — 同批收口：LFN 读路径整段清零 + 校验和/序号连续性校验（C17）；`bps == CACHE_SECTOR_SIZE` 锚定在挂载层（C29，两条 512 字节栈缓冲不变量由此成立）；BPB 三项校验 55AA / `"FAT32"` / 簇因子 2 的幂（C38）；目录"可用槽"判定统一为 0x00 尾标记 + 0xE5 + 0x05 结束标记（认领 0x05 把结尾点推后一位；0x05 之外的非 0x00/0xE5 首字节一律视为活记录），条目槽不足时先扩展目录链再落位，且永不吃掉目录末槽（保住结尾标记，C23）。smoke 阶段 6/6 两个 forged 告警检查依赖 `FAT_WARN_LIMIT` 余量：引导期自测约耗 14/16，单 guest 仅剩 1–2 条，后续新增会烧告警配额的 ktest 时需同步放宽限额。
+> 已落地（供溯源）：C17/C23/C29/C38 — 同批收口：LFN 读路径整段清零 + 校验和/序号连续性校验（C17）；`bps == CACHE_SECTOR_SIZE` 锚定在挂载层（C29，两条 512 字节栈缓冲不变量由此成立）；BPB 三项校验 55AA / `"FAT32"` / 簇因子 2 的幂（C38）；目录"可用槽"判定统一为 0x00 尾槽 + 0xE5 已删除（该批时的判断里 0x05 还被当作"认领时前移的结束标记"，已在边界批次改回规范字义，见下条），条目槽不足时先扩展目录链再落位，且永不吃掉目录末槽（保住终止符，C23）。
+>
+> 已落地（供溯源）：C30/C31/C32/C33/C34/C36 — 边界与校验批次（2026-10-30）：getdent 游标改成 `(簇<<32)|字节偏移` 的物理恢复点（`DIRIT_START=0`、`DIRIT_END=(u64)-1`，`include/fat32_priv.h`），引擎按扇区步进、整簇级跳过零设备读，一整条 readdir 的扇区查找计数 ≈ 链内扇区数 + 条目数（实测 `dir 3 clusters, one walk = 39 lookups (bound 46)`，ktest 直测走查找计数）；LFN 拼接缓冲 260 字符 + 终止符（C31）；卷 FAT 表项数用 u64 计数、>2^28 直接在挂载前拒绝并在日志里点名几何（`[fat32] reject …`，设备恰发一个扇区 = BPB，C32）；`max_cluster` 改独占上限使最末 FAT 格可达且链尾可读（C33）；`resolve` 全对象清零 + 名字逐字节拷贝带终止符（C34）；MBR/EBR 解析期校验每个表项 `lba+count <= 盘容量` 后才收录，EBR 链真正遍历（逻辑分区 + 相对前向链接，上限 32 段，C36）。同批把目录结束符改回规范字义：**0x00 止看**（尾槽之后的残留字节再也浮不出伪记录）、**0x05 是活记录**（它是规范里 8.3 别名对 0xE5 的转义，而 LFN 第五片的首字节恰是序号 5——旧字义会把 20 片长名在第五片拦腰截断）；`fat_chain_advance` 增单簇自环即断 + `chain loop` 告警。ktest：`t_fatfile` C30 游标一次走（SET 断言 + 查找计数 + 5 条手工续走）、C31 二十片长名、C32/C33 伪造盘容量、C34 中毒名终止；`t_mbr` C36 签名 + 范围/EBR 链两例。smoke 阶段 6 相应改造：伪造对象改为**文件数据链**（正确的目录扫描本就止于 0x00，旧的目录链伪造在新语义下根本不会被跟随），自环判据加收新的 `chain loop` 行。`fat_warns` 是**每个挂载**独立预算（16 条封顶后静默）：ktest 各 mount 与真实 root 互不挤兑，阶段 6 guest 的 root 只为损坏报告花 1 条。
