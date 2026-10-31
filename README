@@ -1,6 +1,6 @@
 lnxrm
 
-自制 x86-64 宏内核：裸机到带帧缓冲控制台、FAT32 文件系统、多核与 39 个系统调用的。
+自制 x86-64 宏内核：裸机到带帧缓冲控制台、FAT32 文件系统、多核与 42 个系统调用的。
 使用C/ASM 两语言
 
 构建与运行
@@ -17,7 +17,7 @@ ISO 额外要 grub-mkrescue + grub-pc-bin；镜像要 dosfstools（mkfs.vfat）�
 产物
 
   build/bzImage        内核镜像
-  build/disk.img       FAT32 磁盘（/bin/*）
+  build/disk.img       FAT32 磁盘
   build/lnxrm.iso      GRUB ISO
   build/smoke/serial.log  冒烟运行的完整串口输出
 
