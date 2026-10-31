@@ -127,6 +127,12 @@ static inline long kinput_pop(struct lnxrm_input_event *e)
 { return syscall1(SYS_input_pop, (long)e); }
 static inline long kinput_info(struct lnxrm_input_info *i)
 { return syscall1(SYS_input_info, (long)i); }
+/* unified input event queue 41: blocking pop.  Returns 1 (event copied),
+ * LNXRM_EAGAIN (ms==0, empty queue), LNXRM_EINTR (signal), 0 (timeout),
+ * -EACCES (no CAP_SYS_ADMIN), -EFAULT (bad pointer).  ms is milliseconds;
+ * (u64)-1 waits for an event or a signal only. */
+static inline long kinput_wait(struct lnxrm_input_event *e, u64 ms)
+{ return syscall2(SYS_input_wait, (long)e, (long)ms); }
 
 /* Drop (or, as root, set) this process's uid.  Root may name any uid;
  * naming a uid other than 0 clears the tier to user and every capability

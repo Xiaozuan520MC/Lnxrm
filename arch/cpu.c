@@ -122,7 +122,7 @@ void idt_init(void)
     __asm__ volatile("lidt %0" ::"m"(idtr));
 }
 
-/* ---- IRQ handler table (dispatched by kernel/isr.c) ---- */
+/* ---- IRQ handler table (dispatched by kernel/irq/isr.c) ---- */
 static irq_handler_t handlers[16];
 
 void irq_install(int irq, irq_handler_t h)

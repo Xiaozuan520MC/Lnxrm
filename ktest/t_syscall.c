@@ -1,7 +1,7 @@
 /* Dispatch-level pointer validation: syscall_do()'s gates are what stands
  * between a user pointer and a kernel dereference, and no other self-test
  * reaches them -- t_usercopy proves the copy primitives in isolation,
- * user/systest exercises only the paths a shell happens to walk from ring
+ * userland/systest exercises only the paths a shell happens to walk from ring
  * 3.  syscall_probe() runs the real dispatch table (gates, pointer
  * checks, per-syscall error codes) against caller-built arguments; the
  * only thing it skips is the int 0x80 entry plumbing, which a kernel-side

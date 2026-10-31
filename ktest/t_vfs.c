@@ -40,7 +40,7 @@ static void test_path_too_long(void)
  * drift apart the image, not the test, is what needs looking at.
  * 2026-10-18: "+ Rust" dropped from both sides -- the Rust component was
  * removed (uart.c port, smp.rs folded into smp.cpp, lib.rs deleted);
- * the same day smp.cpp itself became kernel/smp.c (pure-C SMP rewrite).
+ * the same day smp.cpp itself became kernel/core/smp.c (pure-C SMP rewrite).
  * 2026-10-18 (evening): "+ C++" dropped from both sides, string 41 -> 35
  * bytes -- the C++ component reached zero files (cpp/smp.hpp deleted,
  * Makefile CXX/`.opp` rules removed with the pure-C SMP rewrite). */

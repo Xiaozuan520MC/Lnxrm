@@ -11,7 +11,7 @@ struct cpu_info;
 extern "C" {
 #endif
 
-/* ---- signals (kernel/signal.c) ----
+/* ---- signals (kernel/sched/signal.c) ----
  * Signal numbers and the user-facing `struct lnxrm_sigaction` live in
  * <abi/lnxrm_abi.h> so that kernel and user space cannot drift apart.
  * types.h (included below) pulls that header in. */
@@ -107,6 +107,11 @@ struct task {
     struct task *rq_next; /* runqueue link */
     int rq_cpu;           /* CPU whose runqueue holds this task; -1 = not queued */
     struct task *con_next; /* T-054: console-waiter list link (isr.c) */
+    /* input_wait parking link (input_event.c): the queue's wait list is a
+     * push-front singly linked list threaded through this field.  Owned by
+     * evq_lock, not runq_lock: a waiter links/unlinks itself inside that
+     * lock, the producer evicts it there and wakes AFTER dropping it. */
+    struct task *wait_next;
 
     /* signal support */
     u64 signal_pending; /* bitmask of pending signals */
@@ -165,14 +170,14 @@ bool user_ptr_writable(u64 p, u64 n);
  * source is outside the user range or not mapped. */
 int copy_user_str(char *kdst, u64 usrc, size_t max);
 
-/* scheduler (kernel/sched.c) */
+/* scheduler (kernel/sched/sched.c) */
 void sched_init(void);
 void schedule(void);
 void sched_tick(void); /* PIT hook: quantum expiry */
 void sched_maybe_preempt(struct intr_frame *f);
 struct task *task_iter(int *i);
 
-/* signal helpers (kernel/signal.c) */
+/* signal helpers (kernel/sched/signal.c) */
 void send_signal(struct task *t, int sig);
 void do_signal_check(struct task *t);
 /* Map the execute-only sigreturn restorer page into a fresh address space
@@ -184,6 +189,13 @@ bool signal_ignored(struct task *t, int sig);
 void runqueue_add(struct task *t);void runqueue_remove(struct task *t);
 /* Requeue the outgoing current on THIS CPU's queue (see sched.c). */
 void runqueue_add_local(struct task *t);
+/* Wake ONE parked task: T_SLEEPING -> T_RUNNABLE + runqueue_add, the exact
+ * dance send_signal / sched_tick perform inline.  Deliberately defensive:
+ * a NULL or not-parked task answers false and touches nothing, so best-
+ * effort wakeups (producer code, test fakes) can call it without a dance
+ * of their own.  Callers must not hold the producer queue's lock: this
+ * takes runq_lock. */
+bool sched_wake_task(struct task *t);
 void idle_loop(void) __attribute__((noreturn));
 struct task *task_alloc_slot(void);
 void task_free_slot(struct task *t);

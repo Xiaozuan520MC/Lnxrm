@@ -17,7 +17,7 @@ lnxrm 是一个 x86-64 freestanding 单体内核：C 为主体，启动 / 中断
 | `build/vmlinux.elf` | 链接产物（带符号与调试信息），链接脚本 `arch/kernel.ld` |
 | `build/vmlinux.bin` | 按 LMA 导出的裸 payload，落在物理 `0x100000` |
 | `build/disk.img` | 64 MiB FAT32 系统盘：`mkfs.vfat` + mtools 装入 `README.md` 与 `bin/` |
-| `build/user/<name>` | 17 个静态 ELF64 用户程序 |
+| `build/user/<name>` | 16 个静态 ELF64 用户程序 |
 | `build/lnxrm.iso` | GRUB 引导 ISO（`make imageiso`），只含 bootloader + 内核，不含根文件系统 |
 
 工具链 `gcc / nasm / ld / objcopy / python3`。构建阶段与目标依赖见 BUILD.md 的
@@ -31,8 +31,8 @@ lnxrm 是一个 x86-64 freestanding 单体内核：C 为主体，启动 / 中断
 ### 1.2 目录树
 
 ```
-Makefile               唯一构建入口：源文件自动发现 + 内核/汇编/用户态三套编译规则 +
-                       链接、镜像、initramfs、运行、冒烟
+Makefile               构建入口：源文件自动发现 + 内核/汇编编译规则 +
+                       链接、镜像、initramfs、运行、冒烟；用户态规则委托给 userland/Makefile
 arch/                 架构相关：汇编、CPU 状态、链接脚本
   setup.asm           实模式：E820 采集、VBE 四遍选型、临时页表、进长模式
   entry64.S           _start32(GRUB)/_start64、中断桩、swtch/glue_first/load_cr3
@@ -47,25 +47,28 @@ include/              全部头文件，本目录没有实现文件
   其余                 types.h boot.h console.h framebuffer.h disk.h elf.h io.h pci.h
                       font8x16.h fat32_priv.h
 kernel/               内核 C 实现
-  main.c              bring-up 顺序（整个内核的入口与初始化编排）
-  syscall.c           分发、能力门/归属门、brk/kill/uname/diskinfo/setuid
-  task.c sched.c      进程生命周期 / 调度与自旋锁 / 信号 isr.c elf.c apic.c acpi.c
-  signal.c            信号投递、handler 投递、sigreturn
-  input_event.c       统一输入事件队列（39/40 的 63 槽环，叠加在生产者上）
-  smp.c               AP 拉起与 ap_main
-  percpu.c protect.c framebuffer.c print.c selftest.c
+  main.c              入口/bring-up 编排（start_kernel）
+  core/               内核核心：syscall.c(系统调用分发/门) print.c(控制台)
+                      percpu.c(每核) smp.c(AP 拉起) protect.c(保护层) selftest.c(断言)
+  sched/              task.c(进程生命周期/pid/fork/execve/exit/wait4) sched.c(RR 调度器/自旋锁)
+                      elf.c(静态 ELF 装载) signal.c(信号投递/sigreturn)
+  irq/                isr.c(中断分发/异常/IPI) apic.c(LAPIC/IOAPIC) acpi.c(ACPI/MADT 中断路由)
   mm/                 pmm.c(buddy) kheap.c(分箱堆) vmm.c(页表) pagefault.c(#PF 分发)
   fs/                 vfs.c blk_cache.c mbr.c initramfs.c
   fs/fat32/           fat32.c fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
-  drivers/            pci.c ide.c ahci.c uart.c ps2mouse.c
+  drivers/            pci.c ide.c ahci.c uart.c ps2mouse.c framebuffer.c(VBE 帧缓冲+控制台)
+                      input_event.c(统一输入事件队列 39/40)
   lib/string.c        memcpy memset strcmp strcpy strlen
 ktest/                启动自测：ktest.c 框架 + 24 个 t_*.c 用例文件
-init/                 用户态运行库（crt0.S + ulib.c/h），链接进每个用户程序
-user/                 17 个用户程序，一个 .c 一个二进制
+  include/            ktest 私有头（kblk.h 等），经 -Iktest/include 收纳
+userland/             用户态源码树：bin/ 16 个程序（一个 .c 一个二进制）+ lib/ 运行库
+  Makefile            用户态构建规则（make -C userland 委托进入；crt0/ulib/bin 编译、静态链接）
+  bin/                16 个用户程序 .c，自动发现自动进镜像
+  lib/                用户态运行库（crt0.S + ulib.c/h），经 -Ilib（userland/Makefile 视角）收纳
 scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_test.py
 ```
 
-`init/` 不是 `/init` 那个程序，是**每个**用户态程序都链接的运行库；`ktest/` 在仓库根，
+`userland/lib/` 不是 `/init` 那个程序，是**每个**用户态程序都链接的运行库；`ktest/` 在仓库根，
 不在 `kernel/` 下。
 
 ### 1.3 容量常量
@@ -236,7 +239,7 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
   `exec=true` 映射的用户页（`signal_map_restorer`，落在 `USER_SIGRETURN_VA`）。
 - 用户栈在 exec/spawn 时只映 16 KiB（`USER_STACK_TOP - 0x4000` 起），未映射页的 #PF 若落在
   `[USER_STACK_TOP - USTACK_MAX_GROW, ustack_lo)` 内则**懒惰下扩**（`mm/pagefault.c`，
-  下限 512 KiB），否则按栈溢出处理；`kernel/isr.c` 的用户态 #PF 先试
+  下限 512 KiB），否则按栈溢出处理；`kernel/irq/isr.c` 的用户态 #PF 先试
   `page_fault_try_fix()` 再转信号。
 
 ### 3.6 `brk` 与配额
@@ -300,13 +303,13 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
   `SIGCHLD` → `T_ZOMBIE` → 出队 → 唤醒睡眠的父 → `schedule()`。
 - `kernel_spawn`：第一个用户进程，类似 execve 但简化，结尾**切回 master PML4**
   （它跑在内核上下文里）。
-- `kernel/elf.c`：只接受静态 `ET_EXEC`；`e_entry` 必须落在 `[USER_BASE, USER_MAX_VMA)`；
+- `kernel/sched/elf.c`：只接受静态 `ET_EXEC`；`e_entry` 必须落在 `[USER_BASE, USER_MAX_VMA)`；
   返回 `brk_end`。不支持动态链接 / 共享库 / 需求分页。
 - 用户内存访问 helpers：`user_ptr_ok`（逐页确认已映射）、`user_ptr_writable`
   （内核要写用户页时必须逐页确认可写，否则 CR0.WP 下 #PF 且无 fixup 表）、
   `copy_from_user` / `copy_to_user` / `copy_user_str`（逐字节校验）。
 
-### 4.3 调度（`kernel/sched.c`）
+### 4.3 调度（`kernel/sched/sched.c`）
 
 - 每 CPU 一个运行队列（`cpu_info.runq_head` 哨兵），**push-front 单链表**：
   **实为 LIFO，不是环形**（结构体没有尾指针），只有 1 个时间量（`quantum = 6` tick = 60 ms），
@@ -326,7 +329,7 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
   `sp` 字段，真正的寄存器区在任务内核栈上；`glue_first` 是新任务第一次被调度的入口，
   `swtch` 的 `ret` 落在 `intr_frame` 上，`POPALL; add rsp,16; iretq` 直接进用户态。
 
-### 4.4 信号（`kernel/signal.c`）
+### 4.4 信号（`kernel/sched/signal.c`）
 
 - 32 个信号槽；`SIGKILL 9` / `SIGSTOP 19` 不可屏蔽、不可忽略，`SIGCONT 18` 额外唤醒
   `T_STOPPED`。默认终止集只有 6 个：`SIGINT SIGTERM SIGQUIT SIGILL SIGABRT SIGSEGV`，
@@ -347,7 +350,7 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
 - `sys_sigaction`：KILL/STOP 不可捕获 / 忽略；handler 地址必须是哨兵或
   `user_ptr_ok` 校验过的用户页。`sys_sigprocmask`：BLOCK/UNBLOCK/SETMASK。
 
-### 4.5 凭据与能力（`include/sys/cred.h`、`kernel/protect.c`）
+### 4.5 凭据与能力（`include/sys/cred.h`、`kernel/core/protect.c`）
 
 | 层级 | 含义 |
 |---|---|
@@ -389,42 +392,43 @@ scripts/              patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_t
 | 2 | `open` | 打开 / 创建（`O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND/O_CLOEXEC`）；访问位错配在读写端拒绝（C41） | `kernel/fs/vfs.c` |
 | 3 | `close` | 关闭 fd | `kernel/fs/vfs.c` |
 | 4 | `lseek` | `SEEK_SET/CUR/END` | `kernel/fs/vfs.c` |
-| 5 | `brk` | 调整用户堆，带配额算术门 | `kernel/syscall.c` |
+| 5 | `brk` | 调整用户堆，带配额算术门 | `kernel/core/syscall.c` |
 | 6 | `getdent` | 目录枚举（cookie 迭代） | `kernel/fs/vfs.c` |
 | 7 | `dup2` | 复制 fd | `kernel/fs/vfs.c` |
-| 8 | `nanosleep` | 睡眠；被信号打断回 EINTR 并回填余量 | `kernel/sched.c` |
-| 9 | `getpid` | 进程号 | `kernel/syscall.c` |
-| 10 | `fork` | 复制进程（深拷贝地址空间） | `kernel/task.c` |
-| 11 | `execve` | 装载静态 ELF64 | `kernel/task.c` |
-| 12 | `exit` | 退出（释放画屏归属） | `kernel/task.c` |
-| 13 | `wait4` | 等子进程，支持 WNOHANG | `kernel/task.c` |
-| 14 | `kill` | 发信号，kxld / 同 uid / `CAP_KILL` 三道闸 | `kernel/syscall.c` |
-| 15 | `uname` | 系统标识 | `kernel/syscall.c` |
-| 16 | `sigaction` | 装信号处理器 | `kernel/signal.c` |
-| 17 | `sigprocmask` | BLOCK / UNBLOCK / SETMASK | `kernel/signal.c` |
-| 18 | `getppid` | 父进程号（父链接的 pid 半边，无父为 0） | `kernel/syscall.c` |
-| 19 | `ps` | 内核填任务表，带 `CAP_SYS_ADMIN` | `kernel/task.c` |
-| 20 | `sigreturn` | 从 handler 返回，恢复被中断现场 | `kernel/signal.c` |
-| 21 | `diskinfo` | 枚举块设备，带 `CAP_SYS_ADMIN` | `kernel/syscall.c` |
+| 8 | `nanosleep` | 睡眠；被信号打断回 EINTR 并回填余量 | `kernel/sched/sched.c` |
+| 9 | `getpid` | 进程号 | `kernel/core/syscall.c` |
+| 10 | `fork` | 复制进程（深拷贝地址空间） | `kernel/sched/task.c` |
+| 11 | `execve` | 装载静态 ELF64 | `kernel/sched/task.c` |
+| 12 | `exit` | 退出（释放画屏归属） | `kernel/sched/task.c` |
+| 13 | `wait4` | 等子进程，支持 WNOHANG | `kernel/sched/task.c` |
+| 14 | `kill` | 发信号，kxld / 同 uid / `CAP_KILL` 三道闸 | `kernel/core/syscall.c` |
+| 15 | `uname` | 系统标识 | `kernel/core/syscall.c` |
+| 16 | `sigaction` | 装信号处理器 | `kernel/sched/signal.c` |
+| 17 | `sigprocmask` | BLOCK / UNBLOCK / SETMASK | `kernel/sched/signal.c` |
+| 18 | `getppid` | 父进程号（父链接的 pid 半边，无父为 0） | `kernel/core/syscall.c` |
+| 19 | `ps` | 内核填任务表，带 `CAP_SYS_ADMIN` | `kernel/sched/task.c` |
+| 20 | `sigreturn` | 从 handler 返回，恢复被中断现场 | `kernel/sched/signal.c` |
+| 21 | `diskinfo` | 枚举块设备，带 `CAP_SYS_ADMIN` | `kernel/core/syscall.c` |
 | 22 | `mkdir` | 建目录 | `kernel/fs/fat32/fat32_meta.c` |
-| 23 | `fb_info` | 读帧缓冲几何（**两道门都不过**） | `kernel/syscall.c` |
-| 24 | `fb_clear` | 清屏 | `kernel/framebuffer.c` |
-| 25 | `fb_fill` | 矩形填充 | `kernel/framebuffer.c` |
-| 26 | `fb_char` | 画字符 | `kernel/framebuffer.c` |
-| 27 | `fb_puts` | 画字符串 | `kernel/framebuffer.c` |
+| 23 | `fb_info` | 读帧缓冲几何（**两道门都不过**） | `kernel/core/syscall.c` |
+| 24 | `fb_clear` | 清屏 | `kernel/drivers/framebuffer.c` |
+| 25 | `fb_fill` | 矩形填充 | `kernel/drivers/framebuffer.c` |
+| 26 | `fb_char` | 画字符 | `kernel/drivers/framebuffer.c` |
+| 27 | `fb_puts` | 画字符串 | `kernel/drivers/framebuffer.c` |
 | 28 | `unlink` | 删文件 | `kernel/fs/fat32/fat32_meta.c` |
 | 29 | `rmdir` | 删空目录 | `kernel/fs/fat32/fat32_meta.c` |
 | 30 | `rename` | 改名 / 移动 | `kernel/fs/fat32/fat32_meta.c` |
-| 31 | `setuid` | 单向降权 | `kernel/protect.c` |
-| 32 | `fb_flip` | 把离屏后缓冲推上前台 | `kernel/framebuffer.c` |
+| 31 | `setuid` | 单向降权 | `kernel/core/protect.c` |
+| 32 | `fb_flip` | 把离屏后缓冲推上前台 | `kernel/drivers/framebuffer.c` |
 | 33 | `sync` | 把缓存里所有脏扇区交给各自设备（C27） | `kernel/fs/vfs.c` |
-| 34 | `kbd_get` | 非阻塞取一个键（0..255），空则 `EAGAIN`；`CAP_SYS_ADMIN` | `kernel/isr.c` |
-| 35 | `kbd_inject` | 代打键序列进输入环（唤醒 waiter），≤256 字节；`CAP_SYS_ADMIN` | `kernel/syscall.c` |
-| 36 | `kbd_info` | 键盘/输入环计数快照（32 字节 `lnxrm_kbd_info`，两道门都不过） | `kernel/isr.c` |
-| 37 | `mouse_get` | 非阻塞弹一个 PS/2 指针事件（16 字节 `lnxrm_mouse_state`：`dx/dy/buttons/wheel`，空则 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/syscall.c` |
+| 34 | `kbd_get` | 非阻塞取一个键（0..255），空则 `EAGAIN`；`CAP_SYS_ADMIN` | `kernel/irq/isr.c` |
+| 35 | `kbd_inject` | 代打键序列进输入环（唤醒 waiter），≤256 字节；`CAP_SYS_ADMIN` | `kernel/core/syscall.c` |
+| 36 | `kbd_info` | 键盘/输入环计数快照（32 字节 `lnxrm_kbd_info`，两道门都不过） | `kernel/irq/isr.c` |
+| 37 | `mouse_get` | 非阻塞弹一个 PS/2 指针事件（16 字节 `lnxrm_mouse_state`：`dx/dy/buttons/wheel`，空则 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/core/syscall.c` |
 | 38 | `mouse_info` | aux 事件环计数快照（32 字节 `lnxrm_mouse_info`，两道门都不过） | `kernel/drivers/ps2mouse.c` |
-| 39 | `input_pop` | 统一输入事件队列出一个 24 字节事件（`KEY`/`REL`/`BTN`/`WHEEL`，成功回 1，空则 `EAGAIN`）；键值含原始按键 → `CAP_SYS_ADMIN` | `kernel/input_event.c` |
-| 40 | `input_info` | 统一队列计数快照（32 字节 `lnxrm_input_info`，分类型计数之和恒等 `pushed_total`，两道门都不过） | `kernel/input_event.c` |
+| 39 | `input_pop` | 统一输入事件队列出一个 24 字节事件（`KEY`/`REL`/`BTN`/`WHEEL`，成功回 1，空则 `EAGAIN`）；键值含原始按键 → `CAP_SYS_ADMIN` | `kernel/drivers/input_event.c` |
+| 40 | `input_info` | 统一队列计数快照（32 字节 `lnxrm_input_info`，分类型计数之和恒等 `pushed_total`，两道门都不过） | `kernel/drivers/input_event.c` |
+| 41 | `input_wait` | 阻塞弹出 unified 队列事件：空则睡到 evq_lock 保护的 wait list，事件到达唤醒一个等待者，被信号打断回 `EINTR`，带 ms 超时（0 = 非阻塞 pop，-1 = 永等）；成功回 1，超时回 0，门 `CAP_SYS_ADMIN` | `kernel/drivers/input_event.c` |
 
 图形相关共 6 个：`fb_info`/`fb_clear`/`fb_fill`/`fb_char`/`fb_puts`（23–27）与 `fb_flip`(32)。
 指针输入共 2 个消费口（`mouse_get`）+ 1 个只读口（`mouse_info`），结构同 kbd 三件套。
@@ -434,7 +438,7 @@ IRQ1 扫描码解码（`kbd_inject(35)` 是合成终端输入，刻意不进队�
 
 ### 5.3 两道门与其它检查点
 
-- `cap_gate(cap, capname, what)`（`kernel/syscall.c`）：`ps`/`diskinfo`/`kbd_get`/`kbd_inject`/
+- `cap_gate(cap, capname, what)`（`kernel/core/syscall.c`）：`ps`/`diskinfo`/`kbd_get`/`kbd_inject`/
   `mouse_get`/`input_pop` 过 `CAP_SYS_ADMIN`（前四个动的是共享资源），`fb_clear/fill/char/puts/flip`
   过 `CAP_FB`；拒绝统一回 `LNXRM_EACCES = -13` 并打一行
   `[cap] denied <call>: pid … lacks CAP_*`。
@@ -456,7 +460,7 @@ IRQ1 扫描码解码（`kbd_inject(35)` 是合成终端输入，刻意不进队�
 | 项 | 规格 |
 |---|---|
 | `enum lnxrm_errno` | 21 个 `LNXRM_E*`，含 `EINTR -4`、`EAGAIN -11`、`EACCES -13`、`ENAMETOOLONG -36`、`ENOSYS -38` |
-| `enum lnxrm_syscall_number` | 由 `.def` 生成的 33 个 `SYS_*` + `LNXRM_SYSCALL_FIRST/LAST` + 逐编号编译期校验 |
+| `enum lnxrm_syscall_number` | 由 `.def` 生成的 41 个 `SYS_*` + `LNXRM_SYSCALL_FIRST/LAST` + 逐编号编译期校验 |
 | 信号号 | `LNXRM_SIG*` 编号、无前缀别名、`LNXRM_NR_SIGNALS 32`、`SIG_DFL/SIG_IGN`、`LNXRM_SIG_BLOCK/UNBLOCK/SETMASK` |
 | `struct lnxrm_sigaction` | 24 字节 |
 | `struct lnxrm_timespec` | 16 字节（`nanosleep` 剩余时间） |
@@ -467,8 +471,8 @@ IRQ1 扫描码解码（`kbd_inject(35)` 是合成终端输入，刻意不进队�
 
 ⚠️ **ABI 结构体一改，引用它的用户态程序必须全量重编**，否则按旧步长读会拿到错位字段。
 
-用户态入口：`int 0x80` 的内联汇编包装在 `init/ulib.h`（第三个参数手动搬进 `r10`，
-clobber 列表必须含 `r10`），33 个调用全覆盖；`init/crt0.S` 从栈取 argc/argv 调 `main`。
+用户态入口：`int 0x80` 的内联汇编包装在 `userland/lib/ulib.h`（第三个参数手动搬进 `r10`，
+clobber 列表必须含 `r10`），41 个调用全覆盖；`userland/lib/crt0.S` 从栈取 argc/argv 调 `main`。
 
 ## 6. 文件系统
 
@@ -636,7 +640,7 @@ kernel/fs/
 
 - `kernel/drivers/uart.c`：16550，115200 8N1 + FIFO，`lnxrm_uart_init/putc/trygetc/irq_enable`；
   COM1 → IRQ4 → 向量 36（`[serial] COM1 ready`）。
-- `kernel/print.c` 的 `console_putc` 扇出四路：帧缓冲控制台 → VGA 文本 80×25（硬件光标）
+- `kernel/core/print.c` 的 `console_putc` 扇出四路：帧缓冲控制台 → VGA 文本 80×25（硬件光标）
   → 串口 → 4096 字节环形缓冲（`fb_console_init` 用它回放已滚出 VGA 的历史，串口上的
   老消息也能出现在帧缓冲控制台上且不画两次）。
 - `kvprintf` 持 `console_out_lock`（irqsave），与用户态 `write(1,…)` 共用这把锁
@@ -661,8 +665,8 @@ kernel/fs/
   接受数，满环丢键如实计数）；`kbd_info(36)` 给 `lnxrm_kbd_info{pending, capacity,
   pushed_total, dropped, ps2_scans}`——`ps2_scans` 是 IRQ1 自启动以来见过的全部
   scancode 数（make+break），键盘"活着"的判据。get/inject 都要和 shell 抢共享输入流，
-  门同 `ps`（`CAP_SYS_ADMIN`），info 只读全放行。取走即消费的语义归 `kernel/isr.c`
-  （计数器/辅助函数也都在这里），门与用户副本在 `kernel/syscall.c`。
+  门同 `ps`（`CAP_SYS_ADMIN`），info 只读全放行。取走即消费的语义归 `kernel/irq/isr.c`
+  （计数器/辅助函数也都在这里），门与用户副本在 `kernel/core/syscall.c`。
   ktest 侧 `ktest/t_kbd.c` 用 `syscall_probe` 走真分发面：门后指针校验、FIFO 次序、
   255 容量 + 丢键记账 + 计数器单调、`0xFF` 字节身份（sys 层 -13 由 systest 降权
   子进程补证）。
@@ -695,7 +699,7 @@ kernel/fs/
   扩展、溢出、sanity 位不漏进 `buttons`），收尾 `ms_set_packet_bytes()`
   恢复实时模式。
 
-**统一输入事件队列（2026-10-30）**：`kernel/input_event.c` + `include/sys/input.h`，
+**统一输入事件队列（2026-10-30）**：`kernel/drivers/input_event.c` + `include/sys/input.h`，
 把上面两条生产者的**已解码结果**汇成一条 63 槽流（24 字节 `lnxrm_input_event`，
 2026-10-30 号 ABI：`seq/type/a/b/flags/resv`；`type=INPUT_EV_KEY/REL/BTN/WHEEL`，
 `flags` 只在 KEY 上携带 `INPUT_MOD_SHIFT/CAPS`——字符本身已是变换结果，flags 是
@@ -719,9 +723,14 @@ kernel/fs/
   收受，seq/resv 仍由队列做主）与 `kbd_inject_scancode()`（ktest 把扫描码喂进
   **真解码路径**，但刻意不碰 `kbd_scans`——那是"硬件搬过的字节"计数器，注入不是
   硬件，与 kbd_inject 35 的口径一致）。
-- `user/evq.c`（`evq`）：轮询 39/40 的演示程序，逐事件打印（KEY 的 `a`/mods、
-  REL/BTN/WHEEL 的载荷），ESC 或 64 颗退出并展示 `input_info`，非 root 得
-  `-13` 提示。
+- **阻塞变体 `input_wait(41)`（2026-10-31）**：evq_lock（irqsave）保护的 wait
+  list（threaded through `task->wait_next`），空队时消费者以 `T_SLEEPING` +
+  `sleep_until`（ms deadline 或 U64_MAX 永等）停机；生产者在 evq_put 成功后
+  evict 一个 waiter、解锁后再 `sched_wake_task`（避免 evq_lock 嵌套 runq_lock），
+  事件本身留队里供被唤醒者回环 pop；信号打断回 EINTR（pending & ~blocked 且
+  非 ignored），ms==0 等价非阻塞 pop（EAGAIN），ms==-1 永等；门 CAP_SYS_ADMIN
+  先于 EFAULT。sched 新增 `sched_wake_task(t)`（T_SLEEPING → T_RUNNABLE +
+  runqueue_add，send_signal/sched_tick 同款舞步，NULL/非睡眠 task 直接 false）。
 - `ktest/t_input.c`（LATE 四例，USER_BASE+0xF000 独立 VA 页；t_kbd/t_mouse 与
   本文件的先后由链接序决定，所以每例都以计数快照开场、以归还旧环开场时借
   的东西收尾——console 环清空、msring 清空、shift/caps 偶数次归位）：
@@ -825,14 +834,14 @@ kernel/fs/
 
 ### 7.6 用户态图形
 
-`init/ulib.h` 的 `kfb_info/kfb_clear/kfb_fill/kfb_char/kfb_puts/kfb_flip` 与 23–27、32
+`userland/lib/ulib.h` 的 `kfb_info/kfb_clear/kfb_fill/kfb_char/kfb_puts/kfb_flip` 与 23–27、32
 一一对应，参数结构体带 `_Static_assert` 锁布局。用法：23–27 落笔进离屏后缓冲，
 `kfb_flip()` 一次把脏区域推上前台；不调 flip 也行，tick 每 20 ms 兜底 present。
 颜色一律 32 位 `0x00RRGGBB`（16 个 `FB_CLR_*` 命名色），坐标是像素坐标。
 
 ## 8. SMP 与 ACPI
 
-### 8.1 ACPI（`kernel/acpi.c`）
+### 8.1 ACPI（`kernel/irq/acpi.c`）
 
 - RSDP 在传统 BIOS 区（1 MiB 以下，恒等映射内直读）→ RSDT/XSDT → MADT。
 - 产出两样东西：`acpi_collect_ap_ids()`（启用的 local APIC/x2APIC 名单，含 BSP，去重，
@@ -842,7 +851,7 @@ kernel/fs/
   真机固件常把 ACPI 表放在恒等窗口外，直读就是野访问。`acpi_init()` 在 `vmm_init()`
   之后、`cpu_init()` 之前跑（前者提供 `vmm_map_kernel_page`，后者要 IOAPIC 地址）。
 
-### 8.2 AP 拉起（`kernel/smp.c` + `arch/trampoline.S`）
+### 8.2 AP 拉起（`kernel/core/smp.c` + `arch/trampoline.S`）
 
 ```
 smp_init():
@@ -884,7 +893,7 @@ smp_init():
 7. 打印回执 → `lapic_timer_start(32, HZ)`（用 BSP 缓存的 period，不碰 PIT；
    `jiffies` 仍只归 BSP 递增）→ 打印 `online` → `for(;;){schedule(); sti; hlt;}`。
 
-### 8.3 LAPIC / IOAPIC（`kernel/apic.c`）
+### 8.3 LAPIC / IOAPIC（`kernel/irq/apic.c`）
 
 - **xAPIC（MMIO）与 x2APIC（MSR）双路**，由每核 `apic_enable()` 各自定型
   （`s_x2apic` 从不跨核继承）。xAPIC 下 LAPIC/IOAPIC 映射进 `DEV_VMA` 的两个相邻
@@ -909,9 +918,9 @@ smp_init():
 
 | 锁 | 位置 | 保护 | 备注 |
 |---|---|---|---|
-| `runq_lock` | `sched.c` | 所有 per-CPU 运行队列 | 总是 irqsave |
-| `task_table_lock` | `sched.c` | 任务槽分配状态 | |
-| `pid_lock` | `task.c` | pid 计数器 | |
+| `runq_lock` | `sched/sched.c` | 所有 per-CPU 运行队列 | 总是 irqsave |
+| `task_table_lock` | `sched/sched.c` | 任务槽分配状态 | |
+| `pid_lock` | `sched/task.c` | pid 计数器 | |
 | `pmm_lock` | `pmm.c` | buddy 空闲链 + 位图 | |
 | `kheap_lock` | `kheap.c` | 内核堆分箱 | |
 | `cache_lock` | `blk_cache.c` | 块缓存 | **跨越设备 I/O** |
@@ -927,7 +936,7 @@ smp_init():
 - `arch/entry64.S` 的 `ISR_NOERR` / `ISR_ERR` 两个宏压出统一的 `struct intr_frame`
   （地址递增顺序：`r15…rax rbx`，然后 `intno err rip cs rflags ussp usss`；
   `rbx` 刻意排在 `rax` 之后——它是 SysV callee-saved）。
-- `kernel/isr.c` 的 `isr_common` 三段分流：`0xF0..0xF2` → `ipi_dispatch` → `apic_eoi`；
+- `kernel/irq/isr.c` 的 `isr_common` 三段分流：`0xF0..0xF2` → `ipi_dispatch` → `apic_eoi`；
   `< 32` → 异常（ring-3 转信号，ring-0 panic）；`≥ 32` → **先 `apic_eoi` 再调 handler**
   （handler 可能 `schedule()` 切走，延迟 EOI 会把这个向量卡住直到它被切回来）；
   最后返回用户态前 `do_signal_check()`。
@@ -993,7 +1002,7 @@ ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入
   （非默认 smp 档位写 `serial-smpN.log`，互不覆盖）。
 - 日志里出现的 `[fat32] I/O error` 是错误注入用例**故意**打的，不是回归。
 
-### 9.3 用户态自检（`user/systest.c`）
+### 9.3 用户态自检（`userland/systest.c`）
 
 按系统调用编号分节的全量自检：错误码路径、信号与等待（含 WNOHANG）、`fb_*` 图形、
 故意段错误隔离、降权子进程段（`setuid(1000)` 后逐个撞权限检查点）、超长路径段、

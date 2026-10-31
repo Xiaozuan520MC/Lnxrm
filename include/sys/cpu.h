@@ -100,7 +100,7 @@ void tss_set_rsp0(u64 rsp);
 /* Forward-declare interrupt frame (defined in sched.h). */
 struct intr_frame;
 
-/* irq registration (kernel/isr.c) */
+/* irq registration (kernel/irq/isr.c) */
 typedef void (*irq_handler_t)(struct intr_frame *);
 void isr_common(struct intr_frame *f);
 void irq_install(int irq, irq_handler_t h);
@@ -111,7 +111,7 @@ typedef void (*ipi_handler_t)(void);
 void ipi_handler_install(u32 vector, ipi_handler_t h);
 void ipi_dispatch(u32 vector);
 
-/* input queue (kernel/isr.c feeds it; serial too) */
+/* input queue (kernel/irq/isr.c feeds it; serial too) */
 void kbd_irq_handler(struct intr_frame *f);
 void serial_rx_handler(struct intr_frame *f);
 void input_push(char c);
@@ -120,7 +120,7 @@ struct task;
 void console_waiter_arm(struct task *t);
 void console_waiter_disarm(struct task *t);
 
-/* keyboard syscalls 34-36 land in kernel/isr.c; syscall.c does the gates
+/* keyboard syscalls 34-36 land in kernel/irq/isr.c; syscall.c does the gates
  * and the user copies. */
 struct lnxrm_kbd_info;
 u32 kbd_pending(void);    /* keys buffered right now */

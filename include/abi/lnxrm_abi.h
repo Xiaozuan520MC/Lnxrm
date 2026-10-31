@@ -43,7 +43,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  40
+#define LNXRM_SYSCALL_LAST  41
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST

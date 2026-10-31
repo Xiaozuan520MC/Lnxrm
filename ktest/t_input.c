@@ -10,7 +10,7 @@
  * state left as it was found (an even number of toggles).  Gate refusals
  * are deliberately NOT probed here for the same reason t_kbd/t_mouse
  * skip them: setuid mutates the caller's identity, and the demoted-tier
- * answers (-13) are user/systest's lines.  (2026-10-30) */
+ * answers (-13) are userland/systest's lines.  (2026-10-30) */
 #include <sys/ktest.h>
 #include <console.h>
 #include <mm/mm.h>
@@ -99,7 +99,7 @@ static void test_input_syscall_surface(void)
     /* empty answers: EAGAIN to a good receiver, EFAULT to every bad
      * pointer even with nothing to pop -- validation is atomic with the
      * attempt, exactly mouse_get's shape.  (The -13 gate answer belongs
-     * to user/systest; ktest tasks hold CAP_SYS_ADMIN and get through.) */
+     * to userland/systest; ktest tasks hold CAP_SYS_ADMIN and get through.) */
     K_EXPECT_EQ(syscall_probe(SYS_input_pop, EV_VA, 0, 0), LNXRM_EAGAIN);
     K_EXPECT_EQ(syscall_probe(SYS_input_pop, 0, 0, 0), LNXRM_EFAULT);
     K_EXPECT_EQ(syscall_probe(SYS_input_pop, 0xdeadbeef, 0, 0), LNXRM_EFAULT);
@@ -426,7 +426,54 @@ static void test_input_queue_fill_drop_order(void)
     K_EXPECT_EQ(input_event_pending(), 0u);
 }
 
+static void test_input_waitlist_atomicity(void)
+{
+    struct lnxrm_input_event e = {0};
+    struct lnxrm_input_event ev = {0, INPUT_EV_KEY, 0x41, 0, 0, 0};
+
+    /* two fake sleepers, never enqueued on any runqueue */
+    struct task *t1 = task_alloc_slot();
+    struct task *t2 = task_alloc_slot();
+    K_ASSERT(t1 != NULL);
+    K_ASSERT(t2 != NULL);
+    t1->state = T_SLEEPING;
+    t2->state = T_SLEEPING;
+    t1->wait_next = NULL;
+    t2->wait_next = NULL;
+
+    /* empty: no waiters */
+    K_EXPECT_EQ(input_waitlist_head_for_test(), NULL);
+
+    /* push-front: t1 then t2 -> head is t2, linked t2->t1 */
+    input_waitlist_push_for_test(t1);
+    K_EXPECT_EQ(input_waitlist_head_for_test(), t1);
+    input_waitlist_push_for_test(t2);
+    K_EXPECT_EQ(input_waitlist_head_for_test(), t2);
+    K_EXPECT_EQ(t2->wait_next, t1);
+
+    /* take one at a time */
+    struct task *t = input_waitlist_take_one_for_test();
+    K_EXPECT_EQ(t, t2);
+    K_EXPECT_EQ(input_waitlist_head_for_test(), t1);
+    t = input_waitlist_take_one_for_test();
+    K_EXPECT_EQ(t, t1);
+    K_EXPECT_EQ(input_waitlist_head_for_test(), NULL);
+
+    /* an inject plucks one waiter AND leaves the event in the queue */
+    input_waitlist_push_for_test(t1);
+    K_EXPECT_EQ(input_waitlist_head_for_test(), t1);
+    K_EXPECT_EQ(input_event_pending(), 0u);
+    input_inject(&ev, 1);
+    K_EXPECT_EQ(input_event_pending(), 1u);   /* event stays in the queue */
+    K_EXPECT_EQ(input_waitlist_head_for_test(), NULL); /* waiter plucked */
+    K_EXPECT_EQ(input_event_pop(&e), 0);      /* drain the injected event */
+
+    task_free_slot(t1);
+    task_free_slot(t2);
+}
+
 KTEST("input", KTEST_LATE, test_input_syscall_surface);
 KTEST("input", KTEST_LATE, test_input_keyboard_events);
 KTEST("input", KTEST_LATE, test_input_mouse_events);
 KTEST("input", KTEST_LATE, test_input_queue_fill_drop_order);
+KTEST("input", KTEST_LATE, test_input_waitlist_atomicity);

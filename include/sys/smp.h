@@ -1,6 +1,6 @@
 /* SMP initialization: AP startup via INIT-SIPI-SIPI.
  * C-compatible header — the former include/cpp/smp.hpp wrapper was folded
- * in with the 2026-10-18 pure-C rewrite (kernel/smp.c). */
+ * in with the 2026-10-18 pure-C rewrite (kernel/core/smp.c). */
 #pragma once
 #include <types.h>
 

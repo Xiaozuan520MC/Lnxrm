@@ -565,7 +565,7 @@ static void test_fb_flip_copies_only_marked_region(void)
 /* ---- T-033: the surface is held by exactly one pid ----
  *
  * fb_claim()/fb_disown() are the entire policy behind the owner gate in
- * kernel/syscall.c.  The drawing primitives themselves never consult
+ * kernel/core/syscall.c.  The drawing primitives themselves never consult
  * them -- the console shares those and must never be refused by a user
  * process -- so this small state machine is the whole of what "two
  * privileged processes cannot overwrite each other" rests on, and it is

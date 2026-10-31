@@ -2,7 +2,7 @@
  * cases registered for the requested stage and reports a verdict.
  *
  * The counters and the note functions behind console.h's ASSERT()/WARN()/
- * BUG_ON() live in kernel/selftest.c -- production code asserts too, so
+ * BUG_ON() live in kernel/core/selftest.c -- production code asserts too, so
  * they must survive `make KTEST=0`.  This file is the optional half: the
  * harness (runner, checks, verdict), compiled only when ktest/ is. */
 #include <sys/ktest.h>
@@ -16,7 +16,7 @@ static const char *const stage_name[KTEST_STAGE_MAX] = {"early", "mm", "late"};
 
 /* Harness-private state.  The pieces the note functions touch
  * (selftest_case_failed, selftest_bug_seen) live beside the counters in
- * kernel/selftest.c so they exist in every build. */
+ * kernel/core/selftest.c so they exist in every build. */
 static struct {
     bool parsed;
     bool enabled;
@@ -47,7 +47,7 @@ static void ktest_parse_cmdline(void)
     kt.continue_on_fail = cmdline_has("ktest=continue");
 }
 
-/* The ASSERT/WARN/BUG_ON note functions moved to kernel/selftest.c: they
+/* The ASSERT/WARN/BUG_ON note functions moved to kernel/core/selftest.c: they
  * are production infrastructure and must link even in a `make KTEST=0`
  * build.  Everything below is the harness proper. */
 

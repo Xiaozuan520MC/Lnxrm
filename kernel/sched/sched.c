@@ -340,12 +340,30 @@ void sched_tick(void)
     }
 
     if (!current || current->pid == 0) return; /* no quantum to burn on idle */
+}
 
-    if (current->quantum > 0) {
-        current->quantum--;
-        if (current->quantum == 0 && current->state == T_RUNNING)
-            this_cpu_data()->need_resched = true;
-    }
+/* Wake ONE parked task: the exact dance send_signal / sched_tick perform
+ * inline (T_SLEEPING -> T_RUNNABLE + runqueue_add), extracted so input_wait
+ * can reuse it without holding any queue lock.  Defensive: NULL or a task
+ * not in T_SLEEPING answers false and touches nothing, so producer code
+ * and test fakes can call it without a guard of their own.
+ *
+ * Caller must NOT hold evq_lock: this takes runq_lock and may schedule the
+ * wakee on another CPU -- nested locks invert the evq_lock -> runq_lock
+ * order and deadlock. */
+bool sched_wake_task(struct task *t)
+{
+    if (!t || t->state != T_SLEEPING) return false;
+    u64 f;
+    spin_lock_irqsave(&runq_lock, &f);
+    t->state = T_RUNNABLE;
+    runqueue_add(t);
+    spin_unlock_irqrestore(&runq_lock, f);
+    /* Nudge this CPU's scheduler if it is idle (no IPI here: cross-CPU
+     * wakeups are picked up by the target's tick, same as nanosleep). */
+    if (this_cpu_data()->idle && this_cpu_data()->_current == this_cpu_data()->idle)
+        this_cpu_data()->need_resched = true;
+    return true;
 }
 
 void schedule(void)
@@ -600,7 +618,7 @@ struct task *find_task(u32 pid)
      * task_free_slot/task_alloc_slot can swap the slot mid-read (we
      * would observe pid from one occupant and state from the next).
      * The returned pointer is still racy afterwards — callers go
-     * through send_signal's state recheck (kernel/signal.c). */
+     * through send_signal's state recheck (kernel/sched/signal.c). */
     spin_lock_irqsave(&task_table_lock, &flags);
     for (int i = 0; i < NR_TASKS; i++) {
         if (task_table[i].state != T_UNUSED && task_table[i].pid == pid) {

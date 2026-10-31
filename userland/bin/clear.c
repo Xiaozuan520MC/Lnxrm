@@ -1,4 +1,4 @@
-/* user/clear.c -- 清屏 */
+/* userland/clear.c -- 清屏 */
 #include "ulib.h"
 
 int main(int argc, char **argv)

@@ -86,12 +86,12 @@ void fb_puts(u32 x, u32 y, const char *s, u32 fg, u32 bg);
  * consults it -- those primitives are shared with the text console, and a
  * console that could be refused by a user process would be a console a
  * user process could mute.  Enforcement happens in the syscall layer
- * (fb_owner_gate in kernel/syscall.c); only the record and the two
+ * (fb_owner_gate in kernel/core/syscall.c); only the record and the two
  * operations on it live here.
  *
  * Release is deliberately not here either: the holder is a pid, and a
  * pid stops meaning anything when its task dies, so sys_exit drops it
- * (kernel/task.c).  Every way a task dies ends in sys_exit -- the syscall
+ * (kernel/sched/task.c).  Every way a task dies ends in sys_exit -- the syscall
  * itself, SIGKILL, a terminating signal, the #PF/#GP default -- and pids
  * are handed out by a counter that never reuses them, so one release
  * point covers everything that can happen. */

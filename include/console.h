@@ -28,7 +28,7 @@ int in_panic(void);
 
 void panic(const char *fmt, ...) __attribute__((noreturn));
 
-/* ---- assertion infrastructure (T-010, live in kernel/selftest.c) ----
+/* ---- assertion infrastructure (T-010, live in kernel/core/selftest.c) ----
  * Three macros, one set of counters, one machine-readable verdict:
  *
  *   ASSERT(cond, fmt, ...)  a check the kernel must pass; a hit that fails

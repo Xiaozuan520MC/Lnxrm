@@ -163,7 +163,7 @@ static long cap_gate(u64 cap, const char *capname, const char *what)
  * both answer yes and still not both be talking to the same screen;
  * this gate answers that second question -- the first drawing call
  * claims the surface for its pid, every later drawer is turned away
- * until the holder exits (kernel/task.c -> fb_disown).
+ * until the holder exits (kernel/sched/task.c -> fb_disown).
  *
  * Order is fixed by the caller and has to stay capability-first: a
  * plain user must keep seeing -13 for "you have no CAP_FB", which is
@@ -337,7 +337,7 @@ static long sys_mouse_info(struct lnxrm_mouse_info *uinfo)
 /* ---- unified input event queue syscalls (39-40) ----
  * input_pop reads the one stream a compositor wants -- keyboard makes,
  * mouse deltas, button transitions, wheel -- over both existing producers
- * at once (see include/sys/input.h and kernel/input_event.c).  The raw
+ * at once (see include/sys/input.h and kernel/drivers/input_event.c).  The raw
  * keys inside are exactly what kbd_get 34 refused to hand a plain user,
  * so the same CAP_SYS_ADMIN gate rides along, in the same order: gate
  * first, then the 24-byte receiver check (EFAULT on a bad pointer even
@@ -361,6 +361,22 @@ static long sys_input_info(struct lnxrm_input_info *uinfo)
     input_event_stats(&info);
     if (copy_to_user(uinfo, &info, sizeof(info)) < 0) return LNXRM_EFAULT;
     return 0;
+}
+
+/* input_wait (41): blocking read of the unified input event queue.
+ * Gate: CAP_SYS_ADMIN first (same order as input_pop).  Then validate the
+ * receiver pointer (EFAULT even on an empty queue).  Then block on the
+ * queue's wait list until an event arrives, an actionable signal lands
+ * (-> LNXRM_EINTR), or ms passes (-> 0).  ms==0 answers like input_pop
+ * (1 event / EAGAIN); ms==(u64)-1 waits for an event or a signal only.
+ *
+ * Returns: 1 (one event copied to *ue), -EACCES (gate), -EFAULT (bad
+ * pointer), -EINTR (signal), 0 (timeout). */
+static long sys_input_wait(struct lnxrm_input_event *ue, u64 ms)
+{
+    if (!ue) return LNXRM_EFAULT;
+    if (!user_ptr_ok((u64)ue, sizeof(*ue))) return LNXRM_EFAULT;
+    return input_event_wait(ue, ms);
 }
 
 /* Copy a NUL-terminated path out of user space and run a path syscall on it. */
@@ -544,6 +560,11 @@ static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
         break;
     case SYS_input_info:
         ret = sys_input_info((struct lnxrm_input_info *)f->rdi);
+        break;
+    case SYS_input_wait:
+        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "input_wait")) != 0)
+            break;
+        ret = sys_input_wait((struct lnxrm_input_event *)f->rdi, (u64)f->rsi);
         break;
     default:
         /* Anything the table does not name: numbers above LNXRM_SYSCALL_LAST. */

@@ -609,6 +609,7 @@ int main(int argc, char **argv)
             say("user.input.pop", kinput_pop(&evu));  /* -13 */
             struct lnxrm_input_info iu = {0};
             say("user.input.info", kinput_info(&iu)); /* 0 */
+            say("user.input.wait", kinput_wait(&evu, 100)); /* -13: demoted tier refused */
 
             kexit(0);
         }
@@ -984,6 +985,8 @@ int main(int argc, char **argv)
         say("input.info.sum",
             (long)(ii.keys + ii.rel + ii.btn + ii.wheel) == (long)ii.pushed_total);
         say("input.pop.empty", kinput_pop(&ev)); /* -11: nothing produced */
+        say("input.wait.zero", kinput_wait(&ev, 0));        /* -11: empty, ms==0 == nonblocking pop */
+        say("input.wait.timeout", kinput_wait(&ev, 20));    /* 0: 20 ms, nothing produced */
     }
 
     say("systest.done", 1);

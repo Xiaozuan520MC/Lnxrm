@@ -1,4 +1,4 @@
-; user program entry (init/crt0.S).
+; user program entry (userland/lib/crt0.S).
 ; The kernel lays the stack out as the SysV AMD64 process ABI requires:
 ;   [rsp]      argc
 ;   [rsp+8]    argv[0 .. argc-1], NULL

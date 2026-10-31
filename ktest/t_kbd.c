@@ -8,7 +8,7 @@
  *
  * Deliberately NOT probed here: the demoted tier's -13 (setuid mutates
  * the caller's identity, which t_syscall refuses on principle -- the
- * user-tier gate answers are user/systest's); the PS/2 scancode counter
+ * user-tier gate answers are userland/systest's); the PS/2 scancode counter
  * (hardwareIRQ1 -- only monotonicity holds). (2026-10-25) */
 #include <sys/ktest.h>
 #include <console.h>

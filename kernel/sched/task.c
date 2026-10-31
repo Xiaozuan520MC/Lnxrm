@@ -159,7 +159,7 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
      * memory raw. */
     if (copy_user_str(path, (u64)upath, sizeof(path)) < 0) return LNXRM_EFAULT;
 
-    /* A NULL argv/envp stays legal (user/sh.c execs with envp NULL); a
+    /* A NULL argv/envp stays legal (userland/sh.c execs with envp NULL); a
      * NON-NULL but unreachable array used to be accepted and dropped --
      * the new image then ran with argc 0 instead of the caller being told
      * the pointer was bad.  Refuse it, and refuse a bad entry pointer or

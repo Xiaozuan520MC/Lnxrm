@@ -11,7 +11,7 @@ lnxrm 是自制的 x86-64 freestanding 内核，语言只有 C 与汇编两种�
 | `make` | 构建驱动 | `make` |
 | `gcc` | C 编译（内核 + 用户态） | `gcc` |
 | `ld` / `objcopy` / `nm` | 内核链接、ELF 与裸二进制互转、补丁脚本查符号 | `binutils` |
-| `nasm` | 汇编：`arch/*.S`、`arch/setup.asm`、`init/crt0.S` | `nasm` |
+| `nasm` | 汇编：`arch/*.S`、`arch/setup.asm`、`userland/lib/crt0.S` | `nasm` |
 | `python3` | 补丁与打包脚本（`scripts/patch_*.py` 等） | `python3` |
 | `mkfs.vfat` | 在磁盘镜像上建 FAT32 | `dosfstools` |
 | `mcopy` / `mmd` | 往镜像拷文件、建目录 | `mtools` |
@@ -46,7 +46,7 @@ make CROSS=x86_64-linux-gnu-
 | 目标 | 做什么 | 备注 |
 |---|---|---|
 | `all`（默认） | 构建 `build/bzImage` | 只有内核，不含用户态与磁盘镜像 |
-| `user` | 构建全部用户态 ELF 到 `build/user/` | 每个 `user/*.c` 一个程序，自动发现 |
+| `user` | 构建全部用户态 ELF 到 `build/user/` | 委托 `make -C userland`（`userland/Makefile`）；每个 `userland/bin/*.c` 一个程序，自动发现 |
 | `run` | `user` + `bzImage` + `disk.img`，然后启动 QEMU | 见第 4 节；唯一自动带上磁盘镜像的常用入口 |
 | `smoke` | 端到端冒烟测试（六阶段） | 强制 `KTEST=1`，不依赖你当前的 KTEST 设置 |
 | `imageiso` | 生成 `build/lnxrm.iso` | 依赖 `grub-mkrescue`；不重建 `disk.img` |
@@ -70,17 +70,17 @@ make CROSS=x86_64-linux-gnu-
 
 ### 3.1 结构与源文件发现
 
-全仓库只有一个 `Makefile`（仓库根目录）：全局配置、对象清单、内核/汇编/用户态三套编译规则、链接/镜像/运行/冒烟都在里面。源文件用 `$(shell find ...)` 自动发现，所以：
+构建入口分两层：仓库根目录的 `Makefile`（全局配置、对象清单、内核/汇编规则、链接/镜像/运行/冒烟）+ `userland/Makefile`（用户态编译/链接规则，由根目录 `make user` 委托 `make -C userland` 调用，也可在 `userland/` 下独立运行）。源文件用 `$(shell find ...)`/`$(wildcard ...)` 自动发现，所以：
 
 - 新增内核 `.c`（`kernel/` 任意子目录）或 `arch/*.c`：放进文件即可，不用改 Makefile；
-- 新增 `user/*.c`：自动成为新用户程序并自动进磁盘镜像；
+- 新增 `userland/bin/*.c`：自动成为新用户程序并自动进磁盘镜像；
 - 头文件放 `include/`（`-Iinclude` 已在标志里），`-MMD -MP` 的 `.d` 文件自动跟踪头依赖。
 
 `arch/trampoline.S` 被显式排除在普通汇编规则外，单独走两段式处理（见 3.3）。
 
 ### 3.2 编译标志要点
 
-内核侧 `KERNFLAGS = $(BASEFLAGS) -std=gnu11`，用户态侧 `USRFLAGS`，关键差异：
+内核侧 `KERNFLAGS = $(BASEFLAGS) -std=gnu11`（根 Makefile），用户态侧 `USERFLAGS`（`userland/Makefile`），关键差异：
 
 | 标志 | 理由 |
 |---|---|
@@ -104,7 +104,7 @@ ktest/*.c（仅 KTEST=1） ──cc──► build/ktest/*.o ─┤
                                   vmlinux.elf ─objcopy -O binary─► build/vmlinux.bin ─┐
 arch/setup.asm ─nasm─► 补零到 2 KiB 整数倍 ─patch_setup_jmp.py─► build/setup.bin ────┴─cat─► patch_bzimage.py ─► build/bzImage
 
-user/*.c + init/crt0.S + init/ulib.c ──cc──► build/user/<程序名>（静态 ELF）
+userland/bin/*.c + userland/lib/crt0.S + userland/lib/ulib.c ──(userland/Makefile)cc/ld──► build/user/<程序名>（静态 ELF）
 build/user/* + build/README.md ──dd/mkfs.vfat/mcopy──► build/disk.img
 ```
 

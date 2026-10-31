@@ -23,6 +23,9 @@
  * mouse_get/info took 37/38 for the PS/2 aux pointer (2026-10-26).
  * input_pop/info took 39/40 for the unified input event queue over both
  * producers' decode paths (2026-10-30).
+ * input_wait took 41 as the blocking variant: empty queue parks the caller on
+ * an evq_lock-protected wait list, events wake one waiter, signals cut the
+ * wait short (EINTR), ms deadline caps it (2026-10-31).
  */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
@@ -65,3 +68,4 @@ LNXRM_SYS(mouse_get, 37)
 LNXRM_SYS(mouse_info, 38)
 LNXRM_SYS(input_pop, 39)
 LNXRM_SYS(input_info, 40)
+LNXRM_SYS(input_wait, 41)

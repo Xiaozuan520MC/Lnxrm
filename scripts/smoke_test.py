@@ -60,7 +60,7 @@ DISK = os.path.join(BUILD, "disk.img")
 USER_LINK_BASE = 0x7F8000400000
 README_LINE = b"A tiny unix-like kernel in ASM + C!"  # "+ Rust" dropped 2026-10-18 (Rust gone); "+ C++" dropped same day, evening (C++ count zero)
 
-# user/sh.c prints "root@lnxrm$ "; older builds printed "# ".  Accept both so
+# userland/sh.c prints "root@lnxrm$ "; older builds printed "# ".  Accept both so
 # the boot phase and every shell step don't hinge on the prompt's wording.
 SHELL_PROMPT = br"(?:# |root@lnxrm\$ )"
 
@@ -180,8 +180,8 @@ SYSTEST_TAGS = [
     # 当 33 成为合法编号（sync）时会跨行误匹配到下一条的 -38 而假通过。
     # 39/40 在 2026-10-30（统一输入队列 input_pop/info）成为真编号，钉号
     # 随表尾走：systest 的 past 表总是 LAST+1..+3，这里跟着同一个表尾。
-    ("past.41 = -ENOSYS", br"past\.41=[\s\S]{0,60}?unknown syscall 41[\s\S]{0,60}?-38"),
     ("past.42 = -ENOSYS", br"past\.42=[\s\S]{0,60}?unknown syscall 42[\s\S]{0,60}?-38"),
+    ("past.43 = -ENOSYS", br"past\.43=[\s\S]{0,60}?unknown syscall 43[\s\S]{0,60}?-38"),
     ("open.fd >= 0", br"open\.fd=\d+"),
     ("read.after.seek = 15", br"read\.after\.seek=15"),
     ("read.at.end = tail only", br"read\.at\.end=[1-9]\d*"),
@@ -216,6 +216,12 @@ SYSTEST_TAGS = [
     ("mouse aux reset acked", br"mouse\.info\.inited=1"),
     ("user mouse_get refused", br"user\.mouse\.get=-13"),
     ("user mouse_info open", br"user\.mouse\.info=0"),
+    # unified input queue 39-40-41: headless boot has no real input producer,
+    # so 41 is only testable through the timeout/nonblocking/refusal paths;
+    # a real wakeup needs a key/mouse interrupt or ktest injection.
+    ("input.wait.zero = -11", br"input\.wait\.zero=-11"),
+    ("input.wait.timeout = 0", br"input\.wait\.timeout=0"),
+    ("user input.wait refused", br"user\.input\.wait=-13"),
     # T-030: cred tiers visible through ps (idle=kxld=2, init=root=1)
     ("ps idle kind = kxld", br"ps\.kind\.idle=2"),
     ("ps init kind = root", br"ps\.kind\.init=1"),
@@ -517,7 +523,7 @@ def phase_artifacts(report):
             if shutil.which("mdir"):
                 rc, out = sh(["mdir", "-i", DISK, "::/bin"])
                 report.add("FAT32 /bin listed", rc == 0, tail(out, 5))
-                for prog in sorted(p[:-2] for p in os.listdir(os.path.join(ROOT, "user"))
+                for prog in sorted(p[:-2] for p in os.listdir(os.path.join(ROOT, "userland", "bin"))
                                    if p.endswith(".c")):
                     report.add("/bin/%s on image" % prog,
                                rc == 0 and re.search(r"\b%s\b" % re.escape(prog), out),
@@ -526,7 +532,7 @@ def phase_artifacts(report):
                 report.add("/README.md on image", rc == 0 and "README" in out)
 
         # --- user space ELFs ----------------------------------------------
-        usrdir = os.path.join(ROOT, "user")
+        usrdir = os.path.join(ROOT, "userland", "bin")
         sources = sorted(f for f in os.listdir(usrdir) if f.endswith(".c"))
         for src in sources:
             name = src[:-2]

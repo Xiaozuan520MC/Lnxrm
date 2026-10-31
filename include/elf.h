@@ -34,7 +34,7 @@ typedef struct {
 #define PF_W    2
 #define PF_R    4
 
-/* kernel/elf.c -- load a static ELF64 into address space `pml4`.
+/* kernel/sched/elf.c -- load a static ELF64 into address space `pml4`.
  * Returns entry point or 0 on failure; sets *brk_end to first free byte. */
 u64 elf_load(u64 pml4, const void *img, size_t imgsize, u64 *brk_end);
 

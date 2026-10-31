@@ -13,7 +13,7 @@
  *
  * Deliberately NOT probed here: the demoted tier's -13 (setuid mutates
  * the caller's identity, which t_syscall refuses on principle -- the
- * user-tier gate answers are user/systest's); the inited flag (a real
+ * user-tier gate answers are userland/systest's); the inited flag (a real
  * reset probe decides it, and only monotonicity-style facts hold).
  * (2026-10-26) */
 #include <sys/ktest.h>
