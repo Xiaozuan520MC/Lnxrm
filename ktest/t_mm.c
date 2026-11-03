@@ -64,8 +64,12 @@ static void test_pmm_buddy_accounting(void)
     for (int i = 0; i < 16; i++) pmm_free_order(frames[i], 0);
     K_EXPECT_EQ(pmm_free_bytes(), before);
 
-    /* orders at/above MAX_ORDER must fail cleanly, not corrupt the lists */
-    K_EXPECT_EQ(pmm_alloc_order(11), 0);
+    /* orders at/above MAX_ORDER must fail cleanly, not corrupt the lists.
+     * pmm_max_order() is the real boundary -- a hardcoded order number goes
+     * stale the moment MAX_ORDER moves (it did: 11 was the ceiling when this
+     * assertion was written, and an 8 MiB FAT table later needed order 11 to
+     * become allocatable). */
+    K_EXPECT_EQ(pmm_alloc_order(pmm_max_order()), 0);
     K_EXPECT_EQ(pmm_alloc_order(64), 0);
     K_EXPECT_EQ(pmm_free_bytes(), before);
 }

@@ -1,6 +1,6 @@
 /* FAT32 directory layer: 8.3/LFN name handling, directory scanning,
  * path resolution and readdir (fat_dir_iter / getdent). */
-#include "fat32_priv.h"
+#include "fat32.h"
 
 void fat_short_to_name(const u8 *sn, u8 ntres, char out[13])
 {
@@ -86,10 +86,11 @@ int fat_scan_dir_at(struct fat_mount *m, u32 dirclus, u64 resume, dirent_cb cb, 
     /* C30: sectors, not clusters.  A 32-byte dirent never crosses a
      * 512-byte sector, so the scan steps sector by sector -- a resume
      * reads only the sectors the cursor has not served yet, one lookup
-     * each, instead of re-reading whole clusters per call.  m->fat is in
-     * RAM, so chain advancement is arithmetic: skipped clusters cost no
-     * device read.  LFN state starts fresh at a resume, which is exact,
-     * because a long-name run always sits contiguously right before its
+     * each, instead of re-reading whole clusters per call.  The paged FAT
+     * (m->fat_pages) is in RAM, so chain advancement is arithmetic: skipped
+     * clusters cost no device read.  LFN state starts fresh at a resume,
+     * which is exact, because a long-name run always sits contiguously right
+     * before its
      * own 8.3 record -- the next entry's pieces can never lie at or
      * before the cursor. */
     u32 start_clus = (u32)(resume >> 32);

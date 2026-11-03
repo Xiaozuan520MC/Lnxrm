@@ -285,9 +285,11 @@ void input_event_stats(struct lnxrm_input_info *m)
 
 #ifdef CONFIG_KTEST
 /* ktest-driven internal hooks: waitlist add/take atomicity.
- * Exercised only with hand-built fake tasks (state == T_SLEEPING, never
- * enqueued on any runqueue): ktest can't run runqueue_add on fakes, and
- * this file's own waitlist is a separate list from run queues. */
+ * Exercised with hand-built fake tasks (T_SLEEPING, off-runqueue until a
+ * wake enqueues them exactly the way real sleepers are woken -- no tick
+ * is running during ktest, and task_free_slot() unlinks a woken fake
+ * before anything can pick it up).  This file's waitlist is separate from
+ * the run queues; only sched_wake_task borrows the scheduler's dance. */
 struct task *input_waitlist_head_for_test(void)
 {
     return ev_waiters;

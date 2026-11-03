@@ -317,3 +317,9 @@ void pmm_free_order(u64 pa, int order)
 
 u64 pmm_free_bytes(void)
 { return free_pg << MIN_ORDER_BITS; }
+
+/* The first order the buddy refuses (orders 0..MAX_ORDER-1 are valid).
+ * Published so a test can assert the *actual* boundary instead of a
+ * hardcoded order number that goes stale the moment MAX_ORDER moves. */
+int pmm_max_order(void)
+{ return MAX_ORDER; }

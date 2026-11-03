@@ -1,11 +1,10 @@
 /* Shared internals of the FAT32 driver: on-disk structures, mount state,
  * path/cluster helpers and the cross-file entry points of
- * fat32.c / fat32_dir.c / fat32_file.c / fat32_meta.c.  Module-private:
- * nothing outside kernel/fs/ includes this header -- except the boot
- * self-test (ktest/t_fs.c), which is precisely the second consumer
- * these helpers need. */
-#ifndef LNXRM_FAT32_PRIV_H
-#define LNXRM_FAT32_PRIV_H
+ * fat32.c / fat32_dir.c / fat32_file.c / fat32_meta.c.  Consumers: those
+ * four files plus the boot self-test (ktest/t_fs.c and friends), which is
+ * precisely the second consumer these helpers need. */
+#ifndef LNXRM_FAT32_H
+#define LNXRM_FAT32_H
 
 #include <sys/vfs.h>
 #include <console.h>
@@ -104,7 +103,17 @@ struct fat_mount {
     u32 root_cluster;
     u64 data_start_lba; /* cluster 2 */
     u32 max_cluster;
-    u8 *fat; /* cached FAT table */
+    /* Cached FAT table, held as an array of PAGE_SIZE frames rather than one
+     * contiguous buffer.  A real volume's FAT is proportional to its size --
+     * 8 MiB for a 16 GiB partition, far past what one buddy block can serve
+     * contiguously -- so a single kmalloc(fat_bytes) used to fail silently on
+     * every drive above ~4 MiB of table.  Paging it removes the ceiling
+     * entirely: fat_npages frames, each pmm_alloc()ed (order-0, no heap
+     * header), reachable through fat_pages[i].  Entries and sectors never
+     * straddle a frame (4 B | 4096 B, and bytes_per_sector is one of
+     * 512/1024/2048/4096, all | 4096), so the page lookup below is exact. */
+    u8 **fat_pages; /* fat_npages frames, each PAGE_SIZE */
+    u32 fat_npages; /* == ceil(fat_bytes / PAGE_SIZE) */
     u64 fat_bytes;
     u32 fat_warns; /* corruption reports printed so far (rate limiter) */
     u8 dirent_stamp; /* advances once per created record: the creation
@@ -343,6 +352,27 @@ static inline bool fat_alias_eq(const u8 stored[11], const u8 want[11])
 }
 
 /* Cluster / FAT table access (fat32.c). */
+/* The FAT is paged (fat_pages, see struct fat_mount): these three helpers are
+ * the ONLY way driver or ktest code touches a FAT entry or sector.  Byte
+ * offset `off` names a FAT position; it maps to frame off / PAGE_SIZE at
+ * within-frame offset off & (PAGE_SIZE - 1).  A FAT entry (4 B) and a sector
+ * (512/1024/2048/4096 B) both divide PAGE_SIZE, so neither ever straddles a
+ * frame and the lookup is exact. */
+static inline u8 *fat_page_at(struct fat_mount *m, u64 off)
+{ return m->fat_pages[off / PAGE_SIZE]; }
+/* Raw 32-bit entry at cluster `clus` (all four bytes, high nibble intact);
+ * mask with 0x0FFFFFFF where the caller means "the cluster it names". */
+u32 fat_entry_get(struct fat_mount *m, u32 clus);
+/* Raw 32-bit store at cluster `clus` -- the in-memory half of fat_set_entry,
+ * no journal, no write-back.  Callers own the masking. */
+void fat_entry_put_raw(struct fat_mount *m, u32 clus, u32 val);
+/* Pointer to the sector-aligned byte offset `off` inside the cached FAT, for
+ * the journal's whole-sector memcpy.  `off` must be sector-aligned. */
+void *fat_sector_ptr(struct fat_mount *m, u64 off);
+/* Release every FAT frame and the page array.  Safe on a partially built or
+ * all-NULL mount (mount failure paths call it). */
+void fat_pages_free(struct fat_mount *m);
+
 u32 fat_next_cluster(struct fat_mount *m, u32 clus);
 /* Write one FAT entry (memory copy + the sector backing it).
  * Returns 0 or LNXRM_EIO.  On failure the in-memory entry still changes:
@@ -418,4 +448,4 @@ int fat_rmdir_impl(void *mnt, const char *path);
 int fat_unlink_impl(void *mnt, const char *path);
 int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath);
 
-#endif /* LNXRM_FAT32_PRIV_H */
+#endif /* LNXRM_FAT32_H */

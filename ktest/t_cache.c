@@ -33,15 +33,16 @@
  * the bytes are re-read from the device.  The other half of the rule is that
  * each region of the disk uses exactly one path -- the FAT is written
  * straight to the device (so an allocation is durable before the directory
- * entry that names the cluster) and read from m->fat, never from the cache;
- * if a FAT sector ever became resident, those two answers could disagree.
+ * entry that names the cluster) and read from m->fat_pages, never from the
+ * cache; if a FAT sector ever became resident, those two answers could
+ * disagree.
  *
  * Everything here is destructive only on sectors the case itself created, or
  * read-only, and every case leaves the cache empty of its own traffic. */
 #include <sys/ktest.h>
 #include <console.h>
 #include <disk.h>
-#include <fat32_priv.h>
+#include <fat32.h>
 
 /* The mounted volume, or a skip if there is none (same rule as t_ioerr.c). */
 static struct fat_mount *mnt_or_skip(const char *who)
@@ -319,8 +320,8 @@ static void test_fat_region_is_never_cached(void)
 
     /* fat_set_entry() writes the FAT sector straight to the device: the
      * allocation has to be on disk before the directory entry naming the
-     * cluster can be staged, and FAT reads come from m->fat, not from a
-     * sector buffer.  A resident FAT sector would be a stale third copy
+     * cluster can be staged, and FAT reads come from m->fat_pages, not from
+     * a sector buffer.  A resident FAT sector would be a stale third copy
      * (C26 in its remaining form). */
     u64 first = m->reserved_sectors;
     u64 last = (u64)m->reserved_sectors + (u64)m->num_fats * m->fatsz;

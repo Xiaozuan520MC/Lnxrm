@@ -25,6 +25,7 @@ void pmm_reserve(u64 lo, u64 hi); /* keep [lo,hi) out of the free lists (MMIO) *
 u64 pmm_alloc_order(int order); /* phys addr or 0 */
 void pmm_free_order(u64 pa, int order);
 u64 pmm_free_bytes(void);  /* bytes currently on the buddy free lists */
+int pmm_max_order(void);   /* first refused order (0..max-1 are valid) */
 /* ktest only: make the next `n` frame allocations fail (0 = off).  This is
  * how the OOM branches are tested without actually running the machine out
  * of memory; every caller must turn the arm back off before asserting. */

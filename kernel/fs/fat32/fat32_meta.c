@@ -1,6 +1,6 @@
 /* FAT32 namespace layer: create / mkdir / rmdir / unlink, including the
  * parent-directory split and the free-dirent claim helper. */
-#include "fat32_priv.h"
+#include "fat32.h"
 
 /* Split "parent/name" for a create, resolve the parent directory cluster
  * and reject the name if it is already taken.

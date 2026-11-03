@@ -344,21 +344,23 @@ void sched_tick(void)
 
 /* Wake ONE parked task: the exact dance send_signal / sched_tick perform
  * inline (T_SLEEPING -> T_RUNNABLE + runqueue_add), extracted so input_wait
- * can reuse it without holding any queue lock.  Defensive: NULL or a task
- * not in T_SLEEPING answers false and touches nothing, so producer code
- * and test fakes can call it without a guard of their own.
+ * can reuse it.  The transition itself is lock-free like those callers:
+ * runqueue_add() takes runq_lock internally, so wrapping THIS in a second
+ * runq_lock acquire would self-deadlock the waker (observed as an infinite
+ * spin in spin_lock_irqsave from the input-wait wake).  Double-wake is not
+ * a hazard: both wakers read T_SLEEPING, both write T_RUNNABLE, and
+ * runqueue_add() re-checks rq_cpu under its own lock, making the second
+ * call a no-op.  Defensive: NULL or a task not in T_SLEEPING answers false
+ * and touches nothing, so producer code and test fakes can call it without
+ * a guard of their own.
  *
- * Caller must NOT hold evq_lock: this takes runq_lock and may schedule the
- * wakee on another CPU -- nested locks invert the evq_lock -> runq_lock
- * order and deadlock. */
+ * Caller must NOT hold evq_lock: runqueue_add takes runq_lock below, and
+ * runq_lock must never nest inside evq_lock. */
 bool sched_wake_task(struct task *t)
 {
     if (!t || t->state != T_SLEEPING) return false;
-    u64 f;
-    spin_lock_irqsave(&runq_lock, &f);
     t->state = T_RUNNABLE;
     runqueue_add(t);
-    spin_unlock_irqrestore(&runq_lock, f);
     /* Nudge this CPU's scheduler if it is idle (no IPI here: cross-CPU
      * wakeups are picked up by the target's tick, same as nanosleep). */
     if (this_cpu_data()->idle && this_cpu_data()->_current == this_cpu_data()->idle)

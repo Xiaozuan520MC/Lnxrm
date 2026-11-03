@@ -22,7 +22,7 @@
  *      same idea expressed as surrounding fill bytes.
  *   3. THE ANSWER MATCHES AN ORACLE.  Each case carries a second
  *      implementation of the contract, written from the header comments
- *      (types.h, mm/mm.h, fs/vfs.c, fat32_priv.h, elf.h) and answered by
+ *      (types.h, mm/mm.h, fs/vfs.c, fat32.h, elf.h) and answered by
  *      walking the page tables itself -- never by calling the function under
  *      test.
  *
@@ -40,7 +40,7 @@
 #include <mm/mm.h>
 #include <sys/sched.h>
 #include <sys/vfs.h>
-#include <fat32_priv.h>
+#include <fat32.h>
 #include <elf.h>
 
 #define PROP_SEED 0x9E3779B97F4A7C15ULL

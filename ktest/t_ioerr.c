@@ -26,7 +26,7 @@
 #include <sys/ktest.h>
 #include <console.h>
 #include <disk.h>
-#include <fat32_priv.h>
+#include <fat32.h>
 
 static struct fat_mount *mnt_or_skip(const char *who)
 {

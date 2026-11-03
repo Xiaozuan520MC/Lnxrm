@@ -1,4 +1,4 @@
-#include "fat32_priv.h"
+#include "fat32.h"
 
 /* On-disk record header.  One record = this sector, immediately followed by
  * the 512-byte after-image it describes.  seq + crc let recovery reject a
@@ -185,9 +185,9 @@ void fat_journal_mount(struct fat_mount *m)
             m->j_start);
 
     /* Committed but never applied.  Re-do it -- the FAT image was loaded
-     * into RAM before this call, so the replay has to refresh m->fat too,
-     * not just the sectors on disk, or the mount would hand out clusters the
-     * just-committed transaction already claimed. */
+     * into RAM before this call, so the replay has to refresh m->fat_pages
+     * too, not just the sectors on disk, or the mount would hand out
+     * clusters the just-committed transaction already claimed. */
     u8 sec[CACHE_SECTOR_SIZE];
     u32 done = 0;
     for (u32 i = 0; i < s.nrec; i++) {
@@ -204,7 +204,7 @@ void fat_journal_mount(struct fat_mount *m)
             rec.lba < m->reserved_sectors + (u64)m->fatsz) {
             u64 off = (rec.lba - m->reserved_sectors) * m->bytes_per_sector;
             if (off + m->bytes_per_sector <= m->fat_bytes)
-                memcpy(&m->fat[off], sec, m->bytes_per_sector);
+                memcpy(fat_sector_ptr(m, off), sec, m->bytes_per_sector);
         }
         if (jrn_write_home(m, rec.lba, sec)) break;
         done++;

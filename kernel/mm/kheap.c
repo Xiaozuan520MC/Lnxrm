@@ -75,7 +75,8 @@ void *kmalloc(size_t n)
      * tiny `need`, so a small block would be handed out as though it were
      * enormous -- a caller-driven heap overflow.  Nothing larger than the
      * buddy's biggest block (4 MiB) is satisfiable anyway, so reject it here
-     * as a plain allocation failure. */
+     * as a plain allocation failure.  (Buffers that outgrow this are paged,
+     * not widened: the FAT32 driver holds its table as fat_npages frames.) */
     if (n > (4UL << 20) - sizeof(struct hdr)) return NULL;
     struct hdr *h;
 

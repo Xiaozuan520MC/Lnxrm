@@ -5,7 +5,7 @@
 #include <sys/ktest.h>
 #include <console.h>
 #include <sys/vfs.h>
-#include <fat32_priv.h>
+#include <fat32.h>
 
 static void test_abs_path(void)
 {

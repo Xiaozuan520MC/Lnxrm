@@ -45,7 +45,7 @@ include/              全部头文件，本目录没有实现文件
                       ktest input
   mm/                 mm.h（pmm/kheap/vmm 接口与常量）、pagefault.h
   其余                 types.h boot.h console.h framebuffer.h disk.h elf.h io.h pci.h
-                      font8x16.h fat32_priv.h
+                      font8x16.h fat32.h
 kernel/               内核 C 实现
   main.c              入口/bring-up 编排（start_kernel）
   core/               内核核心：syscall.c(系统调用分发/门) print.c(控制台)
@@ -527,12 +527,22 @@ kernel/fs/
 | 区域 | 读 | 写 |
 |---|---|---|
 | 数据 / 目录（≥ `data_start_lba`） | `fat_read_sector`/`fat_read_cluster` → 块缓存 | `fat_write_sector` → 块缓存（写回） |
-| FAT 区 `[reserved, reserved + num_fats*fatsz)` | `m->fat`（挂载时整表读进内存） | `fat_set_entry` 直写 / 入日志事务 |
+| FAT 区 `[reserved, reserved + num_fats*fatsz)` | `m->fat_pages`（挂载时整表分帧读进内存，每帧 4 KiB） | `fat_set_entry` 直写 / 入日志事务 |
 | 挂载期（BPB、FAT 表、MBR） | `blk_io_*` 直读 | — |
 
 **FAT 区永远不进块缓存**：FAT 更新必须先落盘，才能被指向它的目录项暂存；若改走缓存，
 两者都成暂存态，按槽号回写的 `blk_cache_flush` 就会写出"目录项先于 FAT 落盘"的窗口。
 自测 `ktest/t_cache.c` 逐扇区断言 FAT 区一个都不在缓存里。
+
+**FAT 表分帧驻留（2026-11-02）**：`m->fat` 不再是一块连续缓冲，而是 `fat_npages` 个
+4 KiB 帧（`m->fat_pages[]`，每帧 `pmm_alloc()` 一块、`PHYS_TO_VIRT` 取址）。原因：
+FAT 大小正比于分区——16 GiB 分区的表就是 8 MiB，而 `kmalloc` 受 buddy 最大块
+（4 MiB）约束，整表 `kmalloc` 在任何真实大卷上都会失败（曾是静默的 `return NULL`）。
+分帧彻底去掉这个天花板：表多大只受物理内存限制。表项 4 B、扇区 512/1024/2048/4096 B
+都整除 4096，故**表项与扇区永不跨帧**，寻址就是 `帧 = off / 4096`、`帧内 = off & 4095`。
+访问收敛到三个 helper（`fat_entry_get` / `fat_entry_put_raw` / `fat_sector_ptr`），
+驱动与 ktest 都只走它们。挂载读入用 128 KiB（256 扇区 = AHCI 单次上限）的 bounce
+缓冲分批散射，命令数与旧的整表单读一致——逐帧读会在真机上每 4 KiB 一个非 NCQ 往返。
 
 ### 6.5 块缓存（`kernel/fs/blk_cache.c`）
 
@@ -579,7 +589,7 @@ kernel/fs/
 记录。坏簇/自环照样被步数预算或自环即断拦下并告警。
 
 **目录游标**（C30）：getdent 的 cookie 是 `(簇<<32)|字节偏移` 的物理恢复点
-（`DIRIT_START=0`、`DIRIT_END=(u64)-1` 出在 `include/fat32_priv.h`），引擎按扇区
+（`DIRIT_START=0`、`DIRIT_END=(u64)-1` 出在 `include/fat32.h`），引擎按扇区
 步进（32 字节记录不跨 512 扇区），整簇级跳过零设备读。一条 readdir 从头到尾的扇区
 查找计数 ≈ 链内扇区数 + 条目数（实测 `dir 3 clusters, one walk = 39 lookups
 (bound 46)`）——不再是每次 getdent 从首簇重扫的 O(n²)；坏/越界 cookie 一律回
@@ -612,7 +622,7 @@ kernel/fs/
 - 事务期间后像只在 RAM（按 lba 去重覆盖），读己经写由 `fat_read_sector →
   fat_journal_read` 提供；缓冲满时**中途 checkpoint 再续**而不是静默丢弃。
 - `fat_journal_mount` 在挂载加载 FAT 之后跑：superblock 过期 / 损坏则重建，
-  state == COMMIT 则幂等 redo 全部记录（并把重放的 FAT 扇区同步回 `m->fat`），
+  state == COMMIT 则幂等 redo 全部记录（并把重放的 FAT 扇区同步回 `m->fat_pages`），
   完成后置 CLEAN。失败语义：只可能泄漏簇、不交叉链接。
 
 **簇链安全**：`FAT_CHAIN_MAX_STEPS` 限制步数，`fat_chain_limit = MIN(上限, 数据簇数)`；
@@ -731,7 +741,11 @@ kernel/fs/
   非 ignored），ms==0 等价非阻塞 pop（EAGAIN），ms==-1 永等；门 CAP_SYS_ADMIN
   先于 EFAULT。sched 新增 `sched_wake_task(t)`（T_SLEEPING → T_RUNNABLE +
   runqueue_add，send_signal/sched_tick 同款舞步，NULL/非睡眠 task 直接 false）。
-- `ktest/t_input.c`（LATE 四例，USER_BASE+0xF000 独立 VA 页；t_kbd/t_mouse 与
+  2026-11-03 修正：最早版本在进入 runqueue_add 前先自己拿了 runq_lock，而
+  runqueue_add 内部再拿同一把锁 → 自旋死锁（ktest 首次真正走到唤醒路径时当场
+  复现：CPU 卡死在 `spin_lock_irqsave(runq_lock)`，无中断无复位）。对齐
+  send_signal 的免锁写法（双重唤醒由 runqueue_add 的 `rq_cpu != -1` 复查兜住）。
+- `ktest/t_input.c`（LATE 五例，USER_BASE+0xF000 独立 VA 页；t_kbd/t_mouse 与
   本文件的先后由链接序决定，所以每例都以计数快照开场、以归还旧环开场时借
   的东西收尾——console 环清空、msring 清空、shift/caps 偶数次归位）：
   ①分发面（drain 后的空问答 `EAGAIN`/全坏指针 `EFAULT`、`input_inject+probe`
@@ -743,7 +757,10 @@ kernel/fs/
   释放包走纯 0x08、REL 与 WHEEL 同包次序、8 事件/分类型 delta 全对账，msring
   7 包原样回读且与新消费者无关）；
   ④队列全貌（`input_inject` 63 颗四类型铺满→第 64 颗如实丢弃、pending 钉死
-  63、旧环零扰动、FIFO 逐颗 1:1 且 seq 严格 +1、清空后立刻再装）。
+  63、旧环零扰动、FIFO 逐颗 1:1 且 seq 严格 +1、清空后立刻再装）；
+  ⒌waitlist 原子性（注册序最末、却因 section 序**先跑**：开头必须 `evq_drain()`
+  自保——t_mouse 的生产者路径把共享队列灌到满、它只管 msring；push-front/take
+  逐颗摘、inject 摘一个 waiter 事件留队、摘下的假任务走与真任务同款唤醒）。
 - smoke 的 `systest` 两段相应扩展：降权用户 `user.input.pop=-13`/`user.input.info=0`，
   根态 `input.info.ret=0`、`capacity=63`、`sane=1`、`sum=1`、空队 `input.pop.empty=-11`。
 
@@ -924,7 +941,7 @@ smp_init():
 | `pmm_lock` | `pmm.c` | buddy 空闲链 + 位图 | |
 | `kheap_lock` | `kheap.c` | 内核堆分箱 | |
 | `cache_lock` | `blk_cache.c` | 块缓存 | **跨越设备 I/O** |
-| `fat_fs_lock` | `include/fat32_priv.h` | 全部 FAT32 操作 | 与 `cache_lock` 嵌套 |
+| `fat_fs_lock` | `include/fat32.h` | 全部 FAT32 操作 | 与 `cache_lock` 嵌套 |
 | `print_lock` | `print.c` | `kvprintf` 与 `console_write` | 内部名 `console_out_lock` |
 | `fb_box_lock` | `framebuffer.c` | 双缓冲脏箱与 `fb_dirty`（present 只在锁内快照+清空） | 拷贝在锁外 |
 

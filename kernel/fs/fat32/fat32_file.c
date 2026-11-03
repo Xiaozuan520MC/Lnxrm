@@ -1,6 +1,6 @@
 /* FAT32 file layer: path lookup plus read / write-grow-truncate of
  * regular files (cluster chains are extended through alloc_chain). */
-#include "fat32_priv.h"
+#include "fat32.h"
 
 int fat_lookup_impl(void *mnt, const char *path, struct vnode *out)
 {
@@ -140,7 +140,7 @@ static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc, 
         /* whatever sat at the tail is what the caller restores on failure --
          * normally the end marker, but a tail left free (its record died)
          * belongs back at free, not marked as used-and-unclaimed */
-        if (prev) *tail_old = *(u32 *)&m->fat[prev * 4];
+        if (prev) *tail_old = fat_entry_get(m, prev);
     } else
         cnt = 0; /* fresh chain */
 
@@ -177,9 +177,9 @@ static u32 alloc_chain(struct fat_mount *m, u32 first, u64 need_bytes, int *rc, 
  * the tail's previous answer, unlink this call's growth), then return every
  * new cluster to the free pool.  Frees, never cross-links -- a dirent that
  * still names the old head keeps pointing at exactly the data it published.
- * Best effort, like every other failure-path cleanup: m->fat is the
- * authority the next allocation scan reads, and each step is reported by
- * fat_set_entry() on its own. */
+ * Best effort, like every other failure-path cleanup: the paged FAT
+ * (m->fat_pages) is the authority the next allocation scan reads, and each
+ * step is reported by fat_set_entry() on its own. */
 static void rollback_growth(struct fat_mount *m, u32 grown, u32 tail, u32 tail_old)
 {
     if (!grown) return;

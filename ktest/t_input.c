@@ -431,6 +431,16 @@ static void test_input_waitlist_atomicity(void)
     struct lnxrm_input_event e = {0};
     struct lnxrm_input_event ev = {0, INPUT_EV_KEY, 0x41, 0, 0, 0};
 
+    /* drain first, like every input case: this case is the first to run
+     * (section order) and the mouse suite's producer path fills this
+     * queue on its way to the msring (ms_feed_byte -> input_push_mouse).
+     * That suite asserts only its own ring empty, so the shared queue
+     * starts full -- and with a full queue the inject below would be the
+     * event that gets dropped instead of the waiter that gets plucked. */
+    u32 n0 = input_event_pending();
+    K_EXPECT_EQ(evq_drain(), n0);
+    K_EXPECT_EQ(input_event_pending(), 0);
+
     /* two fake sleepers, never enqueued on any runqueue */
     struct task *t1 = task_alloc_slot();
     struct task *t2 = task_alloc_slot();

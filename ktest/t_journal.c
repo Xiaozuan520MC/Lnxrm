@@ -33,7 +33,7 @@
 #include <sys/ktest.h>
 #include <console.h>
 #include <disk.h>
-#include <fat32_priv.h>
+#include <fat32.h>
 
 static const char NAME1[] = "JRNTEST1   "; /* 8.3 image of "/jrntest1" */
 static const char NAME2[] = "JRNTEST2   ";

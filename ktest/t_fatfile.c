@@ -15,7 +15,7 @@
 #include <sys/ktest.h>
 #include <console.h>
 #include <disk.h>
-#include <fat32_priv.h>
+#include <fat32.h>
 #include <mm/mm.h>
 #include <string.h>
 #include "kblk.h"
@@ -134,7 +134,7 @@ static void test_a_stranger_dirent_refuses_the_stale_write(void)
     u8 d1[512];
     K_ASSERT_EQ(disk_sector(m, dlba, d1), 0);
     K_EXPECT_EQ(memcmp(d0, d1, 512), 0);   /* the stranger keeps its record */
-    K_EXPECT_EQ(*(u32 *)&m->fat[dead_head * 4] & 0x0FFFFFFF, 0U); /* and no
+    K_EXPECT_EQ(fat_entry_get(m, dead_head) & 0x0FFFFFFF, 0U); /* and no
         cluster was claimed on the dead record's behalf, least of all the
         one whose chain is no longer anybody's (restored to free, not to
         an unclaimed end-of-chain mark) */
@@ -175,7 +175,7 @@ static void chain_len(struct fat_mount *m, u32 dirclus, u32 *out)
     u32 clus = dirclus;
     while (clus >= 2 && clus < m->max_cluster && len < 1000) {
         len++;
-        clus = *(u32 *)&m->fat[clus * 4] & 0x0FFFFFFF;
+        clus = fat_entry_get(m, clus) & 0x0FFFFFFF;
     }
     *out = len;
 }
@@ -345,8 +345,8 @@ static void test_alias_collision_writes_stay_their_own(void)
     expect_alias_record(m, dc, 3 * DIRENT_SIZE, 0x11, sizeof(a), &ha);
     expect_alias_record(m, dc, 5 * DIRENT_SIZE, 0x22, sizeof(b), &hb);
     K_EXPECT(ha != hb);
-    K_EXPECT_EQ(*(u32 *)&m->fat[ha * 4] & 0x0FFFFFFF, (u32)FAT_EOC);
-    K_EXPECT_EQ(*(u32 *)&m->fat[hb * 4] & 0x0FFFFFFF, (u32)FAT_EOC);
+    K_EXPECT_EQ(fat_entry_get(m, ha) & 0x0FFFFFFF, (u32)FAT_EOC);
+    K_EXPECT_EQ(fat_entry_get(m, hb) & 0x0FFFFFFF, (u32)FAT_EOC);
 
     /* and after both writes the names still resolve where they began */
     struct resolve ra2, rb2;
@@ -369,7 +369,7 @@ static u32 fat_free_count(struct fat_mount *m)
 {
     u32 n = 0;
     for (u32 c = 2; c < m->max_cluster; c++)
-        if (!(*(u32 *)&m->fat[c * 4] & 0x0FFFFFFF)) n++;
+        if (!(fat_entry_get(m, c) & 0x0FFFFFFF)) n++;
     return n;
 }
 
@@ -867,7 +867,7 @@ static struct fat_mount *mount_forged_leave(struct kblk *k)
     struct fat_mount *old = fat_priv;
     struct fat_mount *m2 = fat_mount(&k->dev);
     fat_priv = old;
-    if (m2) kfree(m2->fat);
+    if (m2) fat_pages_free(m2);
     if (m2) kfree(m2);
     return m2;
 }
@@ -924,7 +924,7 @@ static void test_last_fat_cell_reachable(void)
     K_EXPECT_EQ(k->reads, 2);        /* BPB + the one-sector FAT */
 
     fat_priv = old;
-    kfree(m2->fat);
+    fat_pages_free(m2);
     kfree(m2);
     kblk_free(k);
 }

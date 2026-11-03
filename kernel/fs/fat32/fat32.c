@@ -1,8 +1,8 @@
 /* FAT32 driver core: cached FAT table access, mount, and the locked
  * fs_ops table.  Directory scanning lives in fat32_dir.c, file data in
  * fat32_file.c and namespace changes in fat32_meta.c; shared types are
- * in fat32_priv.h. */
-#include "fat32_priv.h"
+ * in fat32.h. */
+#include "fat32.h"
 
 void *fat_priv; /* active mount or NULL */
 
@@ -65,6 +65,41 @@ void fat_warn_io(struct fat_mount *m, const char *op, u64 lba)
     kprintf("[fat32] I/O error %s LBA %llu%s\n", op, lba, fat_warn_tail(m));
 }
 
+/* --- paged FAT access ---------------------------------------------------
+ * One frame (PAGE_SIZE) holds PAGE_SIZE/4 = 1024 FAT entries, and every FAT
+ * position is a byte offset that divides evenly into a frame, so a frame
+ * lookup plus an in-frame offset is the whole translation.  These are the
+ * only places that compute it; everything else in the driver goes through
+ * them (and so does ktest). */
+u32 fat_entry_get(struct fat_mount *m, u32 clus)
+{
+    u64 off = (u64)clus * 4;
+    return *(u32 *)(fat_page_at(m, off) + (off & (PAGE_SIZE - 1)));
+}
+
+void fat_entry_put_raw(struct fat_mount *m, u32 clus, u32 val)
+{
+    u64 off = (u64)clus * 4;
+    *(u32 *)(fat_page_at(m, off) + (off & (PAGE_SIZE - 1))) = val;
+}
+
+void *fat_sector_ptr(struct fat_mount *m, u64 off)
+{
+    /* `off` is sector-aligned and bytes_per_sector | PAGE_SIZE, so the whole
+     * sector lives inside the one frame the offset starts in. */
+    return fat_page_at(m, off) + (off & (PAGE_SIZE - 1));
+}
+
+void fat_pages_free(struct fat_mount *m)
+{
+    if (!m->fat_pages) return;
+    for (u32 i = 0; i < m->fat_npages; i++)
+        if (m->fat_pages[i]) pmm_free(VIRT_TO_PHYS(m->fat_pages[i]));
+    kfree(m->fat_pages);
+    m->fat_pages = NULL;
+    m->fat_npages = 0;
+}
+
 /* Follow the chain out of `clus`.  Only two kinds of entry are legal in a
  * FAT: one that names a cluster of this volume, or an end-of-chain marker.
  * A free entry (0), cluster 1, the reserved range 0x0FFFFFF0-7 and any
@@ -74,7 +109,7 @@ void fat_warn_io(struct fat_mount *m, const char *op, u64 lba)
 u32 fat_next_cluster(struct fat_mount *m, u32 clus)
 {
     if (clus < 2 || clus >= m->max_cluster) return FAT_EOC;
-    u32 val = *(u32 *)&m->fat[clus * 4] & 0x0FFFFFFF;
+    u32 val = fat_entry_get(m, clus) & 0x0FFFFFFF;
     if (cluster_is_eoc(val)) return val;
     if (val >= 2 && val < m->max_cluster) return val;
     fat_warn_entry(m, clus, val);
@@ -129,8 +164,8 @@ void fat_chain_advance(struct fat_chain *ch)
 int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
 {
     if (clus >= m->max_cluster) return LNXRM_EINVAL;
-    u32 old = *(u32 *)&m->fat[clus * 4];
-    *(u32 *)&m->fat[clus * 4] = (old & 0xF0000000) | (val & 0x0FFFFFFF);
+    u32 old = fat_entry_get(m, clus);
+    fat_entry_put_raw(m, clus, (old & 0xF0000000) | (val & 0x0FFFFFFF));
     /* write back the touched sector.  T-005: the result matters -- a silently
      * lost FAT update is how two files end up owning the same cluster after
      * the next remount, so the caller is told and the transfer is reported.
@@ -138,7 +173,7 @@ int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
      * allocation scan from handing this cluster out again in the meantime. */
     u64 off = clus * 4;
     u64 lba = m->reserved_sectors + off / m->bytes_per_sector;
-    void *sec = &m->fat[off & ~(u64)(m->bytes_per_sector - 1)];
+    void *sec = fat_sector_ptr(m, off & ~(u64)(m->bytes_per_sector - 1));
     /* Through the journal: with a transaction open the after-image is only
      * buffered (the commit record has to reach the log first, or a crash
      * here would leave the FAT updated with no record to finish from), and
@@ -180,7 +215,7 @@ int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
 u32 fat_find_free_cluster(struct fat_mount *m)
 {
     for (u32 i = 2; i < m->max_cluster; i++)
-        if ((*(u32 *)&m->fat[i * 4] & 0x0FFFFFFF) == 0) return i;
+        if ((fat_entry_get(m, i) & 0x0FFFFFFF) == 0) return i;
     return 0;
 }
 
@@ -197,7 +232,7 @@ static u64 fat_freespace_impl(void *mnt)
     struct fat_mount *m = fat_priv;
     u64 free_clusters = 0;
     for (u32 i = 2; i < m->max_cluster; i++)
-        if ((*(u32 *)&m->fat[i * 4] & 0x0FFFFFFF) == 0) free_clusters++;
+        if ((fat_entry_get(m, i) & 0x0FFFFFFF) == 0) free_clusters++;
     return free_clusters * m->cluster_size;
 }
 
@@ -437,25 +472,86 @@ void *fat_mount(struct blkdev *dev)
     }
 
     m->fat_bytes = (u64)m->fatsz * m->bytes_per_sector;
-    /* The whole FAT is loaded into RAM up front.  On the 64 MiB test image that
-     * is a couple of hundred kilobytes and invisible; on a real volume it can be
-     * hundreds of megabytes.  Say how much before starting, otherwise the log
+    /* The whole FAT is loaded into RAM up front, frame by frame (see the
+     * paged allocation below).  On the 64 MiB test image that is a couple of
+     * hundred kilobytes and invisible; on a real volume it is proportional
+     * to the partition size.  Say how much before starting, otherwise the log
      * stops at "trying FAT32" and a machine that is merely busy looks wedged. */
     kprintf("[fat32] %s: loading FAT, %llu sectors (%llu MiB)\n", dev->name, (u64)m->fatsz,
             m->fat_bytes >> 20);
-    m->fat = kmalloc(m->fat_bytes);
-    if (!m->fat || blk_io_read(dev, fat_start, m->fatsz, m->fat)) {
-        kfree(m->fat);
+    /* Paged FAT: one order-0 frame per PAGE_SIZE of table, so no single
+     * allocation has to be contiguous across the whole FAT (an 8 MiB table
+     * used to fail every kmalloc above the buddy's biggest block).  The page
+     * array itself is tiny -- fat_npages pointers -- and each frame is one
+     * pmm_alloc()ed block. */
+    m->fat_npages = (u32)((m->fat_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    m->fat_pages = kmalloc((size_t)m->fat_npages * sizeof(u8 *));
+    if (!m->fat_pages) {
+        kprintf("[fat32] reject %s: no memory for %u FAT frames\n", dev->name,
+                m->fat_npages);
         kfree(m);
         return NULL;
+    }
+    memset(m->fat_pages, 0, (size_t)m->fat_npages * sizeof(u8 *));
+    for (u32 i = 0; i < m->fat_npages; i++) {
+        u64 pa = pmm_alloc();
+        if (!pa) {
+            kprintf("[fat32] reject %s: out of memory at FAT frame %u/%u\n",
+                    dev->name, i, m->fat_npages);
+            fat_pages_free(m);
+            kfree(m);
+            return NULL;
+        }
+        m->fat_pages[i] = (u8 *)PHYS_TO_VIRT(pa);
+    }
+    /* Fill the frames through one contiguous bounce buffer per read, sized
+     * to the block driver's max transfer (256 sectors = 128 KiB), so the
+     * command count matches the old whole-FAT read -- going frame by frame
+     * would cost one non-NCQ round trip (200 us-1 ms) per 4 KiB on real
+     * hardware, i.e. minutes for a large table.  Every sector divides
+     * PAGE_SIZE, so each lands wholly inside one frame and the scatter is a
+     * plain per-sector copy. */
+    {
+        u32 chunk = 256; /* sectors per bounce read */
+        u8 *bounce = kmalloc((size_t)chunk * m->bytes_per_sector);
+        if (!bounce) {
+            kprintf("[fat32] reject %s: no memory for FAT read bounce\n",
+                    dev->name);
+            fat_pages_free(m);
+            kfree(m);
+            return NULL;
+        }
+        u32 done = 0;
+        int rc = 0;
+        while (done < m->fatsz && !rc) {
+            u32 n = m->fatsz - done;
+            if (n > chunk) n = chunk;
+            rc = blk_io_read(dev, fat_start + done, n, bounce);
+            if (rc) break;
+            for (u32 s = 0; s < n; s++) {
+                u64 off = (u64)(done + s) * m->bytes_per_sector;
+                memcpy(fat_sector_ptr(m, off),
+                       bounce + (size_t)s * m->bytes_per_sector,
+                       m->bytes_per_sector);
+            }
+            done += n;
+        }
+        kfree(bounce);
+        if (rc) {
+            kprintf("[fat32] reject %s: FAT read failed at sector %u/%u\n",
+                    dev->name, done, m->fatsz);
+            fat_pages_free(m);
+            kfree(m);
+            return NULL;
+        }
     }
 
     /* Lay out the journal in the unused reserved sectors and roll forward
      * any transaction the last session committed but did not get to apply.
      * It runs after the FAT load on purpose: replay rewrites FAT sectors,
-     * and m->fat is the image every chain walk and allocation scan below
-     * reads, so the two have to be brought to the same state here, before
-     * anything can look at either. */
+     * and m->fat_pages is the image every chain walk and allocation scan
+     * below reads, so the two have to be brought to the same state here,
+     * before anything can look at either. */
     fat_journal_mount(m);
 
     kprintf("[fat32] mounted %s: %u MiB, %u B/sector x %u/cluster, "
