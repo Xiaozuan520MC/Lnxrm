@@ -339,7 +339,8 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
  *  - The console has no frames, it has a stream of characters.  Presenting
  *    per character would push a region to the screen thousands of times
  *    over a boot log, so a console write marks its region dirty and lets
- *    fb_present_due() decide when the screen is worth updating.
+ *    the batch boundary (fb_console_flush) decide when the screen is
+ *    worth updating.
  *  - A drawing program does have frames, and calls fb_flip() (or the
  *    fb_flip syscall) to land one as one.
  *
@@ -372,7 +373,7 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
  * racing a present can tear for one frame -- the same window the old
  * direct-to-LFB code had per pixel, now reduced to one copy.
  *
- * fb_present_due() / fb_tick_flush() split presenting between two callers:
+ * Presenting is split between three callers:
  *
  *  - Once the timer runs (everything after lapic_timer_start(), which is
  *    where the steady state lives), the BSP's tick presents: at most one
@@ -382,12 +383,21 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
  *    not one per line.
  *  - Before the first tick (fb_init() through kernel_spawn, which
  *    includes all of ktest stage 3), jiffies never advances and no tick
- *    is coming, so the console presents itself -- coalesced on the output
- *    instead of a clock, once per FB_PRESENT_CHARS characters.  The paths
- *    that halt before the timer ever starts (panic, the kernel_spawn
- *    failure loop) flip the surface themselves for the same reason. */
+ *    is coming, so the console presents itself at its batch boundary:
+ *    kvprintf and console_write emit their output under console_out_lock
+ *    and call fb_console_flush() at console_out_unlock, so each printed
+ *    message lands on screen as one frame.  Coalescing on the batch, not
+ *    on a character count, is what makes the boot log advance as it is
+ *    printed: the whole boot log is ~3 KB, so the old once-per-1024-
+ *    characters clock showed three frames for the entire boot.
+ *  - fb_present_due() keeps that character count as a backstop for
+ *    output that never crosses the console lock; it cannot fire inside
+ *    one batch (kvprintf formats into 1024 bytes, console_write chunks
+ *    64).  The paths that halt before the timer ever starts (panic, the
+ *    kernel_spawn failure loop) flip the surface themselves for the
+ *    same reason. */
 #define FB_PRESENT_TICKS  2    /* HZ=100 -> a dirty box shows within 20 ms */
-#define FB_PRESENT_CHARS 1024  /* pre-timer coalescing, see above */
+#define FB_PRESENT_CHARS 1024  /* unlocked-output backstop, see above */
 
 static volatile u8 fb_dirty;    /* a present is owed: the box below is live */
 static u64 fb_last_present;     /* jiffies of the last present */
@@ -468,17 +478,31 @@ void fb_flip(void)
 
 int fb_double_buffered(void) { return fb_back != NULL; }
 
-/* Called by the console after every character.  Once the timer runs,
- * presenting is the tick's job (fb_tick_flush) -- this returns, and the
- * copy happens in the BSP's timer handler instead of in whatever context
- * happened to print the byte: an ISR, another CPU, an IRQ-off section.
- * Only before the first tick, when no tick is coming at all, does the
- * console present itself, and then only once per FB_PRESENT_CHARS
- * characters (a good fraction of a screenful). */
+/* The gate on every console-initiated present: before the first tick
+ * jiffies and fb_last_present are both 0, so the printer owns the screen;
+ * from the first tick on they differ and fb_tick_flush() owns it -- a copy
+ * must not land in whatever context printed the byte (an ISR, another
+ * CPU, an IRQ-off section). */
+static bool fb_present_wanted(void)
+{ return fb_back && fb_dirty && jiffies == fb_last_present; }
+
+/* End of a console write batch -- console_out_unlock() calls this, so
+ * kvprintf and each 64-byte console_write chunk end with it.  Before the
+ * first tick this is the present clock: one printed message = one frame,
+ * and a message waiting out a silent stretch (a disk read) is already on
+ * screen instead of stuck behind the next character. */
+void fb_console_flush(void)
+{
+    if (fb_present_wanted()) fb_flip();
+}
+
+/* Backstop for output that does not cross the console lock (panic and the
+ * init replay flip themselves).  Called after every character; the counter
+ * resets on each present, and a batch is always shorter than the count,
+ * so in the locked paths fb_console_flush() presents and resets first. */
 static void fb_present_due(void)
 {
-    if (!fb_back || !fb_dirty) return;
-    if (jiffies != fb_last_present) return; /* a tick owns it from here */
+    if (!fb_present_wanted()) return;
     if (++fb_chars_since < FB_PRESENT_CHARS) return;
     fb_flip();
 }

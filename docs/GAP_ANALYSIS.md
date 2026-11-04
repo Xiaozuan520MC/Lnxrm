@@ -8,11 +8,11 @@
 > 已核对的基线：系统调用 41 个（0–40 连续无空洞），其中图形 6 个
 > （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)），
 > 输入 4 个（`kbd_get/inject/info` 34–36、`mouse_get/info` 37–38）加统一队列
-> `input_pop/info` 39–40；ktest 119 cases / 3915 checks（2 skipped，1 条刻意告警）；
+> `input_pop/info` 39–40；ktest 120 cases / 3955 checks（2 skipped，1 条刻意告警）；
 > `make smoke` 205/205（默认 `-smp 2`，`--smp 1` 同数）；`make` 零警告。
 >
-> 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文**只收仍然开放的条目**，
-> 不重排编号；半修的条目在「后果」列注明现状；已关闭的缺陷不复述。
+> 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文主体**只收仍然开放的条目**，
+> 不重排编号；半修的条目在「后果」列注明现状；已关闭的条目一行一条记在第 6 节。
 
 ---
 
@@ -35,7 +35,7 @@
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
 | 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
 | 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 119/3915（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入、统一输入队列四例）、`make smoke` 205/205（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
+| 测试 | 3 | ktest 120/3955（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入、统一输入队列五例）、`make smoke` 205/205（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -220,25 +220,48 @@
 
 一行一项，按依赖顺序排列；括号内引用第 2、3 节的编号。
 
-1. 几行级止血：空文件 `write 0`（C35）、`getdent` 小缓冲忙等（C44）、vnode 泄漏（C40）、写路径访问模式（C41）——已收口（2026-10-25），见已落地段。
-2. 边界与校验：目录游标（C30）、LFN 长度（C31）、FAT 容量（C32/C33）、短名终止符（C34）、MBR 范围与 EBR（C36）——同批收口（2026-10-30），含把目录结束符改回规范字义（0x00 止看 / 0x05 视活记录）与 smoke 伪造盘改造，见溯源段。
-3. 锁与抢占：先 C7（锁外做 I/O），再 C10（请求队列），然后 C62/C4（RR 与队列读），最后 3.6 的内核态抢占与 syscall 关中断——每一步都要有 smoke 兜底。
-4. 验证面：smoke 矩阵化（C68：ISO、内存档位、q35+KVM、双盘）+ 连跑抖动门（OBS-1），再上 CI（3.5）。
-5. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
-6. 内核自身加固：内核 W^X、canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。
-7. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（3.3）。
-8. 驱动收口：AHCI 二选一（补 C49/C51 或标实验性），IDE LBA48（C53）与写后 flush（C55），PCI 配置机制与注释（C56）。
-9. 能力面：`mmap` 家族（3.2）→ COW 与需求分页 → `stat`/时间类 syscall（3.8）→ `pipe`（3.1）。
-10. 暂不做：新子系统、更换文件系统、POSIX 全覆盖、网络栈——上面 1–9 未落地前不加宽度。
+1. 锁与抢占：先 C7（锁外做 I/O），再 C10（请求队列），然后 C62/C4（RR 与队列读），最后 3.6 的内核态抢占与 syscall 关中断——每一步都要有 smoke 兜底。
+2. 验证面：smoke 矩阵化（C68：ISO、内存档位、q35+KVM、双盘）+ 连跑抖动门（OBS-1），再上 CI（3.5）。
+3. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
+4. 内核自身加固：内核 W^X、canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。
+5. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（3.3）。
+6. 驱动收口：AHCI 二选一（补 C49/C51 或标实验性），IDE LBA48（C53）与写后 flush（C55），PCI 配置机制与注释（C56）。
+7. 能力面：`mmap` 家族（3.2）→ COW 与需求分页 → `stat`/时间类 syscall（3.8）→ `pipe`（3.1）。
+8. 暂不做：新子系统、更换文件系统、POSIX 全覆盖、网络栈——上面 1–7 未落地前不加宽度。
 
-> 已落地（供溯源）：C19/C20/C21 — 静默数据损坏三件已于 v0.093 收口：`O_TRUNC` 落盘并释放簇链、写回按目录簇+槽位定位+创建时间戳校验、找不到 dirent 即 `EIO` 并回滚增长。专用 ktest：同名重建的陌生人拒绝（`t_fatfile` 老 stranger 用例）+ 别名碰撞双记录（两个不同 LFN 撞同一个 11 字节 8.3 别名，须手工在磁盘层伪造，常规工具会给第二次冲突自动分配 ~n 尾缀，故该态出现在 2026-10-25 的 `test_alias_collision_writes_stay_their_own` 中）：两文件分别持句柄写入后，磁盘上各记录保留自己的别名/时间戳/大小/簇，FAT 双双 EOC 无交叉。
->
-> 已落地（供溯源）：C16 — `nclus` 已脱离 u32 截断域（2026-10-25）：写需求先经 `fat_write_impl` 的 `off + n` 回卷感知合并，`alloc_chain` 以 `fat_chain_cap_bytes()`（`MIN(FAT_CHAIN_MAX_STEPS, data_clusters) × cluster_size`）为上界，越界需求**先拒绝 `ENOSPC`、零分配**（不做无声短写，也不把整个空闲池订给一条写不到达的链）；拒绝语义不新增 ABI 面（沿用既有 `LNXRM_ENOSPC`）。ktest `test_write_demand_past_the_volume_is_refused`：cap 偏移与 `off+n` 环绕两种写均拒收，拒绝前后空闲簇数不变，记录仍空。
->
-> 已落地（供溯源）：C35/C40/C41/C44 — P2 几行级止血四件（2026-10-25）：C35 `write(buf, 0)` 直接返回 0（空文件不再把"没有簇"误报成 `EIO`，ktest `test_zero_byte_write_is_not_a_fake_disk_full` 顺带断言非空文件零写也不动记录）；C40 普通文件 close 释放**两层**分配——fs 节点（`fs_ops.close_node` 新钩子：FAT `kfree` resolve，initramfs 空操作——`fat_lookup_impl` 每次 open 的 `kmalloc(sizeof(struct resolve))` 从此有归宿）与 vnode 拷贝（`reg_close` 经 refcount 门控恰跑一次），dir_close 同步归还目录的 fs 节点，ktest `test_open_close_leaks_nothing` 用 `kheap_used_bytes()` 证明开合往返**字节逐个归还**（首个开合先行预热查找缓存）；C41 访问位真正生效（`O_RDONLY` 拒写、`O_WRONLY` 拒读，皆 `EBADF`）且 `O_APPEND` 落在 fs **实时** size 上——`fs_ops.size` 新钩子（FAT 重读槽位 dirent、initramfs 返回静态 size），不采用打开时刻的陈旧快照，ktest `test_access_mode_and_append` 用差分断言（pos 归零后再写必须读到 `A\nB\n`，被无视的 O_APPEND 会写出 `B\n`）；C44 getdent 缓冲装不进一条记录即回 `EINVAL`（0 上限照拒，忙等源头消灭，ktest `test_getdent_small_buffer_refused` 并验证 72 字节单条可取）。`O_WRONLY/O_RDWR/O_APPEND` 三个位自此有正式定义（`include/sys/vfs.h`）。
->
-> 已落地（供溯源）：C27 — 脏页与持久化同步（2026-10-25）：崩溃窗口从「最多丢 64 扇区（32 KiB）」收窄到「自上次同步以来写过的扇区」。三道门共用一个 `blk_cache_sync_all()`（扫全部 64 槽，写回每个脏扇区；写回失败保持脏——丢唯一拷贝才是错，最后一个错误上抛）：**定时**（BSP tick 每秒 `blk_cache_tick`，刻意在 panic 期与 `current == NULL` 时静默——boot 自测全程无任务且计时器晚于 ktest 才启动，计数断言保持确定性）、**close**（普通文件最后一个 fd 关闭即同步；目录/字符设备无数据不触发）、**panic**（`blk_cache_sync_all_try()` + 新增 `spin_trylock_irqsave`：panic 路径对其持有的任何锁都不等待，仍能走到 `hlt`——丢字节换死锁才是真损失）。新增 `SYS_sync`（33 号，按紧凑表规则在末尾追加，`LNXRM_SYSCALL_LAST` 同步调至 33；编译期守护自动覆盖），userland `userland/lib/ulib.h` 增 `ksync()`，systest 走 `sync.ret=0` 冒烟。ktest `test_sync_hands_dirty_sectors_to_the_device`（t_cache）：新鲜 mkfs 上先经驱动层直读证明暂存扇区尚未落盘，一次 sync 后写回/设备写计数 ≥1 且直读与暂存逐字节相同（实测 2 次写回 = 数据扇区 + dirent），二次 sync 写回/设备写计数零增长。
 
-> 已落地（供溯源）：C17/C23/C29/C38 — 同批收口：LFN 读路径整段清零 + 校验和/序号连续性校验（C17）；`bps == CACHE_SECTOR_SIZE` 锚定在挂载层（C29，两条 512 字节栈缓冲不变量由此成立）；BPB 三项校验 55AA / `"FAT32"` / 簇因子 2 的幂（C38）；目录"可用槽"判定统一为 0x00 尾槽 + 0xE5 已删除（该批时的判断里 0x05 还被当作"认领时前移的结束标记"，已在边界批次改回规范字义，见下条），条目槽不足时先扩展目录链再落位，且永不吃掉目录末槽（保住终止符，C23）。
->
-> 已落地（供溯源）：C30/C31/C32/C33/C34/C36 — 边界与校验批次（2026-10-30）：getdent 游标改成 `(簇<<32)|字节偏移` 的物理恢复点（`DIRIT_START=0`、`DIRIT_END=(u64)-1`，`include/fat32.h`），引擎按扇区步进、整簇级跳过零设备读，一整条 readdir 的扇区查找计数 ≈ 链内扇区数 + 条目数（实测 `dir 3 clusters, one walk = 39 lookups (bound 46)`，ktest 直测走查找计数）；LFN 拼接缓冲 260 字符 + 终止符（C31）；卷 FAT 表项数用 u64 计数、>2^28 直接在挂载前拒绝并在日志里点名几何（`[fat32] reject …`，设备恰发一个扇区 = BPB，C32）；`max_cluster` 改独占上限使最末 FAT 格可达且链尾可读（C33）；`resolve` 全对象清零 + 名字逐字节拷贝带终止符（C34）；MBR/EBR 解析期校验每个表项 `lba+count <= 盘容量` 后才收录，EBR 链真正遍历（逻辑分区 + 相对前向链接，上限 32 段，C36）。同批把目录结束符改回规范字义：**0x00 止看**（尾槽之后的残留字节再也浮不出伪记录）、**0x05 是活记录**（它是规范里 8.3 别名对 0xE5 的转义，而 LFN 第五片的首字节恰是序号 5——旧字义会把 20 片长名在第五片拦腰截断）；`fat_chain_advance` 增单簇自环即断 + `chain loop` 告警。ktest：`t_fatfile` C30 游标一次走（SET 断言 + 查找计数 + 5 条手工续走）、C31 二十片长名、C32/C33 伪造盘容量、C34 中毒名终止；`t_mbr` C36 签名 + 范围/EBR 链两例。smoke 阶段 6 相应改造：伪造对象改为**文件数据链**（正确的目录扫描本就止于 0x00，旧的目录链伪造在新语义下根本不会被跟随），自环判据加收新的 `chain loop` 行。`fat_warns` 是**每个挂载**独立预算（16 条封顶后静默）：ktest 各 mount 与真实 root 互不挤兑，阶段 6 guest 的 root 只为损坏报告花 1 条。
+---
+
+## 6. 已收口条目
+
+本文已关闭的 C 编号，一行一条，只记结论；实现细节看对应 ktest 用例与 git log。
+
+### 2026-10-25 批次
+
+- **C16** 写需求超卷：`fat_chain_cap_bytes()` 作上界，越界先拒 `ENOSPC`、零分配。
+- **C17** LFN 读路径整段清零 + 校验和 / 序号连续性校验。
+- **C19/C20/C21** 静默数据损坏三件：`O_TRUNC` 落盘并释放簇链；写回按目录簇+槽位定位+时间戳校验；找不到 dirent 即 `EIO` 并回滚。
+- **C23** 目录槽不足先扩链再落位，永不吃目录末槽（保住终止符）。
+- **C27** 脏页三道同步门（每秒 tick / 最后 fd close / panic try 回写）+ `SYS_sync(33)`；崩溃窗口收窄到「上次同步以来写过的扇区」。
+- **C29** `bps == 512` 锚定在挂载层（两条 512 字节栈缓冲的不变量）。
+- **C35** `write(buf, 0)` 返回 0，空文件不再把"没有簇"误报成 `EIO`。
+- **C38** BPB 三项校验：55AA / `"FAT32"` / 簇因子 2 的幂。
+- **C40** close 释放两层分配：`fs_ops.close_node`（FAT kfree resolve）+ vnode 拷贝。
+- **C41** 访问位生效（`O_RDONLY` 拒写、`O_WRONLY` 拒读 → `EBADF`），`O_APPEND` 落在实时 size（`fs_ops.size`）。
+- **C44** getdent 缓冲装不下一条记录即 `EINVAL`，忙等源头消灭。
+
+### 2026-10-30 边界与校验批次
+
+- **C30** getdent 游标 = `(簇<<32)|字节偏移` 物理恢复点，引擎按扇区步进。
+- **C31** LFN 拼接缓冲 260 字符 + 终止符。
+- **C32** FAT 表项数用 u64，`>2^28` 挂载前拒绝并在日志点名几何。
+- **C33** `max_cluster` 改独占上限，最末 FAT 格可达、链尾可读。
+- **C34** `resolve` 全对象清零 + 名字逐字节拷贝带终止符。
+- **C36** MBR/EBR 表项 `lba+count <= 盘容量` 才收录，EBR 链真正遍历（上限 32 段）。
+- 目录结束符回归规范字义：**0x00 止看**、**0x05 是活记录**（8.3 别名对 0xE5 的转义）；`fat_chain_advance` 单簇自环即断 + `chain loop` 告警。
+
+### 2026-11-03 批次
+
+- **FAT 表分帧驻留**：每帧 4 KiB `pmm_alloc` + 128 KiB bounce 散射读；挂载上限从「kmalloc 4 MiB 连续块」变为「全部空闲帧」，硬上限仍是 2^28 入口（1 GiB 表）。分配器回基线（`MAX_ORDER 11`、kmalloc 4 MiB）。
+- **`sched_wake_task` 自死锁**：原实现持 `runq_lock` 再调 `runqueue_add`（内部再拿同一把锁）→ 对齐 `send_signal` 的免锁写法。
+- **ktest `t_input` waitlist**：用例开头补 `evq_drain()`（t_mouse 生产者路径把共享队列灌满）。

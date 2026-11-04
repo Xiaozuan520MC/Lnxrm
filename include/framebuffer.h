@@ -129,6 +129,10 @@ void fb_poke_back_px(u32 x, u32 y, u32 raw);
 /* framebuffer text console (mirrors VGA text mode) */
 void fb_console_init(void);
 void fb_console_putc(char c);
+/* End of a console write batch: called from console_out_unlock() so each
+ * printed message becomes one frame before the first timer tick.  No-op
+ * once ticks own presenting (see framebuffer.c). */
+void fb_console_flush(void);
 /* Cursor and grid of the frame buffer console, for the boot self-test.
  * Any pointer may be NULL. */
 void fb_console_get(int *row, int *col, int *rows, int *cols);

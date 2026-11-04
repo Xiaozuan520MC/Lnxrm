@@ -4,6 +4,7 @@
 #include <io.h>
 #include <sys/spinlock.h>
 #include <disk.h> /* C27: the panic door flushes staged sectors */
+#include <framebuffer.h> /* console_out_unlock ends each batch with fb_console_flush() */
 
 /* Serialize all console output (kprintf AND console_write) across CPUs.
  * Exported via console_out_lock/unlock: console_write in vfs.c shares it,
@@ -14,15 +15,21 @@
 static spinlock_t print_lock = SPINLOCK_INIT;
 
 void console_out_lock(u64 *flags) { spin_lock_irqsave(&print_lock, flags); }
-void console_out_unlock(u64 flags) { spin_unlock_irqrestore(&print_lock, flags); }
+void console_out_unlock(u64 flags)
+{
+    /* Batch boundary: every locked console write (kvprintf, each 64-byte
+     * console_write chunk) ends here, and before the first timer tick this
+     * is the only present clock -- one printed message, one frame.  After
+     * the first tick fb_console_flush()'s gate hands presenting back to
+     * fb_tick_flush, so the copy stays in the timer handler. */
+    fb_console_flush();
+    spin_unlock_irqrestore(&print_lock, flags);
+}
 
 /* VGA text console at the high alias; COM1 via drivers/uart.c. */
 extern void lnxrm_uart_init(void);
 extern void lnxrm_uart_putc(char c);
 extern int lnxrm_uart_trygetc(void);
-
-/* framebuffer console */
-#include <framebuffer.h>
 
 #define VGA_COLS 80
 #define VGA_ROWS 25
