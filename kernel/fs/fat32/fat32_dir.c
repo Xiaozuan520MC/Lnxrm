@@ -325,7 +325,9 @@ static int scan_iter_cb(const char *name, const struct fat_dirent *e, u32 dirclu
  * next call re-reports instead of claiming a clean end. */
 int fat_dir_iter(struct dir_iter *it, struct dirent_out *d)
 {
-    struct fat_mount *m = fat_priv;
+    /* C39: the mount travels with the iterator file_alloc() built, so a
+     * second mount of the same volume walks its own FAT, not "the" one. */
+    struct fat_mount *m = it->mnt_data;
     struct resolve *r = it->node;
     u32 dc = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
     u64 resume = it->cookie;
@@ -361,8 +363,7 @@ int fat_dir_iter(struct dir_iter *it, struct dirent_out *d)
 /* 4-arg wrapper matching fs_ops->getdent signature */
 int fat32_getdent_impl(void *mnt, void *dirnode, u64 *cookie, struct dirent_out *d)
 {
-    (void)mnt;
-    struct dir_iter it = {.node = dirnode, .cookie = *cookie};
+    struct dir_iter it = {.node = dirnode, .cookie = *cookie, .mnt_data = mnt};
     int r = fat_dir_iter(&it, d);
     *cookie = it.cookie;
     return r;

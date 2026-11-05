@@ -23,4 +23,13 @@ struct kblk *kblk_make(const char *name, u64 sectors, u32 backed);
 u8 *kblk_sector(struct kblk *k, u64 lba);
 void kblk_free(struct kblk *k);
 
+/* A boot sector fat_mount() accepts: 512 B/sector, `spc` sectors per
+ * cluster (power of two), `reserved` reserved sectors (the journal lives in
+ * 8..reserved-1), `numfats` FATs of `fatsz32` sectors, `totsec` sectors all
+ * in and `rootclk` as the root directory cluster.  Everything the driver
+ * does not read stays zero, which is what makes a forged volume's root
+ * directory read back as empty. */
+void kblk_forge_fat32_bpb(u8 *s, u32 spc, u32 reserved, u32 numfats, u32 fatsz32,
+                          u32 totsec, u32 rootclk);
+
 #endif

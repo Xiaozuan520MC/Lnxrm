@@ -340,8 +340,13 @@ void start_kernel(void)
     extern void ide_init(void);
     ide_init();
     ahci_init();
+    /* C51: three outcomes, and they are not two -- a disk that mounted but
+     * carries no /bin/init is placed at /mnt..., which is neither "we boot
+     * from this" nor "there is no disk". */
     if (vfs_try_mount_disk() == 0)
         kprintf("[vfs] disk mounted at /\n");
+    else if (vfs_data_volume_ready())
+        kprintf("[vfs] only data volumes mounted (no disk carries /bin/init)\n");
     else
         kprintf("[vfs] no disk found\n");
 

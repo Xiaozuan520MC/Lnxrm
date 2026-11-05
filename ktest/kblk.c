@@ -59,6 +59,22 @@ u8 *kblk_sector(struct kblk *k, u64 lba)
     return k->data + lba * 512;
 }
 
+void kblk_forge_fat32_bpb(u8 *s, u32 spc, u32 reserved, u32 numfats, u32 fatsz32,
+                          u32 totsec, u32 rootclk)
+{
+    memset(s, 0, 512);
+    s[0] = 0xEB, s[1] = 0x3C, s[2] = 0x90;
+    *(u16 *)&s[11] = 512;
+    s[13] = (u8)spc;
+    *(u16 *)&s[14] = (u16)reserved;
+    s[16] = (u8)numfats;
+    *(u32 *)&s[32] = totsec;
+    *(u32 *)&s[36] = fatsz32;
+    *(u32 *)&s[44] = rootclk;
+    *(u16 *)&s[510] = 0xAA55;
+    memcpy(&s[82], "FAT32", 5);
+}
+
 void kblk_free(struct kblk *k)
 {
     if (!k) return;

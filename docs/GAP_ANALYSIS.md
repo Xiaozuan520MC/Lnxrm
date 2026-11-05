@@ -5,10 +5,10 @@
 > **与一个稳健内核之间的能力差距**、**先修什么**。
 > 构建与运行见 BUILD.md；代码结构、文件清单与特性介绍见 CODEBASE.md。
 >
-> 已核对的基线：系统调用 41 个（0–40 连续无空洞），其中图形 6 个
+> 已核对的基线：系统调用 42 个（0–41 连续无空洞），其中图形 6 个
 > （`fb_info` / `fb_clear` / `fb_fill` / `fb_char` / `fb_puts` + `fb_flip`(32)），
-> 输入 4 个（`kbd_get/inject/info` 34–36、`mouse_get/info` 37–38）加统一队列
-> `input_pop/info` 39–40；ktest 120 cases / 3955 checks（2 skipped，1 条刻意告警）；
+> 输入 5 个（`kbd_get/inject/info` 34–36、`mouse_get/info` 37–38）加统一队列
+> `input_pop/info` 39–40 与阻塞 `input_wait` 41；ktest 127 cases / 4054 checks（q35，2 skipped；pc 4032/3 skipped，`ahci` 无设备即 skip；1 条刻意告警）；
 > `make smoke` 205/205（默认 `-smp 2`，`--smp 1` 同数）；`make` 零警告。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文主体**只收仍然开放的条目**，
@@ -28,14 +28,14 @@
 | 进程与信号 | 3 | `fork/execve/wait4/brk/kill`、`sigaction/sigprocmask/sigreturn`、`parent` 存 (pid, 世代) 并经 `task_parent()` 解析；无 CPU 时间限制 |
 | 调度 | 3 | 每 CPU 运行队列、按空闲/队列长度的负载均衡、每 CPU 本地 LAPIC tick；队列实为 push-front LIFO（C62）、内核态不可抢占、无优先级/nice |
 | SMP | 3 | ACPI MADT 枚举 + xAPIC/x2APIC 双路访问、AP 本地时钟与共享标定；全局锁 + 轮询 I/O 使延迟敏感场景不可用 |
-| 系统调用 / ABI | 3 | 41 个编号（0..40）全部实现，用户指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；缺 `mmap`/时间类/`stat`/`pipe` |
+| 系统调用 / ABI | 3 | 42 个编号（0..41）全部实现，用户指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；缺 `mmap`/时间类/`stat`/`pipe` |
 | 并发正确性 | 2 | 终端打印锁、任务表锁、fd 引用计数、console 多等待者链表已就位；仍有跨设备 I/O 的两层 irqsave（C7/C10）、`pick_next` 无锁读（C4） |
-| 设备驱动 | 2 | PS/2 键盘与鼠标中断驱动（IRQ1→键盘环、IRQ12→aux 事件环，串口 RX 中断已接）、AHCI 走 DMA + `clflush`/`mfence` + UC 映射、完成判定补查 `PxTFD.ERR`；AHCI/IDE 纯轮询无中断（C49）、多盘只注册第一块（C51），IDE 无 LBA48 命令（C53） |
-| 文件系统 | 3 | FAT32 + on-disk redo journal（mount 时 replay，`ktest/t_journal.c`）+ 时间戳 LRU 块缓存 + 簇链步数预算；边界批次已收口（目录游标 C30、LFN 260 字符 C31、FAT 容量拒绝 C32、末条目可达 C33、短名终止符 C34、MBR 范围与 EBR 链 C36），目录结束符同时改回规范字义（0x00 止看，0x05 是别名转义/活记录）；vnode 泄漏（C40）已修；剩 mount 数据下传（C39）与分区注册（C28） |
+| 设备驱动 | 3 | PS/2 键盘与鼠标中断驱动（IRQ1→键盘环、IRQ12→aux 事件环，串口 RX 中断已接）、AHCI 走 DMA + `clflush`/`mfence` + UC 映射、完成判定补查 `PxTFD.ERR`；**AHCI 中断驱动**（`GHC_IE` + PxIM + `ahciIsr`，命令经完成中断回执，`issueCmd` 保留超时轮询兜底）、**IDE LBA48**（`0x24/0x34` EXT，`>0xFFFFFFFFFFFF` 拒）、**多盘注册与挂载分流**（有 `/bin/init` 的盘挂 `/`、没有的挂 `/mnt`）均收口（C49/C51/C53）；剩 PCI 配置机制按总线选择（C56） |
+| 文件系统 | 3 | FAT32 + on-disk redo journal（mount 时 replay，`ktest/t_journal.c`）+ 时间戳 LRU 块缓存 + 簇链步数预算；边界批次已收口（目录游标 C30、LFN 260 字符 C31、FAT 容量拒绝 C32、末条目可达 C33、短名终止符 C34、MBR 范围与 EBR 链 C36），目录结束符同时改回规范字义（0x00 止看，0x05 是别名转义/活记录）；vnode 泄漏（C40）已修；挂载层收口（C28/C39/C43/C47：分区入 `diskinfo`、ops/priv 成对下传、最长前缀多挂载与 `umount`、close 引用计数不回绕） |
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
 | 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；受 `mmap` 缺失制约无法动态链接，跑不了第三方软件 |
 | 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 120/3955（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入、统一输入队列五例）、`make smoke` 205/205（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
+| 测试 | 3 | ktest 127/4054（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入、统一输入队列五例、AHCI 中断自测与多盘挂载分流）、`make smoke` 205/205（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -55,38 +55,20 @@
 | C10 | `include/sys/vfs.h` `struct blkdev`；`ide.c` / `ahci.c` 设备锁 | 块设备只有全局锁，无请求队列、无合并、无取消：并发磁盘访问完全串行且不可中断 | 多 slot 请求队列 + 每设备锁，约 300 行 |
 | C62 | `kernel/sched/sched.c` `runqueue_add`（插队首）、`include/sys/percpu.h` | 队列是 push-front（注释已如实描述为 LIFO），持续争用下短任务可能被长队列饿死；无亲和性 API | 队尾指针 + 尾插 + 公平性用例，约 20 行 |
 
-### 2.2 存储与文件系统
+### 2.2 设备驱动
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
-| C28 | `kernel/fs/vfs.c:660`；`kernel/fs/mbr.c` | 分区设备从不 `blk_register`，`diskinfo` 看不到分区；`blk_count` 满 8 之后新设备进不了 `blk_list` 却仍会顶掉 `blk_first` | 分区注册 + 满槽一致处理，约 1 天 |
-| C39 | `kernel/fs/fat32/fat32_file.c:15,32` | vnode 的 `mnt_data` 仍是 `(void*)1` 哨兵，`fat_freespace` 没有调用者：mount 间接层是装饰，多挂载没有基础 | 挂载数据真正下传（与 C47 一起做），约 2 天 |
-
-### 2.3 VFS 与文件语义
-
-| 编号 | 位置 | 后果 | 修法与量级 |
-|---|---|---|---|
-| C43 | `kernel/fs/vfs.c:293-298` | `vfs_close_file` 对 refcnt 没有下溢保护，完全依赖 `sys_close` 先清 fd 槽这条调用序 | 饱和判断 + 断言，几行 |
-| C47 | `kernel/fs/vfs.c:19,45-98,704` | 挂载表只注册过一个 `"/"`，`fs_for_path` 的"无前导斜杠"分支不可达：多挂载与卸载路径从未运行 | 第二挂载点 + `umount` + 用例，约 1 天 |
-
-### 2.4 设备驱动
-
-| 编号 | 位置 | 后果 | 修法与量级 |
-|---|---|---|---|
-| C49 | `kernel/drivers/ahci.c`（`GHC_ARE`，无 `GHC_IE` / MSI / ISR） | AHCI 纯轮询：每条命令在 irqsave 锁里自旋等完成，多核下与 C7 相互放大 | 中断路径（`P_IE`、`HBA.IS` 排空、ISR）约 1 周；或把 AHCI 标为实验性、默认只走 IDE，约 1 小时 |
-| C51 | `kernel/drivers/ahci.c:694-716,959` | **半修**：ABAR 已映射 8 KiB、容量读不出即拒绝注册；仍未校验 BAR 类型（假定 64-bit memory BAR）、不拒 `abar == 0`，且第一块盘注册后 `return 1` —— 多盘只认一块、盘名硬编码 `sda` | BAR/`abar` 校验 + 多盘注册，约 1 天 |
-| C53 | `kernel/drivers/ide.c` | **半修**：容量按 48 位 IDENTIFY 读、LBA28 超界回 `EFAIL`；`READ/WRITE SECTORS EXT`(0x24/0x25) 未实现，>128 GiB 盘仍读不到 | 补 EXT 命令路径，约 1 天 |
-| C55 | `kernel/drivers/ide.c:54-61,126-127` | 写路径的"flush"只等 DRDY：不发 `0xE7` CACHE FLUSH 且忽略返回值，断电时盘内写缓存可能丢失；`ide_wait_ready` 仍不判 `IDE_SR_ERR`（有意保留：发命令前判错会把上一条的 ERR 变成死等，错误已由命令后的 `ide_wait_drq` 兜住） | 写后发 `0xE7` 并检查返回，约 30 行 |
 | C56 | `kernel/drivers/pci.c`（文件头注释、`:37-38`） | **半修**：visited 位图 + `PROBE_MAX_DEPTH 16` 已加；`0xCF8/0xCFC` 对所有总线拼同一 type-1 地址，而该机制只对 bus 0 有架构保证；文件头注释仍写"既无 visited 也无深度限制"，与紧邻的实现矛盾 | 按总线选择配置机制 + 改注释，半天 |
 
-### 2.5 内存
+### 2.3 内存
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
 | C57 | `include/mm/mm.h` `PMM_WINDOW_TOP`；`kernel/mm/pmm.c:24,139-146` | 位图从固定物理 0x10000 顺序排布：管理窗口一旦再扩大，位图会撞上 `arch/entry64.S` 固定在 0x50000 的页表；这是个只写在注释里的隐式依赖 | 位图范围随窗口一起核算或搬移 + 断言，半天 |
 | C61 | `kernel/mm/vmm.c:57-84` | **半修**：已检查既有 PTE 并只做放宽（不再覆盖），原问题基本关闭；`invlpg` 仍打在当前 AS 而非目标 root，目标不是当前 AS 时刷新无效 | 目标为当前 AS 才 invlpg，或把刷新交给调用方，几行 |
 
-### 2.6 引导与架构
+### 2.4 引导与架构
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
@@ -96,11 +78,11 @@
 | C69 | `kernel/mm/pmm.c:96-112` | 只用单个最大 E820 区，且每区钳到 `PMM_WINDOW_TOP`（2 GiB）：其余 RAM 完全不参与分配 | 合并全部区域 + 分段别名，约 2 天 |
 | C70 | `arch/entry64.S:4-7` | 固定物理 0x50000–0x57000 的页表从不与 E820 校验冲突 | 启动早期校验并拒绝冲突布局，约 20 行 |
 
-### 2.7 未定位的观察项
+### 2.5 未定位的观察项
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
-| OBS-1 | `ktest/t_cache.c` `test_write_readback_is_coherent`；`userland/sh`；2026-10-21 一次连跑 | 历史各出现一次失败（伴随 FAT/dir `I/O error`；用户态一次性 `#UD`），重跑通过。其中 I/O 类的常见根因已定位并修掉：IDE 轮询预算（旧 10 万次 port read）短于 QEMU 在 vCPU 线程同步落宿主盘时的 BSY 保持，正常命令被判 EIO（改 `IDE_POLL_ITERS`，旧预算 A/B 必现）；修后连跑 16/17 全绿，余 1 次（3 用例 5 断言，伴 fs 用例整段 skip）未复现；`#UD` 仍未复现 | 连跑 N 次的抖动门 + 失败时保存串口现场，约 1 天 |
+| OBS-1 | `ktest/t_cache.c` `test_write_readback_is_coherent`；2026-10-21 一次连跑 | 历史出现过一次失败（伴随 FAT/dir `I/O error`），重跑通过。I/O 类根因已定位并修掉：IDE 轮询预算（旧 10 万次 port read）短于 QEMU 在 vCPU 线程同步落宿主盘时的 BSY 保持，正常命令被判 EIO（改 `IDE_POLL_ITERS`，旧预算 A/B 必现）；修后连跑 16/17 全绿，余 1 次（3 用例 5 断言，伴 fs 用例整段 skip）未复现 | 连跑 N 次的抖动门 + 失败时保存串口现场，约 1 天 |
 
 ---
 
@@ -166,7 +148,7 @@
 | 全局锁跨 I/O（C7、C10） | 任一核持锁期间其他核关中断自旋 | 见 2.1 |
 | 内核态不可抢占 | `sched_maybe_preempt`（`kernel/sched/sched.c:297-309`）只对 ring-3 与 idle 生效：内核态长临界区拖住整核 | 抢占点 + 重入审计，约 1–2 周 |
 | LIFO 队列与无优先级（C62） | 无真正 RR、无 nice/实时类、无亲和性接口 | 见 2.1 |
-| 轮询块 I/O（C49） | AHCI/IDE 都是轮询 + 全局锁，磁盘延迟直接进关键路径 | 见 2.4 |
+| 轮询块 I/O | AHCI 已中断驱动（C49 收口），但 IDE 仍轮询 + 全局锁（C7/C10），磁盘延迟直接进关键路径 | 见 2.1 |
 
 ### 3.7 可观测性
 
@@ -195,11 +177,8 @@
 
 | 缺口 | 影响 | 量级 |
 |---|---|---|
-| 分区设备可见性（C28） | `diskinfo` 与挂载看不到分区 | 见 2.2 |
-| 块请求队列 / 合并 / 中断 I/O（C10、C49） | 串行、轮询、不可取消 | 见 2.1 与 2.4 |
-| IDE LBA48 命令（C53） | >128 GiB 盘读不到 | 见 2.4 |
-| AHCI 定位决策 | 完成判定、缓存一致性、FLUSH CACHE 已到位，余下 C49/C51 | 二选一：补中断与多盘（约 1 周），或标实验性、默认只走 IDE（约 1 小时） |
-| `umount` 与显式同步 | 卸载只能靠 journal 提交点，没有用户可见的落盘边界 | 约 1 天 |
+| 块请求队列 / 合并（C10） | 串行、不可取消（AHCI 已中断驱动、IDE 仍轮询 + 全局锁） | 见 2.1 |
+| 用户可见的挂载 / 卸载 | 内核侧已有 `vfs_mount_fs`/`vfs_umount`/`vfs_free_space` 并有 ktest 钉点，但用户态没有 umount、也读不到挂载表（ABI 冻结，本批未加 syscall） | 若要暴露成 syscall，约 1 天 |
 
 ---
 
@@ -209,7 +188,7 @@
 |---|---|---|
 | 跑自己写的 `userland/` 程序 | 安全 | `sigreturn` 恢复内核保存的帧（不读用户栈，CS/SS 不经用户之手）；ELF 装载七项校验；syscall 指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；表外编号回 `ENOSYS`；用户态异常只杀进程；`kprintf` 格式串全是字面量且无 `%n` |
 | 跑不完全信任的用户程序 | 不安全 | 权限止于 `uid` + 3 个能力位（无 gid / 文件属主 / CPU 限额 / 沙箱）；内核全程关中断加一把全局 FS 锁，一个 bug 可拖死整机；内核镜像可写可执行、无栈保护、无 KASLR |
-| 挂载可信磁盘 | 基本安全 | on-disk redo journal + mount replay，故障注入覆盖提交点前后两个窗口，块缓存时间戳 LRU，簇链有步数预算；静默损坏三件已修（C19/C20/C21：`O_TRUNC` 落盘、写回按槽位定位、找不到 dirent 即 EIO 回滚）；vnode 泄漏（C40）已修；脏页三道同步门已就位（C27：BSP tick 每秒 / 普通文件 close / panic try 回写，外加 `SYS_sync(33)`；崩溃窗口从 32 KiB 收窄到「上次同步以来写过扇区」） |
+| 挂载可信磁盘 | 基本安全 | on-disk redo journal + mount replay，故障注入覆盖提交点前后两个窗口，块缓存时间戳 LRU，簇链有步数预算；静默损坏三件已修（C19/C20/C21：`O_TRUNC` 落盘、写回按槽位定位、找不到 dirent 即 EIO 回滚）；vnode 泄漏（C40）已修；脏页三道同步门已就位（C27：BSP tick 每秒 / 普通文件 close / panic try 回写，外加 `SYS_sync(33)`；崩溃窗口从 32 KiB 收窄到「上次同步以来写过扇区」）；路由与挂载本身也收口了（C39/C47：ops/priv 成对下传、最长前缀匹配、第二挂载点与 `umount` 有 ktest 钉点；C28：分区与满槽处理一致，`diskinfo` 看得到每个分区）；C55 让 IDE 写路径也以 `0xE7` CACHE FLUSH 收尾并检查返回，落盘承诺不再只是轮询 DRDY |
 | 挂载不可信或可能损坏的磁盘 | 不安全 | 簇链步数预算（`FAT_CHAIN_MAX_STEPS`）+ 单簇自环即断（本批新增）拦住坏链挂钩；BPB 三项校验（55AA / `"FAT32"` / 簇因子 2 的幂）、目录游标（C30）、LFN 长度（C31）、FAT 容量（C32/C33）、短名终止符（C34）、MBR 范围与 EBR 链（C36）、目录结束符回归规范字义（0x00 止看，尾槽后的残留字节浮不出伪记录）均已收口；仍不安全是因为有界长走持 irqsave 锁、无 checksum、目录条目内容仍逐扇区信任读回 |
 | 硬件缓解 | 已开但不完整 | `EFER.NXE`、`CR0.WP`、`CR4.WP`、`SMEP`、`SMAP` 全部置位，BSP 与 AP 都走 `cpu_protect_init()`，启动日志打印 `EFER.NXE` 并有 ktest 钉点；缺 KASLR、KPTI、canary、内核 W^X、IST |
 | 横向定位 | 与 `xv6` 同档 | 同为简单权限模型、同无 KASLR；`sigreturn`、ELF 解析、`copy_user` 三处比常见教学实现更严谨 |
@@ -225,7 +204,7 @@
 3. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
 4. 内核自身加固：内核 W^X、canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。
 5. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（3.3）。
-6. 驱动收口：AHCI 二选一（补 C49/C51 或标实验性），IDE LBA48（C53）与写后 flush（C55），PCI 配置机制与注释（C56）。
+6. 驱动收口：PCI 配置机制按总线选择与注释（C56）；AHCI 中断/多盘、IDE LBA48 已收口（C49/C51/C53）。
 7. 能力面：`mmap` 家族（3.2）→ COW 与需求分页 → `stat`/时间类 syscall（3.8）→ `pipe`（3.1）。
 8. 暂不做：新子系统、更换文件系统、POSIX 全覆盖、网络栈——上面 1–7 未落地前不加宽度。
 
@@ -259,6 +238,24 @@
 - **C34** `resolve` 全对象清零 + 名字逐字节拷贝带终止符。
 - **C36** MBR/EBR 表项 `lba+count <= 盘容量` 才收录，EBR 链真正遍历（上限 32 段）。
 - 目录结束符回归规范字义：**0x00 止看**、**0x05 是活记录**（8.3 别名对 0xE5 的转义）；`fat_chain_advance` 单簇自环即断 + `chain loop` 告警。
+
+### 2026-11-04 挂载与设备批次
+
+- **C28** 分区在尝试挂载前就 `blk_register` 进 `diskinfo`（扩展分区除外）；`blk_register` 改回 0/`EFAIL`，满 8 槽大声拒绝并保持表不变；`blk_first` 删除，挂载改「第一个能挂上的设备」；注册表所有权归 `blk_list`，失败挂载不再留下悬空指针。
+- **C39** 挂载数据真正下传：`fs_for_path` 返回整条挂载项（ops+priv 成对），`vnode.mnt_data` / `dir_iter.mnt_data` 一律是解析时那条挂载；FAT32 各 `_impl` 改用形参 `mnt`，`(void*)1` 哨兵删除；`fs_ops.freespace` 有了调用者 `vfs_free_space(path)`。
+- **C43** `vfs_close_file` 改 CAS 循环：refcnt ≤ 0 时打 `[vfs] close: refcnt=…` 并忽略，绝不二次 free、计数不回绕。
+- **C47** 挂载表按**最长前缀 + 组件边界**匹配（`"/"` 不再吞掉一切，`/alt` 可达）；新增 `vfs_mount_fs`/`vfs_umount`（sync → 去激活 → 重算 `disk_ready`，共享挂载数据不 free），`vfs_mount_initramfs` 复用同一条卸载路径；跨挂载点 `rename` 回 `EXDEV`。不加 syscall，ABI 冻结。
+- **C55** IDE 写路径收尾改发 `0xE7` CACHE FLUSH 并用 `ide_wait_flush` 检查 BSY/ERR/DRDY，失败打 `[ide] FLUSH CACHE (E7) failed` 回 `EFAIL`（与 AHCI 行为一致）；`ide_wait_ready` 不判 ERR 的既有决定保持。
+- ktest 基线升到 **125 cases / 4033 checks**：新增 `ktest/t_blk.c`（分区注册 + 满槽拒绝）与 `t_vfs.c` 三例（close 饱和、`mnt_data` 下传、第二挂载点各自路由）。
+
+### 2026-11-05 中断 I/O 与容量批次
+
+- **C49** AHCI 中断驱动：`GHC_IE` + 端口 `PxIM` arm + `ahciIsr()` 排空 HBA/端口 IS 并回执；`issueCmd` 在写 `P_CI` **之前**开中断、完成走中断、轮询只作超时兜底（超时 dump TFD/IS/SERR）；`ahciRouteIrq()` 把 INTA 经 IOAPIC 接到 vector 32+line 并 unmask；多盘名 `sd_names[8]`。自测 `ahci_irq_selftest()` + `ktest/t_ahci.c`（无 AHCI 设备即 skip）。
+- **C51** 多盘挂载分流：有 `/bin/init` 的卷挂 `/`，其余盘挂 `/mnt`（`home_volume()`/`find_volume()`，`refresh_root()` 重算根）；`register_mount()` 复用槽位、`vfs_try_mount_one()` 先查 `mounts_active()` 防重复泄漏；分区在尝试挂载前 `blk_register` 入表。
+- **C53** IDE LBA48：`0x24/0x34` EXT 命令，`ide_issue(lba,n,cmd)` 按**最后一个扇区**选 LBA28/LBA48，`last > 0xFFFFFFFFFFFF` 拒绝，首次走 EXT 打 `[ide] LBA48:`。
+- **`#UD` 根因（C49 引爆的既有缺陷）**：`isr_common` 曾把**任何**中断帧发布为 `current->tf`；嵌套在 ring-0（syscall 内）到来的 IRQ 会把它改指向用完即弃的帧，`sys_execve` 随后把 `{rip, ussp}` 写进死帧，`iretq` 用**旧 rip + 新地址空间** → 用户 `#UD`（rip 甚至不是指令边界）。修法：只发布 ring-3 帧（`(f->cs & 3) == 3`），`sys_fork` 的帧拷贝同源受益；q35 连跑 12/12 无复现（修前 5/1、1/1、1/2）。
+- q35 幻影 port 2 区分"无响应"与"被拒绝"并回收 CLB/FIS/CT（`ahciPortReclaim`），boot 就绪 33.8 s → 8.5 s。
+- ktest 基线升到 **127 cases / 4054 checks**：新增 `ktest/t_ahci.c`（中断路由 + 首命令中断完成）与 `t_vfs.c` 多盘分流用例。
 
 ### 2026-11-03 批次
 

@@ -87,12 +87,29 @@ long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3); /* ktest only: dispatch, no 
 long sys_open(const char *path, int flags);
 
 void vfs_init(void);
-int vfs_try_mount_disk(void); /* FAT32 from first block dev -> / */
+/* Place every registered disk volume where C51 puts it: "/" only to one
+ * carrying /bin/init, everything else to /mnt, /mnt2 or /mnt3.  Returns 0
+ * only when "/" got a disk -- a data volume mounted is not that answer
+ * (see vfs_data_volume_ready()). */
+int vfs_try_mount_disk(void);
+/* C51: does any volume answer *below* "/"?  Separates "no disk" from "a
+ * disk, just not one this kernel can spawn /bin/init from". */
+bool vfs_data_volume_ready(void);
 /* Mount the initramfs that `make INITRAMFS=` linked into the kernel image
  * at "/", as a read-only root.  Returns LNXRM_ENOENT when the build carried
  * no archive or the bytes there are not a newc cpio archive -- a build
  * without INITRAMFS= behaves exactly as it did before this existed. */
 int vfs_mount_initramfs(void);
+/* Publish {ops, priv} under `prefix` and take it back out again (C47).
+ * Neither is a syscall -- mounting stays a kernel decision -- but both are
+ * the single implementation the disk probe and vfs_mount_initramfs() share,
+ * so a second mount point is routed the same way and unmounted the same
+ * way.  vfs_umount() answers LNXRM_ENOENT when nothing is mounted there. */
+int vfs_mount_fs(struct fs_ops *ops, void *priv, const char *prefix);
+int vfs_umount(const char *prefix);
+/* Free space of the filesystem owning `path`, in bytes, or a negative LNXRM
+ * error (C39: the one caller that makes fs_ops->freespace real). */
+long vfs_free_space(const char *path);
 /* Does `path` name a file that can be opened for reading?  Telling "the
  * disk mounted" apart from "the disk can boot": a FAT32 data disk with no
  * /bin/init on it mounts perfectly and still cannot start anything. */
@@ -108,7 +125,6 @@ long vfs_open_file(const char *path, int flags, struct file **out);
 size_t vfs_file_size(struct file *f);
 long vfs_read_file(struct file *f, void *buf, size_t n);
 void vfs_close_file(struct file *f);
-extern struct blkdev *blk_first;
 
 long sys_read(int fd, void *buf, size_t n);
 long sys_write(int fd, const void *buf, size_t n);
@@ -156,7 +172,37 @@ struct blkdev {
     int (*write)(struct blkdev *, u64 lba, u32 count, const void *buf);
     void *drv;
 };
-void blk_register(struct blkdev *b);
+/* Capacity of the block registry below.  It is a fixed array rather than a
+ * growable list because nothing ever grows it at runtime: drivers register
+ * at init, partitions at probe, and the count is what diskinfo reports. */
+#define BLK_MAX 8
+
+/* Publish `b` in the block registry that diskinfo enumerates (C28).
+ * Returns 0, or LNXRM_EFAIL when it could not be taken -- the table is a
+ * fixed array, and a full one refuses the newcomer out loud rather than
+ * accepting it and dropping it. */
+int blk_register(struct blkdev *b);
+
+#ifdef CONFIG_KTEST
+/* C28 test support only: move the registry out of the way of a case that
+ * drives blk_register() to capacity, then put it back.  `count`/`at` read
+ * what the registry would hand diskinfo. */
+int blk_registry_take(void);
+void blk_registry_put(void);
+int blk_registry_count(void);
+struct blkdev *blk_registry_at(int i);
+#endif
+
+#ifdef CONFIG_KTEST
+/* C51 test support only (ktest/t_vfs.c).  vfs_root_mount() hands out the
+ * root mount's {ops, priv} so a case can take "/" down and put the very
+ * same volume back.  vfs_probe_home() drives the placement rules against
+ * `bd`: 0 = it became the root, 1 = it took a data prefix, <0 = nothing
+ * mountable, and `mounted` receives the mount object so the case can
+ * release it after unmounting (fs_ops has no release hook). */
+int vfs_root_mount(struct fs_ops **ops, void **priv);
+int vfs_probe_home(struct blkdev *bd, void **mounted);
+#endif
 
 #ifdef __cplusplus
 }

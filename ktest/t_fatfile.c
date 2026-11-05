@@ -35,13 +35,13 @@ static int disk_sector(struct fat_mount *m, u64 lba, u8 *buf)
 { return blk_io_read(m->dev, lba, 1, buf); }
 
 static void drop(const char *path)
-{ fat_unlink_impl(NULL, path); }
+{ fat_unlink_impl(fat_priv, path); }
 
 static struct resolve *open_resolve(const char *path)
 {
     struct vnode vn;
     memset(&vn, 0, sizeof(vn));
-    if (fat_lookup_impl(NULL, path, &vn) != 0) return NULL;
+    if (fat_lookup_impl(fat_priv, path, &vn) != 0) return NULL;
     return vn.fs_data;
 }
 
@@ -53,7 +53,7 @@ static void test_truncate_publishes_and_frees(void)
     struct fat_mount *m = mnt_or_skip("trunc");
     if (!m) return;
     drop("/T19TRUNC.T");
-    K_ASSERT_EQ(fat_create_impl(NULL, "/T19TRUNC.T"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/T19TRUNC.T"), 0);
 
     struct resolve *r = open_resolve("/T19TRUNC.T");
     K_ASSERT(r != NULL);
@@ -62,7 +62,7 @@ static void test_truncate_publishes_and_frees(void)
     u8 *buf = kmalloc(n);
     K_ASSERT(buf != NULL);
     for (u32 i = 0; i < n; i++) buf[i] = (u8)i;
-    K_ASSERT_EQ(fat_write_impl(NULL, r, 0, buf, n), (int)n);
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, 0, buf, n), (int)n);
 
     K_ASSERT_EQ(blk_cache_flush(m->dev), 0); /* bisect: flush#1 */
     u64 dlba = (u64)(cluster_lba(m, r->ent_clus) + r->ent_off / m->bytes_per_sector);
@@ -84,7 +84,7 @@ static void test_truncate_publishes_and_frees(void)
     }
     K_ASSERT_EQ(nclu, 2);
 
-    K_ASSERT_EQ(fat_write_impl(NULL, r, 0, NULL, 0), 0);
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, 0, NULL, 0), 0);
 
     /* bisect: A2 = flush#2 only */
     K_ASSERT_EQ(blk_cache_flush(m->dev), 0);
@@ -92,7 +92,7 @@ static void test_truncate_publishes_and_frees(void)
 
     kfree(buf);
     kfree(r);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/T19TRUNC.T"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/T19TRUNC.T"), 0);
 }
 
 /* C20+C21: a stale resolution under an open file must refuse to write.
@@ -104,17 +104,17 @@ static void test_a_stranger_dirent_refuses_the_stale_write(void)
     struct fat_mount *m = mnt_or_skip("stale");
     if (!m) return;
     drop("/T20STALE.T");
-    K_ASSERT_EQ(fat_create_impl(NULL, "/T20STALE.T"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/T20STALE.T"), 0);
 
     /* the first incarnation, resolved and held */
     struct resolve *r = open_resolve("/T20STALE.T");
     K_ASSERT(r != NULL);
-    K_ASSERT_EQ(fat_write_impl(NULL, r, 0, "v1", 2), 2);
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, 0, "v1", 2), 2);
     u32 dead_head = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
 
     /* the record dies and the same-named re-create takes the same slot */
-    K_ASSERT_EQ(fat_unlink_impl(NULL, "/T20STALE.T"), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/T20STALE.T"), 0);
+    K_ASSERT_EQ(fat_unlink_impl(fat_priv, "/T20STALE.T"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/T20STALE.T"), 0);
     struct resolve r2;
     K_ASSERT(fat_resolve_path(m, "/T20STALE.T", &r2) >= 0 && r2.found);
     K_EXPECT_EQ(r2.ent_clus, r->ent_clus); /* the slot really was recycled ... */
@@ -128,7 +128,7 @@ static void test_a_stranger_dirent_refuses_the_stale_write(void)
 
     /* the held-open file's write: a stranger's record must not be
      * rewritten, and the growth booked along the way comes back */
-    K_ASSERT_EQ(fat_write_impl(NULL, r, m->cluster_size, "late", 4), LNXRM_EIO);
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, m->cluster_size, "late", 4), LNXRM_EIO);
 
     K_ASSERT_EQ(blk_cache_flush(m->dev), 0);
     u8 d1[512];
@@ -140,7 +140,7 @@ static void test_a_stranger_dirent_refuses_the_stale_write(void)
         an unclaimed end-of-chain mark) */
 
     kfree(r);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/T20STALE.T"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/T20STALE.T"), 0);
 }
 
 /* "/GRWD0/G001.T" with 001 = three decimal digits of `i` (no printf in
@@ -185,8 +185,8 @@ static void test_full_directory_grows_the_chain(void)
     struct fat_mount *m = mnt_or_skip("grow");
     if (!m) return;
 
-    fat_rmdir_impl(NULL, "/GRWD0"); /* best effort pre-clean */
-    if (fat_mkdir_impl(NULL, "/GRWD0"))
+    fat_rmdir_impl(fat_priv, "/GRWD0"); /* best effort pre-clean */
+    if (fat_mkdir_impl(fat_priv, "/GRWD0"))
         ktest_skip("GRWD0 left non-empty by an aborted prior run");
     struct resolve *r = open_resolve("/GRWD0");
     K_ASSERT(r != NULL);
@@ -202,13 +202,13 @@ static void test_full_directory_grows_the_chain(void)
     for (u32 i = 0; i < n; i++) {
         grow_path(i, path);
         drop(path);
-        int rc = fat_create_impl(NULL, path);
+        int rc = fat_create_impl(fat_priv, path);
         if (rc) {
             for (u32 j = 0; j <= i; j++) {
                 grow_path(j, path);
                 drop(path);
             }
-            fat_rmdir_impl(NULL, "/GRWD0");
+            fat_rmdir_impl(fat_priv, "/GRWD0");
             K_EXPECT_EQ(rc, 0);
             return;
         }
@@ -226,9 +226,9 @@ static void test_full_directory_grows_the_chain(void)
 
     for (u32 i = 0; i < n; i++) {
         grow_path(i, path);
-        K_ASSERT_EQ(fat_unlink_impl(NULL, path), 0);
+        K_ASSERT_EQ(fat_unlink_impl(fat_priv, path), 0);
     }
-    K_ASSERT_EQ(fat_rmdir_impl(NULL, "/GRWD0"), 0);
+    K_ASSERT_EQ(fat_rmdir_impl(fat_priv, "/GRWD0"), 0);
     K_ASSERT(open_resolve("/GRWD0") == NULL); /* rmdir released the grown chain */
 }
 
@@ -289,8 +289,8 @@ static void test_alias_collision_writes_stay_their_own(void)
     struct fat_mount *m = mnt_or_skip("alias");
     if (!m) return;
 
-    fat_rmdir_impl(NULL, "/ALIASD0"); /* best effort pre-clean */
-    if (fat_mkdir_impl(NULL, "/ALIASD0"))
+    fat_rmdir_impl(fat_priv, "/ALIASD0"); /* best effort pre-clean */
+    if (fat_mkdir_impl(fat_priv, "/ALIASD0"))
         ktest_skip("ALIASD0 left non-empty by an aborted prior run");
     struct resolve *rd = open_resolve("/ALIASD0");
     K_ASSERT(rd != NULL);
@@ -330,13 +330,13 @@ static void test_alias_collision_writes_stay_their_own(void)
     u8 a[512], b[512], back[512];
     memset(a, 'A', sizeof(a));
     memset(b, 'B', sizeof(b));
-    K_ASSERT_EQ(fat_write_impl(NULL, rA, 0, a, sizeof(a)), (int)sizeof(a));
-    K_ASSERT_EQ(fat_write_impl(NULL, rB, 0, b, sizeof(b)), (int)sizeof(b));
+    K_ASSERT_EQ(fat_write_impl(fat_priv, rA, 0, a, sizeof(a)), (int)sizeof(a));
+    K_ASSERT_EQ(fat_write_impl(fat_priv, rB, 0, b, sizeof(b)), (int)sizeof(b));
     K_ASSERT_EQ(blk_cache_flush(m->dev), 0);
 
-    K_ASSERT_EQ(fat_read_impl(NULL, rA, 0, back, sizeof(back)), (int)sizeof(back));
+    K_ASSERT_EQ(fat_read_impl(fat_priv, rA, 0, back, sizeof(back)), (int)sizeof(back));
     K_EXPECT_EQ(memcmp(back, a, sizeof(back)), 0);
-    K_ASSERT_EQ(fat_read_impl(NULL, rB, 0, back, sizeof(back)), (int)sizeof(back));
+    K_ASSERT_EQ(fat_read_impl(fat_priv, rB, 0, back, sizeof(back)), (int)sizeof(back));
     K_EXPECT_EQ(memcmp(back, b, sizeof(back)), 0);
 
     /* on disk, each record kept its own size, stamp and alias; the two
@@ -359,9 +359,9 @@ static void test_alias_collision_writes_stay_their_own(void)
 
     kfree(rA);
     kfree(rB);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/ALIASD0/AAA-STALE-A"), 0);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/ALIASD0/BBB-STALE-B"), 0);
-    K_ASSERT_EQ(fat_rmdir_impl(NULL, "/ALIASD0"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/ALIASD0/AAA-STALE-A"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/ALIASD0/BBB-STALE-B"), 0);
+    K_ASSERT_EQ(fat_rmdir_impl(fat_priv, "/ALIASD0"), 0);
 }
 
 /* C16: the free clusters the in-RAM FAT copy sees. */
@@ -384,15 +384,15 @@ static void test_write_demand_past_the_volume_is_refused(void)
     if (!m) return;
 
     drop("/T16CAP.T");
-    K_ASSERT_EQ(fat_create_impl(NULL, "/T16CAP.T"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/T16CAP.T"), 0);
     struct resolve *r = open_resolve("/T16CAP.T");
     K_ASSERT(r != NULL);
 
     u32 free_before = fat_free_count(m);
-    K_ASSERT_EQ(fat_write_impl(NULL, r, fat_chain_cap_bytes(m), "x", 1),
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, fat_chain_cap_bytes(m), "x", 1),
                 LNXRM_ENOSPC);
     /* off+n wrapping past u64 is refused too, not a tiny write */
-    K_ASSERT_EQ(fat_write_impl(NULL, r, (u64)-1, "x", 1), LNXRM_ENOSPC);
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, (u64)-1, "x", 1), LNXRM_ENOSPC);
     K_EXPECT_EQ(fat_free_count(m), free_before); /* zero clusters spent */
 
     struct resolve r2;
@@ -400,7 +400,7 @@ static void test_write_demand_past_the_volume_is_refused(void)
     K_EXPECT_EQ(r2.de.filesize, 0u); /* the record still says empty */
     K_EXPECT_EQ(((u32)r2.de.fstclushi << 16) | r2.de.fstcluslo, 0u);
     kfree(r);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/T16CAP.T"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/T16CAP.T"), 0);
 }
 
 /* C35: a zero-byte write to an empty file used to walk alloc_chain and
@@ -411,19 +411,19 @@ static void test_zero_byte_write_is_not_a_fake_disk_full(void)
     if (!m) return;
 
     drop("/T35ZERO.T");
-    K_ASSERT_EQ(fat_create_impl(NULL, "/T35ZERO.T"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/T35ZERO.T"), 0);
     struct resolve *r = open_resolve("/T35ZERO.T");
     K_ASSERT(r != NULL);
     u8 one = 'z';
-    K_EXPECT_EQ(fat_write_impl(NULL, r, 0, &one, 0), 0); /* empty, zero bytes */
-    K_EXPECT_EQ(fat_write_impl(NULL, r, 0, &one, 1), 1); /* book a byte */
-    K_EXPECT_EQ(fat_write_impl(NULL, r, 1, &one, 0), 0); /* non-empty, zero */
+    K_EXPECT_EQ(fat_write_impl(fat_priv, r, 0, &one, 0), 0); /* empty, zero bytes */
+    K_EXPECT_EQ(fat_write_impl(fat_priv, r, 0, &one, 1), 1); /* book a byte */
+    K_EXPECT_EQ(fat_write_impl(fat_priv, r, 1, &one, 0), 0); /* non-empty, zero */
     K_EXPECT_EQ(blk_cache_flush(m->dev), 0);
     struct resolve r2;
     K_ASSERT(fat_resolve_path(m, "/T35ZERO.T", &r2) >= 0 && r2.found);
     K_EXPECT_EQ(r2.de.filesize, 1u); /* the record says exactly one byte */
     kfree(r);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/T35ZERO.T"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/T35ZERO.T"), 0);
 }
 
 /* ---- C30/C31/C32/C33/C34: boundaries, forged volumes, cursors ---------
@@ -444,22 +444,6 @@ static void iter_short_path(u32 i, char out[24])
 
 /* Hand-crafted BPB: the fields fat_mount() actually validates, zeros for
  * everything mkfs would fill (root entries 0, FAT-size-16 0 = FAT32 only). */
-static void forge_bpb(u8 *s, u32 spc, u32 reserved, u32 numfats, u32 fatsz32,
-                      u32 totsec, u32 rootclk)
-{
-    memset(s, 0, 512);
-    s[0] = 0xEB, s[1] = 0x3C, s[2] = 0x90;
-    *(u16 *)&s[11] = 512;
-    s[13] = (u8)spc;
-    *(u16 *)&s[14] = (u16)reserved;
-    s[16] = (u8)numfats;
-    *(u32 *)&s[32] = totsec;
-    *(u32 *)&s[36] = fatsz32;
-    *(u32 *)&s[44] = rootclk;
-    *(u16 *)&s[510] = 0xAA55;
-    memcpy(&s[82], "FAT32", 5);
-}
-
 /* One readdir pass from `cookie`, collecting up to `total` entries
  * (names in 56-byte slots, inos separate).  Returns how many arrived;
  * `final` gets the cookie after the last step.  No K_ macros here: the
@@ -471,7 +455,7 @@ static u32 sweep(struct resolve *rd, u64 cookie, u32 total, char *names, u64 *in
     while (n < total) {
         struct dirent_out d;
         memset(&d, 0, sizeof(d));
-        int rc = fat32_getdent_impl(NULL, rd, &cookie, &d);
+        int rc = fat32_getdent_impl(fat_priv, rd, &cookie, &d);
         if (rc <= 0) break; /* dead scan or list end: the caller sees the count */
         memcpy(names + (size_t)n * 56, d.name, 56);
         inos[n] = d.ino;
@@ -548,8 +532,8 @@ static void test_getdent_cursor_walks_once(void)
         return;
     }
 
-    fat_rmdir_impl(NULL, "/ITERD0"); /* best effort pre-clean */
-    if (fat_mkdir_impl(NULL, "/ITERD0"))
+    fat_rmdir_impl(fat_priv, "/ITERD0"); /* best effort pre-clean */
+    if (fat_mkdir_impl(fat_priv, "/ITERD0"))
         ktest_skip("ITERD0 left non-empty by an aborted prior run");
     struct resolve *rd = open_resolve("/ITERD0");
     K_ASSERT(rd != NULL);
@@ -561,27 +545,27 @@ static void test_getdent_cursor_walks_once(void)
     u64 cookie = DIRIT_START;
     struct dirent_out d;
     memset(&d, 0, sizeof(d));
-    K_EXPECT_EQ(fat32_getdent_impl(NULL, rd, &cookie, &d), 0);
+    K_EXPECT_EQ(fat32_getdent_impl(fat_priv, rd, &cookie, &d), 0);
     K_EXPECT_EQ(cookie, DIRIT_END);
 
     static const char *const lfns[2] = {"/ITERD0/LfnA.Mixed1", "/ITERD0/LfnB.Mixed2"};
     for (int i = 0; i < 2; i++) drop(lfns[i]);
-    K_ASSERT_EQ(fat_create_impl(NULL, lfns[0]), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, lfns[1]), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, lfns[0]), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, lfns[1]), 0);
     u32 nshort = 2 * per_clus + 5; /* the chain grows past two clusters */
     K_ASSERT(nshort < 1000);
     for (u32 i = 0; i < nshort; i++) {
         char p[24];
         iter_short_path(i, p);
         drop(p);
-        int rc = fat_create_impl(NULL, p);
+        int rc = fat_create_impl(fat_priv, p);
         if (rc) {
             for (u32 j = 0; j <= i; j++) {
                 iter_short_path(j, p);
                 drop(p);
             }
             for (int j = 0; j < 2; j++) drop(lfns[j]);
-            fat_rmdir_impl(NULL, "/ITERD0");
+            fat_rmdir_impl(fat_priv, "/ITERD0");
             K_EXPECT_EQ(rc, 0);
             return;
         }
@@ -602,7 +586,7 @@ static void test_getdent_cursor_walks_once(void)
     K_ASSERT_EQ(got, total);
     /* one past the last delivered entry answers a clean end, once */
     memset(&d, 0, sizeof(d));
-    K_EXPECT_EQ(fat32_getdent_impl(NULL, rd, &endk, &d), 0);
+    K_EXPECT_EQ(fat32_getdent_impl(fat_priv, rd, &endk, &d), 0);
     K_EXPECT_EQ(endk, DIRIT_END);
     c30_set_check(got, names, 0);
     for (u32 i = 1; i < total; i++)
@@ -636,37 +620,37 @@ static void test_getdent_cursor_walks_once(void)
     u64 mid = DIRIT_START;
     for (u32 k = 0; k < 5; k++) {
         memset(&d, 0, sizeof(d));
-        K_ASSERT_EQ(fat32_getdent_impl(NULL, rd, &mid, &d), 1);
+        K_ASSERT_EQ(fat32_getdent_impl(fat_priv, rd, &mid, &d), 1);
     }
     u32 got3 = sweep(rd, mid, total - 5, names, inos, &endk);
     K_ASSERT_EQ(got3, total - 5);
     /* the resumed walk also ends cleanly one past the last entry */
     memset(&d, 0, sizeof(d));
-    K_EXPECT_EQ(fat32_getdent_impl(NULL, rd, &endk, &d), 0);
+    K_EXPECT_EQ(fat32_getdent_impl(fat_priv, rd, &endk, &d), 0);
     K_EXPECT_EQ(endk, DIRIT_END);
     c30_set_check(got3, names, 5);
 
     /* malformed cursors answer "ended", never invent entries */
     cookie = ((u64)dc << 32) | 33; /* misaligned to a 32-byte record */
     memset(&d, 0, sizeof(d));
-    K_EXPECT_EQ(fat32_getdent_impl(NULL, rd, &cookie, &d), 0);
+    K_EXPECT_EQ(fat32_getdent_impl(fat_priv, rd, &cookie, &d), 0);
     K_EXPECT_EQ(cookie, DIRIT_END);
     cookie = ((u64)dc << 32) | (m->cluster_size + 64); /* past the cluster */
-    K_EXPECT_EQ(fat32_getdent_impl(NULL, rd, &cookie, &d), 0);
+    K_EXPECT_EQ(fat32_getdent_impl(fat_priv, rd, &cookie, &d), 0);
     K_EXPECT_EQ(cookie, DIRIT_END);
     cookie = (0xBEEF0000ULL << 32) | 32; /* cluster not in the chain */
-    K_EXPECT_EQ(fat32_getdent_impl(NULL, rd, &cookie, &d), 0);
+    K_EXPECT_EQ(fat32_getdent_impl(fat_priv, rd, &cookie, &d), 0);
     K_EXPECT_EQ(cookie, DIRIT_END);
 
     for (u32 i = 0; i < nshort; i++) {
         char p[24];
         iter_short_path(i, p);
-        K_EXPECT_EQ(fat_unlink_impl(NULL, p), 0);
+        K_EXPECT_EQ(fat_unlink_impl(fat_priv, p), 0);
     }
-    for (int i = 0; i < 2; i++) K_EXPECT_EQ(fat_unlink_impl(NULL, lfns[i]), 0);
+    for (int i = 0; i < 2; i++) K_EXPECT_EQ(fat_unlink_impl(fat_priv, lfns[i]), 0);
     kfree(names);
     kfree(inos);
-    K_ASSERT_EQ(fat_rmdir_impl(NULL, "/ITERD0"), 0);
+    K_ASSERT_EQ(fat_rmdir_impl(fat_priv, "/ITERD0"), 0);
     kfree(rd);
 }
 
@@ -679,8 +663,8 @@ static void test_resolve_poisoned_name_terminates(void)
     struct fat_mount *m = mnt_or_skip("r34");
     if (!m) return;
 
-    fat_rmdir_impl(NULL, "/T34D"); /* best effort pre-clean */
-    if (fat_mkdir_impl(NULL, "/T34D"))
+    fat_rmdir_impl(fat_priv, "/T34D"); /* best effort pre-clean */
+    if (fat_mkdir_impl(fat_priv, "/T34D"))
         ktest_skip("T34D left non-empty by an aborted prior run");
 
     char n55[56];
@@ -690,7 +674,7 @@ static void test_resolve_poisoned_name_terminates(void)
     memcpy(pth, "/T34D/", 6);
     memcpy(pth + 6, n55, 56); /* 61 bytes of path: legal, and long enough */
     drop(pth);
-    K_ASSERT_EQ(fat_create_impl(NULL, pth), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, pth), 0);
 
     struct resolve r;
     memset(&r, 0xAA, sizeof(r));
@@ -705,8 +689,8 @@ static void test_resolve_poisoned_name_terminates(void)
     static const char dir4[5] = {'T', '3', '4', 'D', 0};
     K_EXPECT(memcmp(r2.name, dir4, 5) == 0); /* trailing-slash branch too */
 
-    K_EXPECT_EQ(fat_unlink_impl(NULL, pth), 0);
-    K_EXPECT_EQ(fat_rmdir_impl(NULL, "/T34D"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, pth), 0);
+    K_EXPECT_EQ(fat_rmdir_impl(fat_priv, "/T34D"), 0);
 }
 
 /* C31: a full LFN run holds 20 pieces x 13 = 260 name bytes + terminator.
@@ -761,8 +745,8 @@ static void test_lfn_full_run_survives(void)
         return;
     }
 
-    fat_rmdir_impl(NULL, "/T31LNGB"); /* best effort pre-clean */
-    if (fat_mkdir_impl(NULL, "/T31LNGB"))
+    fat_rmdir_impl(fat_priv, "/T31LNGB"); /* best effort pre-clean */
+    if (fat_mkdir_impl(fat_priv, "/T31LNGB"))
         ktest_skip("T31LNGB left non-empty by an aborted prior run");
     struct resolve *rd = open_resolve("/T31LNGB");
     K_ASSERT(rd != NULL);
@@ -781,7 +765,7 @@ static void test_lfn_full_run_survives(void)
         fp[12] = (char)('0' + i % 10);
         fp[13] = 0;
         drop(fp);
-        int rc = fat_create_impl(NULL, fp);
+        int rc = fat_create_impl(fat_priv, fp);
         if (rc) {
             for (u32 j = 0; j < i; j++) {
                 fp[11] = (char)('0' + j / 10);
@@ -795,7 +779,7 @@ static void test_lfn_full_run_survives(void)
     for (u32 i = 0; i < 23; i++) {
         fp[11] = (char)('0' + i / 10);
         fp[12] = (char)('0' + i % 10);
-        K_EXPECT_EQ(fat_unlink_impl(NULL, fp), 0); /* they must be deletable */
+        K_EXPECT_EQ(fat_unlink_impl(fat_priv, fp), 0); /* they must be deletable */
     }
 
     /* slots 2..25 are deleted (E5) records inside the chain now; the run
@@ -855,8 +839,8 @@ static void test_lfn_full_run_survives(void)
     K_EXPECT_EQ(fat_resolve_path(m, "/T31LNGB/TEST.OLD", &rr), 1);
     K_EXPECT(rr.found);
 
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/T31LNGB/TEST.OLD"), 0); /* via the alias */
-    K_EXPECT_EQ(fat_rmdir_impl(NULL, "/T31LNGB"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/T31LNGB/TEST.OLD"), 0); /* via the alias */
+    K_EXPECT_EQ(fat_rmdir_impl(fat_priv, "/T31LNGB"), 0);
 }
 
 /* C32/C33 mount a forged volume: the mount's answer fields (max_cluster
@@ -885,7 +869,7 @@ static void test_fat_entries_beyond_the_cap_is_refused(void)
     K_ASSERT(s0 != NULL);
     /* data start = 8 + 2 * 3,000,000 < totsec, so the volume geometry
      * itself is coherent -- the FAT alone is the lie */
-    forge_bpb(s0, 1, 8, 2, 3000000, 6000016, 2);
+    kblk_forge_fat32_bpb(s0, 1, 8, 2, 3000000, 6000016, 2);
     K_EXPECT(mount_forged_leave(k) == NULL);
     K_EXPECT(fat_priv != NULL); /* the real mount still owns the slot */
     K_EXPECT_EQ(k->reads, 1);   /* the BPB, and never the giant FAT */
@@ -903,7 +887,7 @@ static void test_last_fat_cell_reachable(void)
     K_ASSERT(k != NULL);
     u8 *s0 = kblk_sector(k, 0);
     K_ASSERT(s0 != NULL);
-    forge_bpb(s0, 1, 8, 2, 1 /* FAT = 512 B = 128 cells */, 256, 2);
+    kblk_forge_fat32_bpb(s0, 1, 8, 2, 1 /* FAT = 512 B = 128 cells */, 256, 2);
     u8 *fatsec = kblk_sector(k, 8); /* the whole FAT */
     K_ASSERT(fatsec != NULL);
     *(u32 *)&fatsec[127 * 4] = 2; /* the last cell points somewhere legal */

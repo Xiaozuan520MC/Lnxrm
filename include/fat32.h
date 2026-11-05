@@ -11,7 +11,9 @@
 #include <mm/mm.h>
 #include <disk.h>
 #include <sys/spinlock.h>
-extern void *fat_priv;          /* active mount or NULL */
+extern void *fat_priv;          /* the volume fat_*_impl with no mount argument
+                                * acts on: the one mounted at "/", else the
+                                * first mounted (C51 -- never overwritten) */
 extern struct fs_ops fat32_ops; /* defined in fat32.c */
 
 /* Global FAT32 lock: serialises cluster allocation, directory scans and

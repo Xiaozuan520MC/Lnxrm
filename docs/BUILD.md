@@ -5,13 +5,13 @@ x86-64 freestanding 内核（C + NASM），构建链零警告。本文覆盖：�
 ## 1. 依赖
 
 ```sh
-sudo apt install make gcc binutils nasm python3 \
+sudo apt install make clang binutils nasm python3 \
                  dosfstools mtools qemu-system-x86 gdb
 ```
 
 可选：`grub-pc-bin` + `xorriso`（`make imageiso`）、`fsck.vfat`/`mdir`（smoke 检查，缺则 SKIP）、`g++`（构建不用，但 smoke 工具链检查要求在 PATH）。
 
-不钉版本；已验证 gcc 15 / binutils 2.46 / nasm 3.01 / python 3.14 / QEMU 10.x。`CROSS=x86_64-linux-gnu-` 可换交叉工具链。
+不钉版本；已验证 clang 21 / binutils 2.46 / nasm 3.01 / python 3.14 / QEMU 10.x。`CROSS` 前缀同时作用于 `CC`/`LD`/`OBJCOPY`，如 `CROSS=x86_64-linux-gnu-` 可换整套交叉工具链。
 
 ## 2. make 目标与变量
 
@@ -49,7 +49,7 @@ build/user/* + README.md ──mkfs.vfat/mcopy──► build/disk.img
 ```
 
 - 源文件用 `find`/`wildcard` 自动发现：新增内核 `.c` 或 `userland/bin/*.c` 不用改 Makefile；头依赖由 `-MMD -MP` 的 `.d` 跟踪。
-- 关键标志：`-ffreestanding -fno-stack-protector -mno-red-zone -mno-sse* -mcmodel=kernel -O2 -g -ffunction-sections -fno-pic`；用户态 `-nostdlib -static -no-pie -mcmodel=large`，链接在 `0x7f8000400000`。
+- 关键标志：`-ffreestanding -fno-stack-protector -mno-red-zone -mno-sse* -mcmodel=kernel -O2 -g -ffunction-sections -fno-pic`；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`，链接 `-nostdlib -nostartfiles -static`（链接专用开关单独放 `USERLDFLAGS`，混进编译命令会被 clang 报 `-Wunused-command-line-argument`），链接在 `0x7f8000400000`。
 - `vmlinux.elf` 查符号：`grep <sym> build/vmlinux.map` 或 `nm build/vmlinux.elf`。
 - `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；`setup.bin` 依赖 `vmlinux.elf` 只为 `nm` 查 `_start32/64` 回填跳转；`patch_bzimage.py` 填 boot protocol 头并断言 `HdrS`/`0x55AA`/对齐。
 - 可复现：设 `SOURCE_DATE_EPOCH` 后 `bzImage` SHA256 稳定。

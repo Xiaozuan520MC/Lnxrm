@@ -14,6 +14,11 @@ void pci_write(u8 bus, u8 dev, u8 fn, u8 off, u32 val);
 
 /* AHCI/SATA controller (drivers/ahci.c) — a PCI class 01h/06h device. */
 void ahci_init(void);
+#ifdef CONFIG_KTEST
+/* C49: one transfer, counted by the interrupt that retires it.  See the
+ * definition for the return contract (>0 pass, 0 fail, <0 skip). */
+int ahci_irq_selftest(void);
+#endif
 
 static inline void pci_enable_bm(u8 b, u8 d, u8 f)
 {

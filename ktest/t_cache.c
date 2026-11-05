@@ -58,12 +58,12 @@ static struct fat_mount *mnt_or_skip(const char *who)
 
 /* A stale file from an aborted earlier run must not fail this case. */
 static void drop(const char *path)
-{ fat_unlink_impl(NULL, path); }
+{ fat_unlink_impl(fat_priv, path); }
 
 static int open_resolve(const char *path, struct vnode *vn)
 {
     memset(vn, 0, sizeof(*vn));
-    return fat_lookup_impl(NULL, path, vn);
+    return fat_lookup_impl(fat_priv, path, vn);
 }
 
 static void close_resolve(struct vnode *vn)
@@ -147,7 +147,7 @@ static void test_a_200_sector_file_costs_one_writeback_each(void)
     struct blkdev *dev = m->dev;
     drop("/t007big");
     K_ASSERT_EQ(blk_cache_purge(dev), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/t007big"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/t007big"), 0);
 
     struct vnode vn;
     K_ASSERT_EQ(open_resolve("/t007big", &vn), 0);
@@ -156,7 +156,7 @@ static void test_a_200_sector_file_costs_one_writeback_each(void)
     u8 page[CACHE_SECTOR_SIZE];
     for (u32 i = 0; i < 200; i++) {
         memset(page, (int)(i * 7 + 3), sizeof(page));
-        K_ASSERT_EQ(fat_write_impl(NULL, vn.fs_data, (u64)i * 512, page, sizeof(page)),
+        K_ASSERT_EQ(fat_write_impl(fat_priv, vn.fs_data, (u64)i * 512, page, sizeof(page)),
                     (int)sizeof(page));
     }
 
@@ -172,7 +172,7 @@ static void test_a_200_sector_file_costs_one_writeback_each(void)
     int mismatch = -1;
     for (u32 i = 0; i < 200; i += 37) {
         memset(page, (int)(i * 7 + 3), sizeof(page));
-        if (fat_read_impl(NULL, vn.fs_data, (u64)i * 512, back, sizeof(back)) !=
+        if (fat_read_impl(fat_priv, vn.fs_data, (u64)i * 512, back, sizeof(back)) !=
                 (int)sizeof(back) ||
             memcmp(back, page, sizeof(back)) != 0)
             mismatch = (int)i;
@@ -184,7 +184,7 @@ static void test_a_200_sector_file_costs_one_writeback_each(void)
     if (mismatch == -1) K_ASSERT_EQ(blk_cache_purge(NULL), 0);
     for (u32 i = 0; mismatch == -1 && i < 200; i += 37) {
         memset(page, (int)(i * 7 + 3), sizeof(page));
-        if (fat_read_impl(NULL, vn.fs_data, (u64)i * 512, back, sizeof(back)) !=
+        if (fat_read_impl(fat_priv, vn.fs_data, (u64)i * 512, back, sizeof(back)) !=
                 (int)sizeof(back) ||
             memcmp(back, page, sizeof(back)) != 0)
             mismatch = (int)i + 1000;
@@ -209,7 +209,7 @@ static void test_hot_sectors_survive_a_cold_stream(void)
     K_ASSERT(dev->num_sectors > 170);
     drop("/t007hot");
     K_ASSERT_EQ(blk_cache_purge(NULL), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/t007hot"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/t007hot"), 0);
 
     /* Enough bytes for at least 8 sectors whatever the cluster size is
      * (a cluster holds a whole number of sectors, so >= 8 sectors of file
@@ -219,7 +219,7 @@ static void test_hot_sectors_survive_a_cold_stream(void)
     struct vnode vn;
     K_ASSERT_EQ(open_resolve("/t007hot", &vn), 0);
     for (u32 off = 0; off < 8 * m->bytes_per_sector; off += sizeof(seed))
-        K_ASSERT_EQ(fat_write_impl(NULL, vn.fs_data, off, seed, sizeof(seed)),
+        K_ASSERT_EQ(fat_write_impl(fat_priv, vn.fs_data, off, seed, sizeof(seed)),
                     (int)sizeof(seed));
     close_resolve(&vn);
 
@@ -274,7 +274,7 @@ static void test_write_readback_is_coherent(void)
     struct blkdev *dev = m->dev;
     drop("/t008");
     K_ASSERT_EQ(blk_cache_purge(dev), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/t008"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/t008"), 0);
 
     struct vnode vn;
     K_ASSERT_EQ(open_resolve("/t008", &vn), 0);
@@ -285,12 +285,12 @@ static void test_write_readback_is_coherent(void)
         memset(page, (int)(i * 13 + 5), sizeof(page));
         page[0] = (u8)(i >> 8); /* every iteration has its own first bytes */
         page[1] = (u8)i;
-        if (fat_write_impl(NULL, vn.fs_data, 0, page, sizeof(page)) != (int)sizeof(page)) {
+        if (fat_write_impl(fat_priv, vn.fs_data, 0, page, sizeof(page)) != (int)sizeof(page)) {
             bad = -2; /* the write refused: not a coherence problem, but a failure */
             break;
         }
         memset(back, 0xAA, sizeof(back));
-        if (fat_read_impl(NULL, vn.fs_data, 0, back, sizeof(back)) != (int)sizeof(back) ||
+        if (fat_read_impl(fat_priv, vn.fs_data, 0, back, sizeof(back)) != (int)sizeof(back) ||
             memcmp(back, page, sizeof(back)) != 0)
             bad = i;
     }
@@ -301,7 +301,7 @@ static void test_write_readback_is_coherent(void)
      * disk. */
     K_ASSERT_EQ(blk_cache_purge(dev), 0);
     memset(back, 0, sizeof(back));
-    int n = fat_read_impl(NULL, vn.fs_data, 0, back, sizeof(back));
+    int n = fat_read_impl(fat_priv, vn.fs_data, 0, back, sizeof(back));
     K_EXPECT_EQ(n, (int)sizeof(back));
     K_EXPECT_EQ(memcmp(back, page, sizeof(back)), 0);
 
@@ -350,14 +350,14 @@ static void test_sync_hands_dirty_sectors_to_the_device(void)
     struct blkdev *dev = m->dev;
     drop("/t027");
     K_ASSERT_EQ(blk_cache_purge(NULL), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/t027"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/t027"), 0);
 
     struct vnode vn;
     K_ASSERT_EQ(open_resolve("/t027", &vn), 0);
     u8 page[CACHE_SECTOR_SIZE];
     memset(page, 0x3C, sizeof(page));
     page[0] = 0xC7;
-    K_ASSERT_EQ(fat_write_impl(NULL, vn.fs_data, 0, page, sizeof(page)),
+    K_ASSERT_EQ(fat_write_impl(fat_priv, vn.fs_data, 0, page, sizeof(page)),
                 (int)sizeof(page));
     u64 lbas[2];
     K_ASSERT_EQ(file_lbas(m, "/t027", lbas, 1), 1);

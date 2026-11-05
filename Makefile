@@ -1,5 +1,5 @@
 CROSS   :=
-CC      := $(CROSS)gcc
+CC      := $(CROSS)clang
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
 NASM    := nasm -w-implicit-abs-deprecated

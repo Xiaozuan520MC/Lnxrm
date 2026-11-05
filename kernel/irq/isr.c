@@ -410,6 +410,19 @@ void isr_common(struct intr_frame *f)
             kprintf("[exception] task pid=%u name=%s cs=%#lx ss=%#lx\n", current->pid,
                     current->name, f->cs, f->usss);
 
+        /* A #UD whose rip is not an instruction boundary means control was
+         * transferred there (bad frame, wild jump), not that the text is bad --
+         * so show the bytes the CPU actually decoded from, which is what tells
+         * the two apart in one line. */
+        if (f->intno == 6) {
+            unsigned char b[8];
+            if (copy_from_user(b, (const void *)f->rip, sizeof b) == 0) {
+                kprintf("[exception] text@rip:");
+                for (unsigned i = 0; i < sizeof b; i++) kprintf(" %02x", b[i]);
+                kprintf("\n");
+            }
+        }
+
         /* A fault from user mode must kill the offending process, not
          * panic the whole kernel (this is what SIGSEGV/SIGILL/... are for). */
         if (current && (f->cs & 3) == 3) {
@@ -460,7 +473,19 @@ void isr_common(struct intr_frame *f)
     }
 
     int irq = f->intno - 32;
-    if (current && current->pid != 0) current->tf = f;
+    /* current->tf is the frame this task will iretq THROUGH to get back to
+     * user mode -- sys_fork() copies it, sys_execve() rewrites its rip/ussp,
+     * signal.c() redirects it (see the contract at signal.c:159).  An IRQ that
+     * arrived in ring 0 pushed a frame that is discarded on the way back INTO
+     * the kernel, so publishing it here hands those callers a frame nobody
+     * returns through.  C49 made the HBA interrupt-driven, which put an IRQ
+     * inside exactly the syscall that matters: sys_execve() then wrote
+     * {rip=entry, ussp=sp} into the dead IRQ frame, the live syscall frame
+     * kept /bin/init's "int 0x80" return address, and iretq re-entered that
+     * address in the address space execve had just installed -- /bin/sh died
+     * with #UD at a rip that was not even an instruction boundary in its own
+     * text.  Only a user-mode frame IS that frame, so only one is published. */
+    if (current && current->pid != 0 && (f->cs & 3) == 3) current->tf = f;
 
     if (irq >= 0 && irq < 16) {
         /* spurious IRQ7/15 check (still valid with IOAPIC) */

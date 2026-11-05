@@ -20,8 +20,23 @@
 #define IDE_SR_DRQ  0x08
 #define IDE_SR_ERR  0x01
 
-#define IDE_CMD_READ     0x20
-#define IDE_CMD_WRITE    0x30
+#define IDE_CMD_READ  0x20
+#define IDE_CMD_WRITE 0x30
+/* C53: the 48-bit pair.  LBA28 ends at sector 2^28-1 = 128 GiB, and this
+ * driver used to refuse everything past it -- which is correct for the
+ * *start* of a request and wrong for a request that starts below the
+ * ceiling and runs across it, and wrong again for a disk whose LBA simply
+ * is above it: both used to answer from a different sector (the top LBA
+ * bits were dropped) or not at all.  Same commands AHCI always issues. */
+#define IDE_CMD_READ_EXT  0x24
+#define IDE_CMD_WRITE_EXT 0x34
+/* C55: WRITE SECTORS only moves bytes into the *drive's* buffer.  Without
+ * FLUSH CACHE the "flush" this driver used to do was a plain DRDY poll that
+ * said nothing about durability: power could drop with the write still in
+ * the drive's volatile cache, and the journal -- which promises that a
+ * committed transaction reaches the log before home -- was making a promise
+ * it had no way to keep.  Same command AHCI issues (ahci.c, non-data 0xE7). */
+#define IDE_CMD_CACHE_FLUSH 0xE7
 
 /* Sectors carried by ONE PIO command.  READ SECTORS/WRITE SECTORS take an
  * 8-bit count: 1..255 with 0 meaning 256.  Issuing a command per sector costs
@@ -51,6 +66,10 @@
 #define IDE_PROBE_ITERS 100000
 #define IDE_POLL_ITERS  20000000
 
+/* C53: the first transfer that needs the 48-bit registers says so once, so
+ * "why did this image take the EXT path" is answerable from the log. */
+static bool ide_lba48_notice;
+
 static int ide_wait_ready(int mask, int timeout)
 {
     for (int i = 0; i < timeout; i++) {
@@ -70,22 +89,76 @@ static int ide_wait_drq(int timeout)
     return LNXRM_EFAIL;
 }
 
-static int ide_read_sectors(u64 lba, u32 n, void *buf)
+/* C55: completion of a command that carries no data phase (FLUSH CACHE).
+ * ide_wait_ready() deliberately does not look at ERR -- a device that sets
+ * DRDY with ERR is answering something else, and every data command checks
+ * ERR on its own DRQ wait.  FLUSH CACHE has no DRQ, so this is the one
+ * place where ERR is the device's entire answer: ignoring it would make
+ * "the write was flushed" an assumption again. */
+static int ide_wait_flush(int timeout)
 {
-    /* LBA28 tops out at 128 GiB (2^28 sectors).  Without this line the
-     * (lba >> 24) & 0x0F below drops the top bits and answers from a
-     * *different* sector instead of failing: wrong data, no error, nothing
-     * in the log to trace it by (C53). */
-    if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
-    if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
-    if (ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS)) return LNXRM_EFAIL;
+    for (int i = 0; i < timeout; i++) {
+        u8 s = inb(IDE_STATUS);
+        if (s & IDE_SR_BSY) continue;
+        if (s & IDE_SR_ERR) return LNXRM_EFAIL;
+        if (s & IDE_SR_DRDY) return 0;
+    }
+    return LNXRM_EFAIL;
+}
 
-    outb(IDE_SECCOUNT, (u8)n); /* n == 256 encodes as 0, which ATA reads as 256 */
+/* Program the task file and ring the command register for ONE PIO command.
+ *
+ * C53: the decision is made on the *last* sector of the transfer, not the
+ * first -- a request that starts below the 128 GiB ceiling and runs past it
+ * has to be 48-bit too, or the top address bits are dropped and the drive
+ * answers from a different sector with no error anywhere.  Above that (or
+ * with a count only 16 bits can hold) the EXT command goes out: the three
+ * high LBA bytes and the high count byte are written FIRST, because the
+ * drive latches each register's previous contents as the high half -- in
+ * that order, a single write is a complete LBA and the second one never
+ * changes the address.
+ *
+ * Below the ceiling the 28-bit command is kept as it always was, count and
+ * all: 256 sectors is a 0 in the 8-bit field, which ATA reads as 256. */
+static int ide_issue(u64 lba, u32 n, u8 cmd)
+{
+    u64 last = lba + n - 1;
+
+    if (last <= 0x0FFFFFFFUL) {
+        outb(IDE_SECCOUNT, (u8)n); /* n == 256 encodes as 0, which ATA reads as 256 */
+        outb(IDE_LBA_LO, (u8)(lba));
+        outb(IDE_LBA_MID, (u8)(lba >> 8));
+        outb(IDE_LBA_HI, (u8)(lba >> 16));
+        outb(IDE_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+        outb(IDE_CMD, cmd);
+        return 0;
+    }
+
+    /* 2^48-1 sectors = 128 PiB: past it there is no addressing mode left */
+    if (last > 0xFFFFFFFFFFFFULL) return LNXRM_EFAIL;
+    if (!(ide_lba48_notice)) {
+        ide_lba48_notice = true;
+        kprintf("[ide] LBA48: %s at lba=%llu+%u is beyond the 28-bit ceiling\n",
+                cmd == IDE_CMD_READ ? "read" : "write", lba, n);
+    }
+    outb(IDE_SECCOUNT, (u8)(n >> 8));
+    outb(IDE_LBA_LO, (u8)(lba >> 24));
+    outb(IDE_LBA_MID, (u8)(lba >> 32));
+    outb(IDE_LBA_HI, (u8)(lba >> 40));
+    outb(IDE_SECCOUNT, (u8)n);
     outb(IDE_LBA_LO, (u8)(lba));
     outb(IDE_LBA_MID, (u8)(lba >> 8));
     outb(IDE_LBA_HI, (u8)(lba >> 16));
     outb(IDE_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(IDE_CMD, IDE_CMD_READ);
+    outb(IDE_CMD, cmd == IDE_CMD_READ ? IDE_CMD_READ_EXT : IDE_CMD_WRITE_EXT);
+    return 0;
+}
+
+static int ide_read_sectors(u64 lba, u32 n, void *buf)
+{
+    if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
+    if (ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS)) return LNXRM_EFAIL;
+    if (ide_issue(lba, n, IDE_CMD_READ)) return LNXRM_EFAIL;
 
     u16 *p = (u16 *)buf;
     for (u32 s = 0; s < n; s++) {
@@ -101,17 +174,11 @@ static int ide_read_sectors(u64 lba, u32 n, void *buf)
 
 static int ide_write_sectors(u64 lba, u32 n, const void *buf)
 {
-    /* Same ceiling as the read path. */
-    if (lba > 0x0FFFFFFFUL) return LNXRM_EFAIL;
     if (!n || n > IDE_MAX_CHUNK) return LNXRM_EFAIL;
     if (ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS)) return LNXRM_EFAIL;
-
-    outb(IDE_SECCOUNT, (u8)n);
-    outb(IDE_LBA_LO, (u8)(lba));
-    outb(IDE_LBA_MID, (u8)(lba >> 8));
-    outb(IDE_LBA_HI, (u8)(lba >> 16));
-    outb(IDE_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(IDE_CMD, IDE_CMD_WRITE);
+    /* Same LBA28/LBA48 choice as the read path: the ceiling is a property
+     * of the address, not of the direction (C53). */
+    if (ide_issue(lba, n, IDE_CMD_WRITE)) return LNXRM_EFAIL;
 
     const u16 *p = (const u16 *)buf;
     for (u32 s = 0; s < n; s++) {
@@ -123,8 +190,17 @@ static int ide_write_sectors(u64 lba, u32 n, const void *buf)
         p += 256;
     }
 
-    /* flush */
-    ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS);
+    /* Retire WRITE SECTORS, then make it durable (C55).  The old code did
+     * the first half, threw away its result, and returned success -- so a
+     * controller that never finished the write still read as a completed
+     * write(). */
+    if (ide_wait_ready(IDE_SR_DRDY, IDE_POLL_ITERS)) return LNXRM_EFAIL;
+
+    outb(IDE_CMD, IDE_CMD_CACHE_FLUSH);
+    if (ide_wait_flush(IDE_POLL_ITERS)) {
+        kprintf("[ide] FLUSH CACHE (E7) failed after write lba=%llu+%u\n", lba, n);
+        return LNXRM_EFAIL;
+    }
     return 0;
 }
 

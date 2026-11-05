@@ -93,7 +93,7 @@ static void test_journal_write_ahead_and_replay(void)
     K_EXPECT(!root_has(m, NAME1));
 
     K_ASSERT_EQ(fat_journal_begin(m), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/jrntest1"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/jrntest1"), 0);
 
     /* Write-ahead: the directory entry exists only in the log buffer. */
     K_EXPECT(!root_has(m, NAME1));
@@ -125,7 +125,7 @@ static void test_journal_write_ahead_and_replay(void)
 
     /* tidy up for the image the smoke test fscks afterwards */
     K_ASSERT_EQ(fat_journal_begin(m), 0);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/jrntest1"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/jrntest1"), 0);
     K_EXPECT_EQ(fat_journal_commit(m), 0);
     K_EXPECT(!root_has(m, NAME1));
 
@@ -146,7 +146,7 @@ static void test_journal_log_failure_leaves_no_trace(void)
     u32 st = 0xFFFFFFFF;
 
     K_ASSERT_EQ(fat_journal_begin(m), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/jrntest2"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/jrntest2"), 0);
 
     blk_inject_io(m->dev, log_lba, BLK_IO_WRITE);
     int crc = fat_journal_commit(m);
@@ -173,7 +173,7 @@ static void test_journal_normal_commit_is_durable(void)
     u32 st = 0xFFFFFFFF;
 
     K_ASSERT_EQ(fat_journal_begin(m), 0);
-    K_ASSERT_EQ(fat_create_impl(NULL, "/jrntest3"), 0);
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/jrntest3"), 0);
     K_ASSERT_EQ(fat_journal_commit(m), 0);
 
     K_EXPECT(root_has(m, NAME3));        /* applied home ... */
@@ -187,7 +187,7 @@ static void test_journal_normal_commit_is_durable(void)
     K_EXPECT_EQ(st, JRN_STATE_CLEAN);
 
     K_ASSERT_EQ(fat_journal_begin(m), 0);
-    K_EXPECT_EQ(fat_unlink_impl(NULL, "/jrntest3"), 0);
+    K_EXPECT_EQ(fat_unlink_impl(fat_priv, "/jrntest3"), 0);
     K_EXPECT_EQ(fat_journal_commit(m), 0);
     K_EXPECT(!root_has(m, NAME3));
 }

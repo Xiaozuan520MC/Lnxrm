@@ -4,7 +4,7 @@
 
 int fat_lookup_impl(void *mnt, const char *path, struct vnode *out)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct resolve r;
     while (*path == '/') path++;
     if (!*path) {
@@ -12,7 +12,7 @@ int fat_lookup_impl(void *mnt, const char *path, struct vnode *out)
         out->type = V_DIR;
         out->size = 0;
         out->ops = &fat32_ops;
-        out->mnt_data = (void *)1;
+        out->mnt_data = mnt; /* C39: the mount, not a placeholder */
         out->fs_data = kmalloc(sizeof(struct resolve));
         if (!out->fs_data) return LNXRM_ENOMEM; /* T-004: NULL is real now */
         memset(out->fs_data, 0, sizeof(struct resolve));
@@ -42,7 +42,7 @@ int fat_lookup_impl(void *mnt, const char *path, struct vnode *out)
 
 int fat_read_impl(void *mnt, void *node, u64 off, void *ubuf, size_t n)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct resolve *r = node;
     if (r->de.attr & ATTR_DIR) return LNXRM_EFAIL;
 
@@ -241,7 +241,7 @@ static int dirent_writeback_at(struct fat_mount *m, const struct resolve *r, boo
 
 int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct resolve *r = node;
     if (r->de.attr & ATTR_DIR) return LNXRM_EFAIL;
     if (!buf && !n) {
@@ -380,7 +380,7 @@ int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
  * with what it knows. */
 u64 fat_size_impl(void *mnt, void *node)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct resolve *r = node;
     u8 buf[512];
     u64 lba = cluster_lba(m, r->ent_clus) + r->ent_off / m->bytes_per_sector;

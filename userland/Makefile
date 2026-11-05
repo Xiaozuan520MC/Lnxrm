@@ -1,5 +1,5 @@
 CROSS   ?=
-CC      := $(CROSS)gcc
+CC      := $(CROSS)clang
 NASM    := nasm -w-implicit-abs-deprecated
 
 WARN    := -Wall -Wextra -Wno-unused-parameter
@@ -10,8 +10,9 @@ MAKEFLAGS += --no-print-directory
 .DELETE_ON_ERROR:
 
 USERFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie -O2 \
-             -nostdlib -nostartfiles -static -no-pie -mcmodel=large $(WARN) \
+             -mcmodel=large $(WARN) \
              -mno-mmx -mno-sse -Ilib -I../include -idirafter ../include
+USERLDFLAGS := -nostdlib -nostartfiles -static
 
 USER_LINK_BASE := 0x7f8000400000
 
@@ -48,7 +49,7 @@ $(USER_OBJDIR)/%.o: bin/%.c | $(BUILD)
 $(USER_ELFS): $(BUILD)/user/%: $(USER_OBJDIR)/%.o $(USER_OBJDIR)/ulib.o $(USER_OBJDIR)/crt0.o | $(BUILD)
 	@mkdir -p $(dir $@)
 	@printf "  LD      $(SHORT)\n"
-	@$(CC) $(USERFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
+	@$(CC) $(USERFLAGS) $(USERLDFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
 
 clean:
 	@rm -rf $(BUILD)/usero $(BUILD)/user

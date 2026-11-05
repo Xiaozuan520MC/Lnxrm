@@ -315,13 +315,15 @@ kernel/fs/
 | 对象 | 内容 | 生命周期 |
 |---|---|---|
 | `struct vnode` | `{type, size, fs_data, ops, mnt_data}` | **每次 open 在栈上创建并拷贝**，非持久 inode——两个 fd 的 `pos` 各自独立，无 link count |
-| `struct file` | `{ops, pos, priv, is_dir, flags, refcnt}` | `kmalloc`，引用计数 |
+| `struct file` | `{ops, pos, priv, is_dir, flags, refcnt}` | `kmalloc`，引用计数：`vfs_close_file` 用 CAS 循环只减调用者真有的那份，refcnt ≤ 0 的多余 close 打日志并忽略（**计数永不回绕、对象不二次 free**） |
 | `struct dir_iter` | `{node, ops, cookie, mnt_data, err}` | `V_DIR` 的 `file->priv`；`err` 记住扫描已因 I/O 错误终止，下次 `getdent` 继续报错而不是"到头了" |
 | `struct fs_ops` | 12 钩子：lookup/getdent/read/write/**size/close_node**/create/mkdir/unlink/rmdir/rename/freespace | `size` 给 `O_APPEND` 取**实时**大小；`close_node` 由 fs 决定节点释放方式（FAT `kfree` resolve，initramfs 空操作） |
 | `struct file_ops` | read/write/getdent/close（**没有 lseek**） | 普通文件 close 即 `reg_close`：先 `close_node` 归还 fs 节点、再释放 vnode 拷贝（refcount 门控恰跑一次） |
 
 - fd 表每任务 `NR_FDS 16`；挂载表 `MAX_MOUNTS 4`。
-- `vfs_lookup`：扫挂载表匹配前缀 → `ops->lookup` → 失败试 `dev_lookup` → `O_CREAT` 试 `create` → `O_TRUNC` 试截断；三处失败各有出口。`abs_path()` 超长直接 `ENAMETOOLONG`，不写半个路径。
+- `vfs_lookup`：`fs_for_path()` 按**最长前缀 + 组件边界**选出唯一挂载项（`"/"` 不再吞掉 `/alt`），成功/创建/截断三条出口都把 `vn->mnt_data` 置成**该条挂载的 priv**（`dir_iter.mnt_data` 同源），失败再试 `dev_lookup`（虚拟节点 `mnt_data = NULL`）；`O_CREAT` 试 `create` → `O_TRUNC` 试截断；三处失败各有出口。`abs_path()` 超长直接 `ENAMETOOLONG`，不写半个路径。
+- 挂载入口只有 `vfs_mount_fs(ops, priv, prefix)`（前缀必须 `/` 开头、同前缀不重复）与 `vfs_umount(prefix)`（sync → 去激活 → 重算 `disk_ready`，**不 free priv**：挂载数据与其他挂载共享）；两者都**不是 syscall**。`vfs_free_space(path)` 是 `fs_ops.freespace` 的唯一调用者。跨挂载点 `rename` 回 `EXDEV`。
+- 块注册表 `blk_list[BLK_MAX=8]`：`blk_register()` 回 0 / `EFAIL`，满槽打 `[blk] … NOT registered` 并**保持表不变**；分区在尝试挂载前就入表，所有权归注册表、永不被挂载失败回收。
 - 设备节点只有 `/dev`、`/dev/console`；console 读阻塞等待输入，**信号 EINTR 优先于睡眠**，arm waiter 后二次复查竞态，等待者是 `con_next` 链表（多读者互不覆盖）。
 - 访问语义：`reg_read/reg_write` 按 fd 访问位放行（`O_RDONLY` 拒写、`O_WRONLY` 拒读，皆 `EBADF`）；`O_APPEND` 每次写落 fs **实时** size；`getdent` 缓冲 < 单条 dirent（72 字节含 0）即 `EINVAL`（小缓冲不回 0 让调用方忙等）。
 
@@ -381,9 +383,10 @@ kernel/fs/
 
 ### 6.7 挂载顺序与回退
 
-1. `vfs_try_mount_disk()` 按 `blk_list[]` 逐盘：先"整盘 FAT32"，失败再试"MBR 分区表"（`mbr.c` 把分区包成 `part_dev`，读写转发 `blk_io_*`）。
-2. `mbr.c` 解析期掐死坏输入：签名 55AA 必须；每表项验 `lba + count <= 盘容量`，越界（含 count==0）报 `[mbr] … outside the disk` 后丢弃；EBR 链真正遍历（表 0 是相对 `ebr+rel` 的逻辑分区、表 1 是相对前移的链接，上限 32 段，`MBR_MAX_PARTITIONS` = 4 主 + 32 逻辑）。
-3. 根没就绪或缺 `/bin/init` → `vfs_mount_initramfs()` 用 newc cpio 当根；没有 `INITRAMFS=` 的构建带空段，行为不变。
+1. `vfs_try_mount_disk()` 按 `blk_list[]` 快照逐盘（遍历中分区会入表，快照避免把分区当盘再解析一遍）：先"整盘 FAT32"，失败再试"MBR 分区表"（`mbr.c` 把分区包成 `part_dev`，读写转发 `blk_io_*`；**每个非扩展分区先 `blk_register` 再试挂载**，盘名在对象里、每个分区各自一份）。
+2. **挂载点分流（C51）**：能挂上的卷先问 `volume_has_init()`——有 `/bin/init` 的占 `/`，其余挂 `/mnt`（`home_volume()` 定"家"、`find_volume()` 按路径选卷，`refresh_root()` 在根变化后重算）；`main.c` 按三分支打印提示（根在盘 / 根在 initramfs / 数据盘在 `/mnt`）。
+3. `mbr.c` 解析期掐死坏输入：签名 55AA 必须；每表项验 `lba + count <= 盘容量`，越界（含 count==0）报 `[mbr] … outside the disk` 后丢弃；EBR 链真正遍历（表 0 是相对 `ebr+rel` 的逻辑分区、表 1 是相对前移的链接，上限 32 段，`MBR_MAX_PARTITIONS` = 4 主 + 32 逻辑）。
+4. 根没就绪或缺 `/bin/init` → `vfs_mount_initramfs()` 用 newc cpio 当根，它复用 `umount_prefix("/")` 先把旧根去激活（与 `vfs_umount` 同一条路径）；没有 `INITRAMFS=` 的构建带空段，行为不变。
 
 ## 7. 驱动
 
@@ -418,11 +421,11 @@ kernel/fs/
 
 | 驱动 | 要点 |
 |---|---|
-| `ide.c` | 硬编码主通道 `0x1F0`、主设备、PIO、单命令 ≤256 扇区。选盘 → 4 次状态读当 400 ns → `s==0x00\|\|0xFF` 判无设备 → 等 DRDY → `0xEC` → `ide_wait_drq()`（**全文件唯一 ERR 判定点**）→ IDENTIFY → `ata_total_sectors()` 取容量，0 则不注册。读写先做 LBA 上界检查（28 位命令），`ide_lock` 包住整个循环。轮询预算两档：探测 `IDE_PROBE_ITERS`、读写 `IDE_POLL_ITERS`（QEMU 在 vCPU 线程里同步落宿主文件，宿主回写压力下 BSY 可持数十毫秒，旧 10 万次预算会把正常命令饿成 EIO） |
-| `ahci.c` | `ahci_init → pci_scan → ahciProbe`（class 过滤）→ 映射 ABAR → HBA 复位 → `ahciProbePort` → `blk_register`。下发 `buildH2dFis + issueCmd`：轮询 `P_CI` 清零后**先查 `IS_TFES` 再查 `PxTFD.ERR`**（完成 ≠ 成功），超时用 TSC 折算。单 PRD，缓冲必须物理连续的 512 字节 |
+| `ide.c` | 硬编码主通道 `0x1F0`、主设备、PIO、单命令 ≤256 扇区。选盘 → 4 次状态读当 400 ns → `s==0x00\|\|0xFF` 判无设备 → 等 DRDY → `0xEC` → `ide_wait_drq()`（**ERR 判定点**）→ IDENTIFY → `ata_total_sectors()` 取容量，0 则不注册。**LBA48**：`ide_issue(lba,n,cmd)` 按最后一个扇区选 `0x20/0x30`（LBA28）或 `0x24/0x34`（EXT），`last > 0xFFFFFFFFFFFF` 直接拒，首次走 EXT 打 `[ide] LBA48:`；**写完发 `0xE7` CACHE FLUSH 并由 `ide_wait_flush()` 判 BSY/ERR/DRDY**，失败打 `[ide] FLUSH CACHE (E7) failed` 回 `EFAIL`（与 AHCI 一致；`ide_wait_ready` 仍不判 ERR，是既有决定：发命令前判错会把上一条的 ERR 变成死等）。`ide_lock` 包住整个循环。轮询预算两档：探测 `IDE_PROBE_ITERS`、读写 `IDE_POLL_ITERS`（QEMU 在 vCPU 线程里同步落宿主文件，宿主回写压力下 BSY 可持数十毫秒，旧 10 万次预算会把正常命令饿成 EIO） |
+| `ahci.c` | `ahci_init → pci_scan → ahciProbe`（class 过滤）→ 映射 ABAR → HBA 复位 → `ahciProbePort` → `blk_register`（多盘：`sd_names[8]` 按注册序命名）。**中断驱动**：`GHC_IE` 使能 + 每端口 `PxIM` arm INTA → `ahciRouteIrq()` 把端口中断经 IOAPIC 接到 vector 32+line 并 unmask；`issueCmd` 下发顺序 = 清 `PxIS` → **开中断** → 写 `P_CI` → 完成经 `ahciIsr()`（排空 IS、`irq_done` 回执）→ 轮询 `P_CI` 只作超时兜底（超时 dump TFD/IS/SERR 后判失败）；探测期与超时路径用 `ahciPortReclaim()` 回收 CLB/FIS/CT，停不下来则保留内存。下发 `buildH2dFis`：**先查 `IS_TFES` 再查 `PxTFD.ERR`**（完成 ≠ 成功），超时用 TSC 折算。单 PRD，缓冲必须物理连续的 512 字节。自测 `ahci_irq_selftest()`（无 AHCI 设备回 -1 即 ktest skip） |
 | `pci.c` | 传统 `0xCF8/0xCFC` 配置窗口，`pci_scan` 递归（visited + 深度上限），支持多功能设备 |
 
-⚠️ **`make run` 的 QEMU 是 `if=ide`，机器上没有 SATA 控制器**：`ahciProbe` 的 class 过滤对所有设备提前返回，AHCI 路径在标准流程下零执行；`mbr.c` 同理是第二步 fallback，整盘 FAT 总能先成功。
+⚠️ **`make run` 默认 `MACHINE=q35`，AHCI 是主路径**（`sda`）；`MACHINE=pc` 是 IDE/hda，无 SATA 控制器，`ahciProbe` 的 class 过滤对所有设备提前返回，AHCI 路径零执行、`ktest/t_ahci.c` 自动 skip；`mbr.c` 是第二步 fallback，整盘 FAT 总能先成功。`smoke` 固定 pc + TCG + `-m 256`。
 
 容量统一走 `ata_total_sectors()`（`include/sys/vfs.h` 的 static inline）：IDENTIFY words 100-103 非 0 即权威；words 60-61 为 `FFFFFFFFh` 哨兵返回 0，调用方据此**拒绝 `blk_register`**。
 
@@ -530,18 +533,18 @@ smp_init():
 
 框架与用例分离：`ktest/ktest.c` + **26 个 `t_*.c`**；`KTEST(suite, stage, fn)` 注册进 `.ktest` 段，按 `EARLY/MM/LATE` 三阶段在 `start_kernel` 里跑。编译开关 `KTEST=1`；`make smoke` 强制 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
 
-当前判据（2026-11-03 实机 boot 日志，加用例先改这里）：
+当前判据（2026-11-05 实机 boot 日志，加用例先改这里）：
 
 | 阶段 | cases | checks | failed |
 |---|---|---|---|
 | early | 25 | 398 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 78 | 3120 | 0 |
-| 合计 | 120 | 3955 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 85 | 3219 | 0 |
+| 合计 | 127 | 4054 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (120 cases, 3955 checks) [2 skipped]` 与 `[selftest] 3955/3955 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**（`WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 任何模式都停机）。
+汇总行 `[ktest] selftest PASS (127 cases, 4054 checks) [2 skipped]` 与 `[selftest] 4054/4054 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**（`WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 任何模式都停机）。`MACHINE=pc` 下为 `127 cases, 4032 checks [3 skipped]`（`ahci` 整例 skip + early 少 21 checks，均为机器差异，0 failed 同判据）。
 
-29 个 suite：`abi blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mouse oom pmm prop syscall task usercopy vfs vmm`，覆盖 ABI 布局与编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、系统调用指针门、信号与任务、VFS/FAT32、键盘/鼠标/统一输入队列。
+31 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mouse oom pmm prop syscall task usercopy vfs vmm`，覆盖 ABI 布局与编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、系统调用指针门、信号与任务、VFS/FAT32（含多盘挂载分流）、块注册表（分区与满槽）、AHCI 中断路由与首命令中断完成（无 AHCI 设备即 skip）、键盘/鼠标/统一输入队列。
 
 ### 9.2 端到端冒烟（`scripts/smoke_test.py`，`make smoke`）
 
@@ -579,8 +582,13 @@ smp_init():
 - `sched_wake_task` 不得持 `runq_lock` 调 `runqueue_add`（后者内部再拿同一把锁 → 自旋死锁）；双重唤醒由 `rq_cpu != -1` 复查兜住。
 - 只有 `pml4` 不同才切 CR3；idle 任务的 pml4 必须是 `master_pml4_phys()`。
 - 信号只在 `iretq` 之前、带 ring-3 守卫的地方投递；一次只投一帧。
+- `current->tf` 只发布 **ring-3 帧**（`isr_common` 里 `(f->cs & 3) == 3` 才写）：它是该任务 `iretq` 回用户态要用的那帧，`sys_execve` 改它的 `rip/ussp`、`sys_fork` 拷贝它、signal 改投它；ring-0 中断帧用完即弃，发布出去会让 execve 写死帧 → 旧 rip + 新地址空间 → 用户 `#UD`。
 - restorer 页是唯一 `exec=true` 的用户页（其余用户页 NX），每个地址空间映一次。
 - `blk_io_read/write` 是全内核唯一调用 `dev->read/write` 的地方（含分区层）。
+- 路径路由只认**最长前缀 + 组件边界**的那条挂载项，`ops` 与 `priv` 必须成对取自它；`vnode.mnt_data` / `dir_iter.mnt_data` 是解析时的那条挂载，绝不是占位符或"按 ops 反查的那一个"。
+- `vfs_close_file` 只减调用者真有的那份引用，refcnt ≤ 0 的多余 close 记日志后忽略（不二次 free、计数不回绕）；`vfs_umount` 只动路由、**不 free priv**（挂载数据共享）。
+- `blk_register` 满 8 槽必须**大声拒绝且表不变**；注册表拥有分区对象，挂载失败不回收它（`diskinfo` 正在枚举这些指针）。
+- IDE 与 AHCI 的写都以 `0xE7` CACHE FLUSH 收尾并**检查返回值**：`write()` 回 0 才是可承诺的落盘。
 - FAT 区**永不进块缓存**；元数据走 redo 日志，文件数据字节走写回缓存（ordered）。
 - journal `commit` 第 ④ 步失败必须**保留 COMMIT 状态**；失败路径也必须 commit。
 - 一个扇区只走一条读写路（数据/目录经缓存、FAT 区直写、挂载期直读），三者不重叠。

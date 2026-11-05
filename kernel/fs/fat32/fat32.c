@@ -229,7 +229,7 @@ static int fat32_getdent_locked(void *mnt, void *dirnode, u64 *cookie, struct di
 
 static u64 fat_freespace_impl(void *mnt)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     u64 free_clusters = 0;
     for (u32 i = 2; i < m->max_cluster; i++)
         if ((fat_entry_get(m, i) & 0x0FFFFFFF) == 0) free_clusters++;
@@ -275,9 +275,9 @@ static int fat_read(void *mnt, void *node, u64 off, void *ubuf, size_t n)
 static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
 {
     FAT_ENTER();
-    fat_journal_begin(fat_priv);
+    fat_journal_begin(mnt);
     int r = fat_write_impl(mnt, node, off, buf, n);
-    int c = fat_journal_commit(fat_priv);
+    int c = fat_journal_commit(mnt);
     FAT_LEAVE();
     if (r < 0) return r;
     return c < 0 ? c : r; /* a failed commit means the short count never landed */
@@ -286,9 +286,9 @@ static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
 static int fat_create(void *mnt, const char *path)
 {
     FAT_ENTER();
-    fat_journal_begin(fat_priv);
+    fat_journal_begin(mnt);
     int r = fat_create_impl(mnt, path);
-    int c = fat_journal_commit(fat_priv);
+    int c = fat_journal_commit(mnt);
     FAT_LEAVE();
     return r ? r : c;
 }
@@ -296,9 +296,9 @@ static int fat_create(void *mnt, const char *path)
 static int fat_mkdir(void *mnt, const char *path)
 {
     FAT_ENTER();
-    fat_journal_begin(fat_priv);
+    fat_journal_begin(mnt);
     int r = fat_mkdir_impl(mnt, path);
-    int c = fat_journal_commit(fat_priv);
+    int c = fat_journal_commit(mnt);
     FAT_LEAVE();
     return r ? r : c;
 }
@@ -306,9 +306,9 @@ static int fat_mkdir(void *mnt, const char *path)
 static int fat_unlink(void *mnt, const char *path)
 {
     FAT_ENTER();
-    fat_journal_begin(fat_priv);
+    fat_journal_begin(mnt);
     int r = fat_unlink_impl(mnt, path);
-    int c = fat_journal_commit(fat_priv);
+    int c = fat_journal_commit(mnt);
     FAT_LEAVE();
     return r ? r : c;
 }
@@ -316,9 +316,9 @@ static int fat_unlink(void *mnt, const char *path)
 static int fat_rmdir(void *mnt, const char *path)
 {
     FAT_ENTER();
-    fat_journal_begin(fat_priv);
+    fat_journal_begin(mnt);
     int r = fat_rmdir_impl(mnt, path);
-    int c = fat_journal_commit(fat_priv);
+    int c = fat_journal_commit(mnt);
     FAT_LEAVE();
     return r ? r : c;
 }
@@ -326,9 +326,9 @@ static int fat_rmdir(void *mnt, const char *path)
 static int fat_rename(void *mnt, const char *oldpath, const char *newpath)
 {
     FAT_ENTER();
-    fat_journal_begin(fat_priv);
+    fat_journal_begin(mnt);
     int r = fat_rename_impl(mnt, oldpath, newpath);
-    int c = fat_journal_commit(fat_priv);
+    int c = fat_journal_commit(mnt);
     FAT_LEAVE();
     return r ? r : c;
 }
@@ -559,6 +559,12 @@ void *fat_mount(struct blkdev *dev)
             dev->name, totsec * m->bytes_per_sector >> 20, m->bytes_per_sector,
             m->sectors_per_cluster, m->root_cluster);
 
-    fat_priv = m;
+    /* C51: only the first mount claims fat_priv.  The VFS can now place a
+     * second volume (a data disk at /mnt...), and letting each one take this
+     * over would repoint every caller that works through fat_priv -- the
+     * boot self-tests above all -- at a volume that is not the root.  The
+     * volume that takes "/" sets it explicitly instead (vfs.c), so probe
+     * order alone never decides which volume "the active one" means. */
+    if (!fat_priv) fat_priv = m;
     return m;
 }

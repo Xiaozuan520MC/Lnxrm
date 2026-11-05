@@ -83,7 +83,7 @@ static void test_write_refuses_an_unreadable_sector(void)
 
     struct vnode vn;
     memset(&vn, 0, sizeof(vn));
-    K_ASSERT_EQ(fat_lookup_impl(NULL, "/README.md", &vn), 0);
+    K_ASSERT_EQ(fat_lookup_impl(fat_priv, "/README.md", &vn), 0);
     K_ASSERT(vn.fs_data != NULL);
     struct resolve *r = vn.fs_data;
 
@@ -98,7 +98,7 @@ static void test_write_refuses_an_unreadable_sector(void)
 
     static const char payload[] = "T-005 payload must never reach the disk";
     blk_inject_io(m->dev, data_lba, BLK_IO_READ | BLK_IO_WRITE);
-    int rc = fat_write_impl(NULL, r, 0, payload, sizeof(payload) - 1);
+    int rc = fat_write_impl(fat_priv, r, 0, payload, sizeof(payload) - 1);
     blk_inject_io_off();
 
     K_EXPECT_EQ(rc, LNXRM_EIO); /* refused, not "0 bytes written" */
@@ -112,7 +112,7 @@ static void test_write_refuses_an_unreadable_sector(void)
     /* and the file still reads back exactly what it held before */
     char back[48];
     memset(back, 0, sizeof(back));
-    int n = fat_read_impl(NULL, r, 0, back, sizeof(back));
+    int n = fat_read_impl(fat_priv, r, 0, back, sizeof(back));
     K_EXPECT(n > 0);
     K_EXPECT(strncmp(back, "A tiny unix-like kernel", 23) == 0);
 
@@ -134,14 +134,14 @@ static void test_create_reports_the_failure(void)
     /* (a) the directory cannot be read: the slot must not be picked out of
      *     an unread -- i.e. uninitialised -- buffer */
     blk_inject_io(m->dev, dir_lba, BLK_IO_READ);
-    int rc = fat_create_impl(NULL, "/t005a");
+    int rc = fat_create_impl(fat_priv, "/t005a");
     blk_inject_io_off();
     K_EXPECT_EQ(rc, LNXRM_EIO);
 
     /* (b) reading works, writing is refused: the call must not claim the
      *     entry exists when it was never staged */
     blk_inject_io(m->dev, dir_lba, BLK_IO_WRITE);
-    rc = fat_create_impl(NULL, "/t005b");
+    rc = fat_create_impl(fat_priv, "/t005b");
     blk_inject_io_off();
     K_EXPECT_EQ(rc, LNXRM_EIO);
 
@@ -158,8 +158,8 @@ static void test_create_reports_the_failure(void)
 
     /* Belt and braces: if a regression did let an entry through, take it
      * back out so the image is left exactly as it was found. */
-    fat_unlink_impl(NULL, "/t005a");
-    fat_unlink_impl(NULL, "/t005b");
+    fat_unlink_impl(fat_priv, "/t005a");
+    fat_unlink_impl(fat_priv, "/t005b");
 }
 
 /* The read half of every lookup-shaped call: an unreadable directory has to
@@ -177,17 +177,17 @@ static void test_lookup_reports_io_error_not_enoent(void)
 
     struct vnode root, vn;
     memset(&root, 0, sizeof(root));
-    K_ASSERT_EQ(fat_lookup_impl(NULL, "/", &root), 0);
+    K_ASSERT_EQ(fat_lookup_impl(fat_priv, "/", &root), 0);
     K_ASSERT(root.fs_data != NULL);
 
     blk_inject_io(m->dev, dir_lba, BLK_IO_READ);
 
     memset(&vn, 0, sizeof(vn));
-    int lk = fat_lookup_impl(NULL, "/README.md", &vn);
-    int un = fat_unlink_impl(NULL, "/t005-missing"); /* name it could not read */
-    int rm = fat_rmdir_impl(NULL, "/t005-missing-dir");
+    int lk = fat_lookup_impl(fat_priv, "/README.md", &vn);
+    int un = fat_unlink_impl(fat_priv, "/t005-missing"); /* name it could not read */
+    int rm = fat_rmdir_impl(fat_priv, "/t005-missing-dir");
 
-    struct dir_iter it = {.node = root.fs_data, .cookie = 0};
+    struct dir_iter it = {.node = root.fs_data, .cookie = 0, .mnt_data = fat_priv};
     struct dirent_out d;
     int gd = fat_dir_iter(&it, &d);
 

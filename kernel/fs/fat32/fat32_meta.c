@@ -365,7 +365,7 @@ static int dir_claim_run(struct fat_mount *m, u32 dirclus, int need, struct dire
 
 int fat_create_impl(void *mnt, const char *path)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct parent_dir pd;
     int rc = parent_dir_init(m, path, &pd);
     if (rc) return rc;
@@ -394,7 +394,7 @@ static u32 dotdot_store(struct fat_mount *m, u32 parent)
 
 int fat_mkdir_impl(void *mnt, const char *path)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct parent_dir pd;
     int rc = parent_dir_init(m, path, &pd);
     if (rc) return rc;
@@ -462,7 +462,7 @@ free_cluster: /* the content of the new directory could not be written */
 
 int fat_rmdir_impl(void *mnt, const char *path)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct resolve r;
     int rc = fat_resolve_path(m, path, &r);
     if (rc < 0) return rc; /* T-005 */
@@ -524,7 +524,7 @@ done_check:
 
 int fat_unlink_impl(void *mnt, const char *path)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     struct resolve r;
     int rc = fat_resolve_path(m, path, &r);
     if (rc < 0) return rc; /* T-005: EIO, not "already gone" */
@@ -737,7 +737,7 @@ static void path_trim(char *p)
  * link of a moved directory is repointed at the new parent. */
 int fat_rename_impl(void *mnt, const char *oldpath, const char *newpath)
 {
-    struct fat_mount *m = fat_priv;
+    struct fat_mount *m = mnt;
     (void)mnt;
     char ob[128], nb[128];
     strncpy(ob, oldpath, sizeof(ob) - 1);

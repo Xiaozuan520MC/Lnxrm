@@ -7,7 +7,11 @@
 #include <sys/ktest.h>
 #include <sys/vfs.h>
 #include <console.h>
+#include <disk.h>
+#include <fat32.h>
 #include <mm/mm.h>
+#include <string.h>
+#include "kblk.h"
 
 /* C46: a path that does not fit the 128-byte scratch buffer abs_path()
  * normalises into is refused with ENAMETOOLONG.  Cutting it short instead
@@ -362,6 +366,238 @@ static void test_getdent_small_buffer_refused(void)
     vfs_close_file(d);
 }
 
+/* C43: dropping a reference must not be able to run the count below zero,
+ * and a drop that arrives with nothing left to drop must leave the file
+ * alone instead of freeing it out from under whoever still holds it. */
+static void test_close_saturates_the_refcount(void)
+{
+    struct file *f = NULL;
+    K_ASSERT_EQ(vfs_open_file("/README.md", O_RDONLY, &f), 0);
+    K_ASSERT(f != NULL);
+    K_EXPECT_EQ(f->refcnt, 1);
+
+    /* two holders: the first close is not the last one */
+    f->refcnt = 2;
+    vfs_close_file(f);
+    K_EXPECT_EQ(f->refcnt, 1);
+    char buf[8];
+    K_EXPECT_EQ(vfs_read_file(f, buf, sizeof(buf)), (u64)sizeof(buf));
+
+    /* nothing left to drop: refused, not underflowed, and not freed --
+     * the reads below only hold if the object is still there */
+    f->refcnt = 0;
+    vfs_close_file(f);
+    K_EXPECT_EQ(f->refcnt, 0);
+    K_EXPECT(f->ops != NULL && f->ops->read != NULL);
+    K_EXPECT_EQ(vfs_read_file(f, buf, sizeof(buf)), (u64)sizeof(buf));
+
+    /* the same for a count already driven negative */
+    f->refcnt = -3;
+    vfs_close_file(f);
+    K_EXPECT_EQ(f->refcnt, -3);
+
+    /* and the real last drop still frees exactly once */
+    f->refcnt = 1;
+    vfs_close_file(f);
+}
+
+/* C39: a node carries the mount it was resolved through, and the freespace
+ * hook has a caller.  Both used to be placeholders -- vnode.mnt_data was
+ * (void*)1 and nothing ever called ops->freespace -- which is what made the
+ * whole mount layer decorative. */
+static void test_mount_data_reaches_the_node(void)
+{
+    if (!root_ready()) return;
+
+    struct file *f = NULL;
+    K_ASSERT_EQ(vfs_open_file("/README.md", O_RDONLY, &f), 0);
+    K_ASSERT(f != NULL && !f->is_dir);
+    struct vnode *vn = f->priv;
+    K_ASSERT(vn != NULL);
+    K_EXPECT(vn->ops != NULL);
+    /* the whole point: not a placeholder, and specifically not the old
+     * (void*)1 sentinel */
+    K_EXPECT(vn->mnt_data != NULL);
+    K_EXPECT(vn->mnt_data != (void *)1);
+    if (vfs_root_is_fat()) K_EXPECT_EQ((u64)vn->mnt_data, (u64)fat_priv);
+    vfs_close_file(f);
+
+    /* a directory's iterator carries the same mount, since file_alloc() has
+     * to hand the ops layer something to call the volume with */
+    struct file *d = NULL;
+    K_ASSERT_EQ(vfs_open_file("/", O_RDONLY, &d), 0);
+    K_ASSERT(d != NULL && d->is_dir);
+    struct dir_iter *it = d->priv;
+    K_EXPECT(it != NULL);
+    K_EXPECT(it->mnt_data != NULL && it->mnt_data != (void *)1);
+    if (vfs_root_is_fat()) K_EXPECT_EQ((u64)it->mnt_data, (u64)fat_priv);
+    vfs_close_file(d);
+
+    /* vfs_free_space() routes a path to its mount's hook and answers with
+     * bytes: the same number the volume's own ops entry gives when asked
+     * directly, and never an error code for a path that is mounted. */
+    long via_path = vfs_free_space("/");
+    K_EXPECT(via_path >= 0);
+    if (vfs_root_is_fat())
+        K_EXPECT_EQ((u64)via_path, fat32_ops.freespace(fat_priv));
+    else
+        K_EXPECT_EQ(via_path, 0); /* a read-only archive has no free space */
+}
+
+/* C39/C47: two mounts of the SAME ops table, each with its own volume.
+ * Only that shape can falsify "the mount travels with the path": with one
+ * volume, routing could hand back any priv at all and every answer would
+ * still look right.  So a second FAT32 volume is forged, mounted at "/alt",
+ * and both roots are asked to list themselves -- the answer each gives is
+ * the volume routing actually picked. */
+static void test_second_mount_routes_to_its_own_volume(void)
+{
+    if (!root_ready() || !vfs_root_is_fat()) {
+        ktest_skip("no FAT32 root to bind a second mount point to");
+        return;
+    }
+
+    /* before it exists, "/alt" is just a name under the root mount */
+    struct file *pre = NULL;
+    K_EXPECT_EQ(vfs_open_file("/alt", O_RDONLY, &pre), (u64)LNXRM_ENOENT);
+    K_EXPECT(pre == NULL);
+    struct file *pref = NULL;
+    K_EXPECT_EQ(vfs_open_file("/alt/README.md", O_RDONLY, &pref), (u64)LNXRM_ENOENT);
+    K_EXPECT(pref == NULL);
+
+    struct kblk *k = kblk_make("kmntalt", 256, 16);
+    K_ASSERT(k != NULL);
+    u8 *s0 = kblk_sector(k, 0);
+    K_ASSERT(s0 != NULL);
+    kblk_forge_fat32_bpb(s0, 1, 8, 2, 1 /* FAT = 512 B = 128 cells */, 256, 2);
+
+    /* fat_mount() publishes its result into fat_priv, which belongs to the
+     * real root volume -- park it and put it straight back, or every case
+     * behind this one would be reading the forged disk. */
+    struct fat_mount *active = fat_priv;
+    struct fat_mount *m2 = fat_mount(&k->dev);
+    fat_priv = active;
+    K_ASSERT(m2 != NULL); /* leaked (m2 + kblk) rather than left mounted */
+
+    K_ASSERT_EQ(vfs_mount_fs(&fat32_ops, m2, "/alt"), 0);
+
+    struct file *a = NULL, *r = NULL;
+    K_EXPECT_EQ(vfs_open_file("/alt", O_RDONLY, &a), 0);
+    K_EXPECT_EQ(vfs_open_file("/", O_RDONLY, &r), 0);
+    if (a && r) {
+        struct dir_iter *ia = a->priv, *ir = r->priv;
+        K_EXPECT(a->is_dir && r->is_dir);
+        /* C39: which mount each iterator belongs to */
+        K_EXPECT_EQ((u64)ia->mnt_data, (u64)m2);
+        K_EXPECT_EQ((u64)ir->mnt_data, (u64)fat_priv);
+        K_EXPECT(ia->mnt_data != ir->mnt_data);
+
+        /* ... and the answers come from those volumes, not from whichever
+         * one the ops table happened to name */
+        char bufa[256], bufr[256];
+        memset(bufa, 0, sizeof(bufa));
+        memset(bufr, 0, sizeof(bufr));
+        K_EXPECT_EQ(a->ops->getdent(a, bufa, sizeof(bufa)), 0); /* forged root: empty */
+        K_EXPECT(r->ops->getdent(r, bufr, sizeof(bufr)) > 0);   /* real root: has names */
+    }
+    if (a) vfs_close_file(a);
+    if (r) vfs_close_file(r);
+
+    /* C47: taking it back out of the table removes the route, and the root
+     * mount underneath is neither disturbed nor removed with it. */
+    K_EXPECT_EQ(vfs_umount("/alt"), 0);
+
+    struct file *post = NULL;
+    K_EXPECT_EQ(vfs_open_file("/alt/README.md", O_RDONLY, &post), (u64)LNXRM_ENOENT);
+    K_EXPECT(post == NULL);
+    K_EXPECT_EQ(vfs_umount("/alt"), (u64)LNXRM_ENOENT); /* not mounted: says so */
+
+    struct file *ok = NULL;
+    K_EXPECT_EQ(vfs_open_file("/README.md", O_RDONLY, &ok), 0);
+    if (ok) vfs_close_file(ok);
+
+    fat_pages_free(m2);
+    kfree(m2);
+    /* drop the forged volume's cache lines before the device goes away, so
+     * a later writeback cannot find a pointer to freed memory */
+    blk_cache_purge(&k->dev);
+    kblk_free(k);
+}
+
+/* C51: a disk that carries no /bin/init is data, not root -- and the only
+ * honest way to ask that question is with "/" free, so the real root goes
+ * down first and the very same volume comes back afterwards (C47: umount
+ * deactivates a mount, it never releases it).  The forged volume is both
+ * empty and init-less, so placement that put it at "/", or that displaced
+ * the root with it, shows up in the return code and in what each path then
+ * answers.  The other half of the rule -- a volume WITH /bin/init takes "/"
+ * -- is what every boot does, and what the smoke log's
+ * "[vfs] FAT32 mounted at /" line records. */
+static void test_a_disk_without_init_is_placed_below_root(void)
+{
+    if (!root_ready() || !vfs_root_is_fat()) {
+        ktest_skip("no FAT32 root to take down");
+        return;
+    }
+
+    /* The root's identity is fetched before anything is unmounted, so a
+     * later failure still leaves a way back to it. */
+    struct fs_ops *rops;
+    void *rpriv;
+    K_ASSERT_EQ(vfs_root_mount(&rops, &rpriv), 0);
+
+    /* Forge the data volume BEFORE touching "/": a failed allocation must
+     * not be able to leave the machine with no root at all. */
+    struct kblk *k = kblk_make("kmntdata", 256, 16);
+    K_ASSERT(k != NULL);
+    u8 *s0 = kblk_sector(k, 0);
+    K_ASSERT(s0 != NULL);
+    kblk_forge_fat32_bpb(s0, 1, 8, 2, 1 /* FAT = 512 B = 128 cells */, 256, 2);
+
+    /* "/" free -- the state the rule exists for */
+    K_EXPECT_EQ(vfs_umount("/"), 0);
+    K_EXPECT(!vfs_root_ready()); /* derived from the table, not remembered */
+
+    void *m = NULL;
+    int rc = vfs_probe_home(&k->dev, &m);
+    K_EXPECT_EQ(rc, 1);        /* a data prefix, not the root slot */
+    K_EXPECT(m != NULL);
+    K_EXPECT(!vfs_root_ready());  /* an init-less volume took "/" anyway? */
+    K_EXPECT(vfs_data_volume_ready());   /* ...it did not: it is a data volume */
+    K_EXPECT(vfs_free_space("/mnt") >= 0); /* and it answers under /mnt */
+
+    /* Root back: same ops, same volume, no second mount of "/" created */
+    if (rc == 0) vfs_umount("/"); /* bug path: give the slot back first */
+    K_EXPECT_EQ(vfs_mount_fs(rops, rpriv, "/"), 0);
+    K_EXPECT(vfs_root_ready());
+
+    /* Both volumes are mounted now, so routing can be told apart by what
+     * each path answers: the root is the real disk, /mnt the empty forge. */
+    struct file *r = NULL;
+    K_EXPECT_EQ(vfs_open_file("/README.md", O_RDONLY, &r), 0);
+    if (r) vfs_close_file(r);
+    struct file *d = NULL;
+    K_EXPECT_EQ(vfs_open_file("/mnt/README.md", O_RDONLY, &d), (u64)LNXRM_ENOENT);
+    K_EXPECT(d == NULL);
+    K_EXPECT(vfs_free_space("/mnt") < vfs_free_space("/"));
+
+    /* Take the data volume back out: the root stays, and so does the answer
+     * to "is anything mounted below /". */
+    K_EXPECT_EQ(vfs_umount("/mnt"), 0);
+    K_EXPECT(vfs_root_ready());
+    K_EXPECT(!vfs_data_volume_ready());
+    K_EXPECT(vfs_file_exists("/bin/init"));
+
+    if (m) {
+        fat_pages_free(m);
+        kfree(m);
+    }
+    /* drop the forged volume's cache lines before the device goes away, so
+     * a later writeback cannot find a pointer to freed memory */
+    blk_cache_purge(&k->dev);
+    kblk_free(k);
+}
+
 KTEST("vfs", KTEST_LATE, test_ata_capacity);
 KTEST("vfs", KTEST_LATE, test_read_readme);
 KTEST("vfs", KTEST_LATE, test_root_listing);
@@ -371,3 +607,7 @@ KTEST("vfs", KTEST_LATE, test_enospc_on_full_volume);
 KTEST("vfs", KTEST_LATE, test_open_close_leaks_nothing);
 KTEST("vfs", KTEST_LATE, test_access_mode_and_append);
 KTEST("vfs", KTEST_LATE, test_getdent_small_buffer_refused);
+KTEST("vfs", KTEST_LATE, test_close_saturates_the_refcount);
+KTEST("vfs", KTEST_LATE, test_mount_data_reaches_the_node);
+KTEST("vfs", KTEST_LATE, test_second_mount_routes_to_its_own_volume);
+KTEST("vfs", KTEST_LATE, test_a_disk_without_init_is_placed_below_root);
