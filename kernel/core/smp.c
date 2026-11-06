@@ -5,6 +5,7 @@
 #include <mm/mm.h>
 #include <sys/cpu.h>
 #include <console.h>
+#include <framebuffer.h>
 #include <sys/sched.h>
 #include <io.h>
 #include <sys/spinlock.h>
@@ -229,6 +230,15 @@ void smp_init(void)
 
 void ap_main(u32 ap_id)
 {
+    /* The LFB's memory type is per logical processor: IA32_PAT gets its
+     * own WC slot here, and this core adopts the BSP's MTRR state (an AP's
+     * reset MTRRs are its own; unsynced, this core could resolve the LFB
+     * PTE to a different type than the BSP stores with).  Both must settle
+     * before anything here can touch the framebuffer -- the kprintfs below,
+     * panic's flip -- so every CPU stores to the LFB with the same type.
+     * See fb_memtype_program(). */
+    fb_memtype_program();
+
     struct cpu_info *c = &cpu_table[ap_id];
     c->id = ap_id;
     c->bsp = false;

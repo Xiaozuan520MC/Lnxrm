@@ -257,6 +257,13 @@
 - q35 幻影 port 2 区分"无响应"与"被拒绝"并回收 CLB/FIS/CT（`ahciPortReclaim`），boot 就绪 33.8 s → 8.5 s。
 - ktest 基线升到 **127 cases / 4054 checks**：新增 `ktest/t_ahci.c`（中断路由 + 首命令中断完成）与 `t_vfs.c` 多盘分流用例。
 
+### 2026-11-06 双缓冲呈现与 LFB 写合并批次
+
+- **P0-A 频率门**：`fb_present_wanted()` 从 `jiffies == fb_last_present` 改 `jiffies == 0`——旧条件在同 tick 内 present 落地后重开写批次门，快速滚屏时控制台每个 64 B 分块都做一次全屏 present（每次拷贝都是整帧预算），输出一帧一爬；现在首 tick 后批次门**永久关死**，呈现只由 tick 节流。
+- **P0-C 撕裂**：present 的逐行拷贝从"锁外"改为**全程持 `console_out_lock`**（拆出 `fb_present_held()`；`fb_flip`/`fb_tick_flush` 走 lock→held→unlock，批次路径调用方已持锁直调 held）；4 个绘图 syscall（clear/fill/char/puts）**整个原语持锁**、unlock 兼批次尾；`panic()` 改 `fb_flip_unlocked()`（T-002：调用方可能已持锁，再拿即关中断自旋死锁）；拷贝尾补 `mfence`（WC 合并缓冲排空，否则 flip 返回即读会读到旧帧）。staging 快照方案放弃：1080p back+staging = 15.8 MiB > 14 MiB 后缓冲窗，真机会被逼回单缓冲。
+- **P0-B PAT/MTRR**：新增 `fb_memtype_program()`（每 CPU 一次：BSP 在 `fb_init`、AP 在 `ap_main` 顶）——① `IA32_PAT` 无 WC 槽时补 `PAT[7]=WC`（全仓无人选它）；② BSP 存 DEFTYPE+variable range 快照，AP 关 range→清零→回放→DEFTYPE 收尾（MTRR per core，AP 复位态与 BSP 不保证一致，不采纳即 BSP=UC/AP=WC 混写同一 PTE；fixed 只达 1 MiB 下不镜像）；③ 「MTRR 开、无 range 覆盖孔径、默认 UC/WP」时给孔径**新增** pow2 WC range（只用空槽、不碰固件已有范围、块恒在 BAR 内，撞范围/无空槽/对不齐即放弃并点名）；固件 UC **覆盖**孔径（QEMU：`mtrr[0]=0xc0000000/1 GiB/UC` 盖住 `0xfd000000`）时架构性胜过 PAT WC，如实打点名判定行 `MTRR[i] UC @base -> UC`，不承诺 WC。`vcnt > 16` 时整体不改写（无法忠实镜像），全 CPU 统一停在固件类型。
+- 验证：q35 boot 0 异常、`ready in ~8.1 s`、`[smp] AP1 online` 正常、判定行为点名形式；KTEST=0/1 与 userland 零警告；ktest **127 cases / 4054 checks，0 failed**（q35 全量 239 s）。真机 `make smoke` 与撕裂/滚屏延迟实测由用户执行。
+
 ### 2026-11-03 批次
 
 - **FAT 表分帧驻留**：每帧 4 KiB `pmm_alloc` + 128 KiB bounce 散射读；挂载上限从「kmalloc 4 MiB 连续块」变为「全部空闲帧」，硬上限仍是 2^28 入口（1 GiB 表）。分配器回基线（`MAX_ORDER 11`、kmalloc 4 MiB）。

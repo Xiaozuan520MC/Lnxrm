@@ -357,21 +357,29 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
  * CPU.  With the whole-surface flag this was merely a tear -- the next
  * store anywhere repainted everything -- but a lost *region* would sit in
  * the back surface until something marked that region again, so both
- * rules are now structural, held under fb_box_lock:
+ * rules are structural:
  *
- *  - Mark after the store, never before.  A present may then skip a write
- *    that is not marked yet (one more frame for it), but it can never
- *    consume the mark of a write that has not happened.
- *  - The present consumes the box (flag down, box emptied) in one locked
- *    step and copies *outside* the lock.  A mark either completes before
- *    it -- its pixels are in the snapshot just copied -- or lands after
- *    it -- a fresh box, presented next.  Neither can slip between.
+ *  - Mark after the store, never before (under fb_box_lock).  A present
+ *    may then skip a write that is not marked yet (one more frame for
+ *    it), but it can never consume the mark of a write that has not
+ *    happened.
+ *  - The present consumes the box (flag down, box emptied) under
+ *    fb_box_lock and copies the pixels under console_out_lock.  Every
+ *    back-surface writer holds console_out_lock for its whole write --
+ *    a console batch from the first character to fb_console_flush, a
+ *    drawing syscall for the whole primitive -- so the copy reads one
+ *    consistent frame.  A scroll or cursor redraw landing mid-copy on
+ *    the other CPU is what used to stack two frames on one screen
+ *    during a fast scroll; holding the writer's own lock across the
+ *    copy is what closes that window, and a mark cannot slip in either:
+ *    it needs console_out_lock too, so it lands before the copy (its
+ *    pixels are in it) or after (a fresh box, presented next).
  *
  * fb_box_lock is held for about a dozen stores on each side (irqsave:
- * handlers print).  The copy itself stays lockless, as the flag design
- * was: two concurrent presents copy snapshots that agree, and a draw
- * racing a present can tear for one frame -- the same window the old
- * direct-to-LFB code had per pixel, now reduced to one copy.
+ * handlers print); console_out_lock spans the copy itself, which is a
+ * WB->WC blast over the dirty box -- at most a couple of milliseconds
+ * with the aperture in WC (fb_memtype_program), and every spinner on the
+ * other CPU is a console batch, already bounded by the same budget.
  *
  * Presenting is split between three callers:
  *
@@ -380,7 +388,12 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
  *    copy every FB_PRESENT_TICKS ticks, no matter how much was drawn in
  *    between, and always in the timer handler -- never in whatever
  *    context printed the byte.  A burst of kprintfs becomes one present,
- *    not one per line.
+ *    not one per line.  The batch gate is shut for good after the first
+ *    tick (see fb_present_wanted): it used to reopen for the rest of any
+ *    tick in which a present had landed, which made a fast-scrolling
+ *    console present once per 64-byte chunk -- each copy as long as the
+ *    whole frame budget, so output ran at a crawl and the screen lagged
+ *    behind it.
  *  - Before the first tick (fb_init() through kernel_spawn, which
  *    includes all of ktest stage 3), jiffies never advances and no tick
  *    is coming, so the console presents itself at its batch boundary:
@@ -448,8 +461,16 @@ static void fb_mark_dirty(u32 x, u32 y, u32 w, u32 h)
  * copied is only what was marked (front and back agree outside the box:
  * fb_console_init() synced them at boot and every write has marked its
  * box since).  No-op when single buffered (fb_ptr is the LFB then and
- * every draw already showed) or when nothing is dirty. */
-void fb_flip(void)
+ * every draw already showed) or when nothing is dirty.
+ *
+ * The copy runs with console_out_lock HELD: every back-surface writer
+ * takes that lock for its whole write, so the surface cannot change
+ * under the copy (the tear window the old lockless copy left open --
+ * a scroll racing the present = two frames stacked on screen).  Callers
+ * that do not already hold it take it here; the console batch paths
+ * (fb_console_flush, fb_present_due) already do and call the _held form
+ * directly -- console_out_lock is not reentrant. */
+static void fb_present_held(void)
 {
     if (!fb_back || !fb_front) return;
     u32 x0, y0, x1, y1;
@@ -472,28 +493,60 @@ void fb_flip(void)
         fb_copy_fwd((volatile void *)(fb_front + (u64)y * fb_pitch + (u64)x0 * fb_pxsz),
                     (const volatile void *)(fb_back + (u64)y * fb_pitch + (u64)x0 * fb_pxsz),
                     row_bytes);
+    /* WC stores drain into write-combining buffers and can sit there after
+     * the last one retires; without a fence this function could return --
+     * and its caller read the LFB back (ktest's fb_read_front_px) -- while
+     * the tail of the frame is still in flight. */
+    __asm__ volatile("mfence" ::: "memory");
     fb_chars_since = 0;
     fb_last_present = jiffies;
 }
 
+void fb_flip(void)
+{
+    if (!fb_back || !fb_front) return;
+    u64 fl;
+    console_out_lock(&fl);
+    fb_present_held();
+    /* Unlock still runs fb_console_flush(), but the box is consumed and
+     * marks need this very lock, so the gate reads empty: no recursion. */
+    console_out_unlock(fl);
+}
+
+/* Present without taking console_out_lock.  panic() only: its caller may
+ * already hold the lock (a BUG inside the console path -- taking it again
+ * would spin forever with interrupts off, the T-002 self-deadlock), and if
+ * some other CPU holds it the frame may tear -- on a machine that is dying
+ * anyway, a torn last frame beats none. */
+void fb_flip_unlocked(void)
+{
+    if (!fb_back || !fb_front) return;
+    fb_present_held();
+}
+
 int fb_double_buffered(void) { return fb_back != NULL; }
 
-/* The gate on every console-initiated present: before the first tick
- * jiffies and fb_last_present are both 0, so the printer owns the screen;
- * from the first tick on they differ and fb_tick_flush() owns it -- a copy
- * must not land in whatever context printed the byte (an ISR, another
- * CPU, an IRQ-off section). */
+/* The gate on every console-initiated present: the printer owns the
+ * screen only while jiffies is still 0 (before the first tick no tick is
+ * coming and the boot log must advance as it prints).  From the first
+ * tick on the gate stays shut -- fb_tick_flush() owns presenting then,
+ * and a copy must not land in whatever context printed the byte (an ISR,
+ * another CPU, an IRQ-off section).  The old test (jiffies ==
+ * fb_last_present) reopened the gate for the rest of any tick in which a
+ * present had landed: a burst of output then presented once per batch
+ * (console_write chunks of 64 bytes), each copy a full-frame budget. */
 static bool fb_present_wanted(void)
-{ return fb_back && fb_dirty && jiffies == fb_last_present; }
+{ return fb_back && fb_dirty && jiffies == 0; }
 
-/* End of a console write batch -- console_out_unlock() calls this, so
- * kvprintf and each 64-byte console_write chunk end with it.  Before the
- * first tick this is the present clock: one printed message = one frame,
- * and a message waiting out a silent stretch (a disk read) is already on
- * screen instead of stuck behind the next character. */
+/* End of a console write batch -- console_out_unlock() calls this with
+ * console_out_lock held, so kvprintf and each 64-byte console_write chunk
+ * end with it.  Before the first tick this is the present clock: one
+ * printed message = one frame, and a message waiting out a silent stretch
+ * (a disk read) is already on screen instead of stuck behind the next
+ * character.  No-op once ticks own presenting (see fb_present_wanted). */
 void fb_console_flush(void)
 {
-    if (fb_present_wanted()) fb_flip();
+    if (fb_present_wanted()) fb_present_held();
 }
 
 /* Backstop for output that does not cross the console lock (panic and the
@@ -504,18 +557,24 @@ static void fb_present_due(void)
 {
     if (!fb_present_wanted()) return;
     if (++fb_chars_since < FB_PRESENT_CHARS) return;
-    fb_flip();
+    fb_present_held();
 }
 
 /* The BSP timer handler: show what was drawn, at most one copy every
  * FB_PRESENT_TICKS ticks however much was written in between -- a burst of
  * kprintfs becomes one present, not one per line.  It is a load and a
- * branch when nothing drew, which is most ticks. */
+ * branch when nothing drew, which is most ticks.  console_out_lock is
+ * taken for the copy: BSP-only (only the BSP advances jiffies), and the
+ * BSP can never deadlock on it -- a CPU holding it runs with interrupts
+ * off, so this handler cannot be the holder. */
 void fb_tick_flush(void)
 {
     if (!fb_back || !fb_dirty) return;
     if (jiffies - fb_last_present < FB_PRESENT_TICKS) return;
-    fb_flip();
+    u64 fl;
+    console_out_lock(&fl);
+    fb_present_held();
+    console_out_unlock(fl);
 }
 
 static void fbc_scroll(void)
@@ -640,13 +699,71 @@ void fb_console_get(int *row, int *col, int *rows, int *cols)
 
 static const char *const memtype_name[8] = {"UC", "WC", "rsvd", "rsvd", "WT", "WP", "WB", "UC-"};
 
+/* How many variable MTRR ranges this kernel is willing to mirror onto the
+ * APs.  Shipping CPUs carry 8-10 (QEMU: 8); past MTRR_MAX_VAR the snapshot
+ * in fb_memtype_program() could not reproduce the BSP's state faithfully,
+ * so nothing gets reprogrammed at all -- a uniformly firmware-typed LFB
+ * beats a half-synced one. */
+#define MTRR_MAX_VAR 16
+
+/* The BSP's MTRR state as fb_memtype_program() left it, for every AP to
+ * adopt.  MTRRs are per logical processor: an AP comes up on its own reset
+ * state, which the platform may or may not have kept in step with the
+ * BSP's (QEMU gives its APs the BSP's DEFTYPE -- observed -- but ranges
+ * firmware touched only on the BSP need not be there at all).  Left
+ * unsynced, the BSP would type the LFB UC under firmware's range while an
+ * AP, with PAT alone, types it WC: one PTE, two types, lost pixels --
+ * exactly the mixing this section exists to prevent.  Fixed MTRRs are not
+ * mirrored: they reach only below 1 MiB (fb_mtrr_covering), where the only
+ * resident is the AP trampoline, which fetches instructions under any type
+ * and has already run by the time an AP gets here. */
+static struct {
+    bool valid; /* a snapshot exists; APs adopt it */
+    u64 deftype;
+    u64 base[MTRR_MAX_VAR];
+    u64 mask[MTRR_MAX_VAR];
+} s_mtrr_bsp;
+static bool s_bsp_seen; /* the first caller -- the BSP -- has been and gone */
+
+/* Give THIS logical processor a WC slot in IA32_PAT, if firmware left
+ * none.  The reset layout has WC at PAT[2], but firmware may have
+ * rewritten the MSR (QEMU resets it to 0x0007040600070406 -- UC- where
+ * Intel puts WC), and without a WC slot the LFB can only be mapped UC:
+ * every present then costs one uncached PCIe write per store, which is
+ * the difference between a 1-2 ms frame and a 10-20 ms one.
+ *
+ * PAT[7] (index = PG_PAT|PG_PCD|PG_PWT) is the slot to claim:
+ *  - nothing in this kernel selects it: every early page table entry is
+ *    0x83 (PAT bits clear -> slot 0), the APIC windows use PAT[2]
+ *    (PG_PCD alone, apic.c), the AHCI ABAR and the UC fallback use
+ *    PAT[3] (PG_PCD|PG_PWT), and only this file ever sets PG_PAT;
+ *  - it is UC on both reset layouts, so no firmware mapping that still
+ *    survives can be relying on it being something else.
+ *
+ * The MSR is per logical processor, so every core runs this: the BSP in
+ * fb_init() before the LFB PTE picks its slot (fb_lfb_pte_flags reads
+ * the MSR right after), every AP at the top of ap_main() before it can
+ * touch the screen.  Programming only the BSP would leave one CPU
+ * storing WC and another UC to the same PTE -- exactly the mixing the
+ * old read-only note warned about.  The MTRR half of the combination is
+ * fb_memtype_program()'s business; this function only ever owns IA32_PAT. */
+static void fb_pat_wc_program(void)
+{
+    if (!bootinfo.fb.ok || !bootinfo.fb.phys_addr) return;
+    u64 pat = rdmsr(MSR_IA32_PAT);
+    for (int i = 0; i < 8; i++)
+        if (((pat >> (8 * i)) & 0xFF) == PAT_TYPE_WC) return; /* one is enough */
+    pat = (pat & ~(0xFFULL << 56)) | ((u64)PAT_TYPE_WC << 56); /* PAT[7] := WC */
+    wrmsr(MSR_IA32_PAT, pat);
+}
+
 /* MTRR type of a variable range covering every byte of [pa, pa+len), or -1
- * if none does.  Fixed ranges reach only below 1 MiB, so they cannot cover an
- * aperture and are not consulted.  Read-only, deliberately: this kernel still
- * programs no MTRRs, and retyping a range the firmware owns also retypes
- * everything else inside it -- an aperture's neighbours are usually register
- * blocks that must stay UC. */
-static int fb_mtrr_covering(u64 pa, u64 len)
+ * if none does; *r_idx gets that range's index when one does.  Fixed ranges
+ * reach only below 1 MiB, so they cannot cover an aperture and are not
+ * consulted.  Read-only, deliberately: retyping a range the firmware owns
+ * also retypes everything else inside it -- an aperture's neighbours are
+ * usually register blocks that must stay UC. */
+static int fb_mtrr_covering(u64 pa, u64 len, u32 *r_idx)
 {
     u64 cap = rdmsr(MSR_IA32_MTRR_CAP);
     for (u32 i = 0; i < (u32)(cap & 0xFF); i++) {
@@ -655,33 +772,168 @@ static int fb_mtrr_covering(u64 pa, u64 len)
         u64 base = rdmsr(MSR_IA32_MTRR_BASE + 2 * i) & MTRR_PHYSMASK;
         if ((pa & mask) != (base & mask)) continue;
         if (((pa + len - 1) & mask) != (base & mask)) continue;
+        *r_idx = i;
         return (int)(rdmsr(MSR_IA32_MTRR_BASE + 2 * i) & 7);
     }
     return -1;
+}
+
+/* Ask for a WC variable range over the aperture -- but only when every
+ * step of it is provably safe:
+ *
+ *  - MTRRs on, WC supported, and no range covering the aperture: what the
+ *    aperture gets is whatever the default type says, so a range of ours
+ *    retypes nothing firmware had asked for;
+ *  - the default type is UC or WP (with WB/WT/WC the PAT slot already
+ *    comes through, so no range is needed);
+ *  - the aperture rounds up to a pow2 block it is aligned to, no larger
+ *    than FB_MAX_BYTES: VBE hands out the BAR's base address, and a PCI
+ *    BAR is pow2-sized and at least as large as the aperture it holds, so
+ *    the block stays inside the BAR and cannot reach a neighbour;
+ *  - that block intersects no enabled firmware range (a partial overlap
+ *    would mean shrinking or splitting theirs -- not ours to do), and one
+ *    variable range is free.
+ *
+ * QEMU fails the first condition on purpose: firmware marks the whole
+ * upper 1 GiB UC (mtrr[0] = 0xc0000000 / 1 GiB / UC), the LFB sits inside
+ * it, and a 1 GiB pow2 block is not something we may carve up -- so this
+ * returns quietly and fb_lfb_pte_flags() reports the UC for what it is.
+ * Machines whose firmware left the aperture to a UC default but covered it
+ * with no range get their WC this way.  Written only by the BSP, before
+ * SMP starts: one CPU, no concurrent reader of these MSRs. */
+static void fb_mtrr_aperture_wc(u64 pa, u64 len)
+{
+    u64 cap = rdmsr(MSR_IA32_MTRR_CAP);
+    u64 def = rdmsr(MSR_IA32_MTRR_DEFTYPE);
+    if (!(def & (1ULL << 11))) return; /* variable MTRRs off: PAT alone */
+    if (!(cap & (1ULL << 10))) return; /* no WC in MTRR_CAP */
+    u32 n = (u32)(cap & 0xFF);
+    u32 idx;
+    if (fb_mtrr_covering(pa, len, &idx) >= 0) return; /* firmware already types it */
+    u32 dflt = (u32)(def & 0xFF);
+    if (dflt > 7 || (dflt != 0 && dflt != 5)) return; /* PAT WC gets through */
+
+    u64 size = 1;
+    while (size < len) size <<= 1;
+    while (size <= FB_MAX_BYTES && (pa & (size - 1))) size <<= 1;
+    if (size < len || size > FB_MAX_BYTES || (pa & (size - 1))) {
+        kprintf("[fb] aperture %llx+%lu not pow2-aligned within %lu MiB - no WC range\n",
+                (unsigned long long)pa, (unsigned long)len,
+                (unsigned long)(FB_MAX_BYTES >> 20));
+        return;
+    }
+
+    u32 slot = 0xFFFFFFFF;
+    for (u32 i = 0; i < n; i++) {
+        u64 m = rdmsr(MSR_IA32_MTRR_BASE + 2 * i + 1);
+        u64 b = rdmsr(MSR_IA32_MTRR_BASE + 2 * i);
+        if (!(m & MTRR_PHYSMASK)) { /* disabled range: the one to claim */
+            if (slot == 0xFFFFFFFF) slot = i;
+            continue;
+        }
+        u64 start = b & MTRR_PHYSMASK;
+        u64 rsize = (((~m) & MTRR_PHYSMASK) | 0xFFF) + 1;
+        if (pa < start + rsize && start < pa + size) {
+            kprintf("[fb] MTRR[%u] %s partially overlaps the aperture block - no WC range\n",
+                    i, memtype_name[b & 7]);
+            return;
+        }
+    }
+    if (slot == 0xFFFFFFFF) {
+        kprintf("[fb] no free MTRR range for the aperture (default %s) - LFB stays on it\n",
+                memtype_name[dflt]);
+        return;
+    }
+    /* Base first, then the mask with its V bit: the range is inactive
+     * (mask 0 -> default type) until the second write lands it. */
+    wrmsr(MSR_IA32_MTRR_BASE + 2 * slot, (pa & MTRR_PHYSMASK) | PAT_TYPE_WC);
+    wrmsr(MSR_IA32_MTRR_BASE + 2 * slot + 1,
+          ((~(size - 1)) & MTRR_PHYSMASK) | (1ULL << 11)); /* V: valid */
+    kprintf("[fb] MTRR[%u] WC %llx+%lu KiB (default %s, nothing covered the aperture)\n",
+            slot, (unsigned long long)pa, (unsigned long)(size >> 10),
+            memtype_name[dflt]);
+}
+
+/* Program this core's LFB memory type, and keep every CPU in step:
+ *
+ *  - IA32_PAT gets a WC slot (per logical processor, so each core runs
+ *    this -- see fb_pat_wc_program());
+ *  - the first caller -- always the BSP, from fb_init() via
+ *    fb_lfb_pte_flags(), long before SMP starts -- may add a WC range
+ *    over the aperture (fb_mtrr_aperture_wc) and then snapshots the MTRRs
+ *    for whoever comes after;
+ *  - every later caller (an AP, at the top of ap_main() before it can
+ *    touch the screen) replays that snapshot, so all CPUs resolve the
+ *    LFB's PTE to the same type: an AP's own reset ranges may lack what
+ *    firmware wrote on the BSP, and without the replay one CPU would
+ *    store UC (the BSP, under firmware's range) and another WC (an AP,
+ *    PAT alone) to the same PTE.
+ *
+ * Nothing here invents a memory type: DEFTYPE is only ever written back
+ * as the BSP had it, and the fixed MTRRs are left alone (see s_mtrr_bsp). */
+void fb_memtype_program(void)
+{
+    if (!bootinfo.fb.ok || !bootinfo.fb.phys_addr) return;
+    u64 cap = rdmsr(MSR_IA32_MTRR_CAP);
+    u32 n = (u32)(cap & 0xFF);
+
+    if (s_bsp_seen) { /* AP */
+        if (!s_mtrr_bsp.valid) return; /* the BSP reprogrammed nothing */
+        fb_pat_wc_program();
+        /* Variable ranges off first, this core's reset state dropped,
+         * the BSP's ranges replayed, and DEFTYPE last -- exactly as the
+         * BSP has it.  Nothing here runs with interrupts on (APs reach
+         * ap_main() from the trampoline and have not sti'd yet), and this
+         * core touches no memory during the window but its own stack. */
+        wrmsr(MSR_IA32_MTRR_DEFTYPE, s_mtrr_bsp.deftype & ~(1ULL << 11));
+        for (u32 i = 0; i < n; i++)
+            wrmsr(MSR_IA32_MTRR_BASE + 2 * i + 1, 0);
+        for (u32 i = 0; i < n; i++) {
+            wrmsr(MSR_IA32_MTRR_BASE + 2 * i, s_mtrr_bsp.base[i]);
+            wrmsr(MSR_IA32_MTRR_BASE + 2 * i + 1, s_mtrr_bsp.mask[i]);
+        }
+        wrmsr(MSR_IA32_MTRR_DEFTYPE, s_mtrr_bsp.deftype);
+        return;
+    }
+    s_bsp_seen = true;
+
+    if (n > MTRR_MAX_VAR) {
+        /* Printed here, not on the APs: they call at the top of ap_main(),
+         * before idt_init() has run on that core, which is no place to
+         * print from.  PAT is left alone too, so every CPU stays on the
+         * firmware type. */
+        kprintf("[fb] %u MTRR ranges > %u - LFB stays on the firmware type\n",
+                n, (unsigned)MTRR_MAX_VAR);
+        return;
+    }
+    fb_pat_wc_program();
+    if (fb_pitch && fb_height) /* geometry is set: this is the fb_init() call */
+        fb_mtrr_aperture_wc(bootinfo.fb.phys_addr, (u64)fb_pitch * fb_height);
+    s_mtrr_bsp.deftype = rdmsr(MSR_IA32_MTRR_DEFTYPE);
+    for (u32 i = 0; i < n; i++) {
+        s_mtrr_bsp.base[i] = rdmsr(MSR_IA32_MTRR_BASE + 2 * i);
+        s_mtrr_bsp.mask[i] = rdmsr(MSR_IA32_MTRR_BASE + 2 * i + 1);
+    }
+    s_mtrr_bsp.valid = true;
 }
 
 /* PTE cache bits for the LFB, plus a line saying what came of it.
  *
  * This used to be a flat UC (PG_PCD|PG_PWT = PAT[3]), justified by "WC would
  * mean reprogramming IA32_PAT".  It does not have to: a PTE reaches all
- * eight PAT slots (index = PG_PAT*4 + PG_PCD*2 + PG_PWT), and one of them
- * normally already holds WC.  Which one is firmware's business, so the MSR is
- * read rather than a slot number guessed -- IA32_PAT's reset layout is not
- * the only one out there (QEMU's differs from Intel's).  UC is what a 1080p
- * console pays for: fbc_scroll() rewrites 8 MiB of the aperture on every line
- * that reaches the bottom, and at UC that is slow enough to watch happen from
- * the top of the screen down.
+ * eight PAT slots (index = PG_PAT*4 + PG_PCD*2 + PG_PWT), and
+ * fb_memtype_program() runs first, on this CPU, so the read below is
+ * guaranteed to find a WC slot (PAT[7] on firmware that rewrote the MSR,
+ * PAT[2] on the Intel reset layout) -- and so that every other CPU agrees
+ * about the MTRR half of the combination.
  *
- * This only ever *reads* IA32_PAT.  Rewriting it is per logical processor,
- * and the APs brought up later would still be on the old value -- one CPU
- * storing to the screen as WC and another as WB is a way to lose pixels, not
- * a way to be fast.  If no slot holds WC, that is exactly the point at which
- * programming it becomes necessary, and it stays deliberately undone.
- *
- * The MTRR half of the combination is not ours to change either, so report
- * it: a firmware UC over the aperture wins and the answer is UC again. */
+ * The combination decides, and the MTRR half may still be firmware's: a
+ * UC range over the aperture beats any PAT slot (architecture, not a
+ * preference), so the line below reports what actually came out of it
+ * instead of promising WC. */
 static u64 fb_lfb_pte_flags(u64 pa, u64 len)
 {
+    fb_memtype_program(); /* WC slot + MTRR sync, before either is read */
     u64 pat = rdmsr(MSR_IA32_PAT);
     int idx = -1;
     for (int i = 0; i < 8; i++)
@@ -690,25 +942,41 @@ static u64 fb_lfb_pte_flags(u64 pa, u64 len)
             break;
         }
     if (idx < 0) {
+        /* Unreachable while fb_pat_wc_program() precedes the read (it
+         * writes PAT[7] when nothing holds WC); kept as the honest
+         * fallback for a future caller that skips it. */
         kprintf("[fb] IA32_PAT=%016llx holds no WC slot\n", (unsigned long long)pat);
         kprintf("[fb] LFB cache: -> UC (IA32_PAT would have to be rewritten)\n");
         return PG_PCD | PG_PWT;
     }
 
-    int type = -1; /* -1: MTRRs disabled, PAT decides alone */
+    int type = -1;  /* -1: MTRRs disabled, the PAT slot decides alone */
+    bool covered = false;
+    u32 range = 0;
     u64 def = rdmsr(MSR_IA32_MTRR_DEFTYPE);
     if (def & (1ULL << 11)) {
-        type = fb_mtrr_covering(pa, len);
-        if (type < 0) type = (int)(def & 0xFF); /* nothing covers: default type */
+        type = fb_mtrr_covering(pa, len, &range);
+        covered = (type >= 0);
+        if (!covered) type = (int)(def & 0xFF); /* nothing covers: default type */
         if (type > 7) type = 0;                 /* reserved encoding: assume UC */
     }
-    /* PAT=WC against that type: UC and WP win, everything else stays WC.
-     * mm.h's table covers WB/WT/WC/UC; WP is not in it and UC is the safe
-     * reading. */
-    int uc = (type == 0 || type == 5);
-    kprintf("[fb] LFB cache: IA32_PAT[%d]=WC MTRR=%s -> %s\n", idx,
-            type < 0 ? "disabled" : memtype_name[type],
-            uc ? "UC (firmware MTRR, scrolling stays slow)" : "WC (write-combining)");
+    /* PAT=WC against that type: WC/WT/WB let it through, everything else
+     * wins over it -- UC and WP per mm.h's table, and the reserved type
+     * codes get the same safe reading (MTRRs never encode UC- themselves,
+     * but a firmware range may carry a reserved field). */
+    int uc = (type >= 0) && type != 1 && type != 4 && type != 6;
+    const char *verdict = uc ? "UC (firmware MTRR, scrolling stays slow)"
+                             : "WC (write-combining)";
+    if (type < 0)
+        kprintf("[fb] LFB cache: IA32_PAT[%d]=WC MTRR=disabled -> %s\n", idx, verdict);
+    else if (covered)
+        kprintf("[fb] LFB cache: IA32_PAT[%d]=WC MTRR[%u] %s @%llx -> %s\n",
+                idx, range, memtype_name[type],
+                (unsigned long long)(rdmsr(MSR_IA32_MTRR_BASE + 2 * range) & MTRR_PHYSMASK),
+                verdict);
+    else
+        kprintf("[fb] LFB cache: IA32_PAT[%d]=WC MTRR default %s -> %s\n",
+                idx, memtype_name[type], verdict);
 
     u64 flags = 0;
     if (idx & 1) flags |= PG_PWT;

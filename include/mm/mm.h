@@ -129,11 +129,14 @@ u64 vmm_count_user_pages(u64 root);
  * Getting WC does not come for free, though.  A PTE can reach all eight PAT
  * slots -- index = PG_PAT*4 + PG_PCD*2 + PG_PWT -- so when a slot holds WC it
  * is there for the asking; but the value firmware leaves behind normally
- * holds none at all (the reset layout is [WB, WT, UC-, UC] twice over, which
- * is exactly what QEMU reports, and it is why Linux's PAT init exists at all:
- * "the PAT MSR must be updated by Linux in order to support WC and WT
- * attributes").  In that case IA32_PAT really is the obstacle, and rewriting
- * it is per logical processor, which is the part this kernel has not done.
+ * holds none at all (QEMU resets IA32_PAT to [WB, WT, UC-, UC] twice over,
+ * and it is why Linux's PAT init exists at all: "the PAT MSR must be updated
+ * by Linux in order to support WC and WT attributes").  In that case
+ * IA32_PAT really is the obstacle, and rewriting it is per logical
+ * processor -- framebuffer.c now does exactly that (fb_memtype_program():
+ * the BSP in fb_init() before the LFB is mapped, every AP at the top of
+ * ap_main(), claiming PAT[7] for WC when no slot holds it -- and the APs
+ * also adopt the BSP's MTRRs, since those are per processor too).
  * Whichever half of the combination ends up deciding, an MTRR the firmware
  * set to UC still wins -- so framebuffer.c reports what actually came out of
  * it instead of promising it. */

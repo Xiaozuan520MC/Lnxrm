@@ -238,9 +238,17 @@ static long sys_fb_info(struct lnxrm_fb_info *uinfo)
     return 0;
 }
 
+/* The four drawing calls below run under console_out_lock: they write the
+ * back surface, and the present copies it under the same lock (fb_flip),
+ * so a frame being drawn on one CPU cannot land half-way into a present
+ * on the other.  The unlock doubles as a batch end: before the first tick
+ * the frame shows immediately, after it the tick presents (gate closed). */
 static long sys_fb_clear(u32 color)
 {
+    u64 fl;
+    console_out_lock(&fl);
     fb_clear(color);
+    console_out_unlock(fl);
     return 0;
 }
 
@@ -249,7 +257,10 @@ static long sys_fb_fill(struct lnxrm_fb_rect *urect)
     struct lnxrm_fb_rect r;
     if (!user_ptr_ok((u64)urect, sizeof(r))) return LNXRM_EFAULT;
     copy_from_user(&r, urect, sizeof(r));
+    u64 fl;
+    console_out_lock(&fl);
     fb_fill_rect(r.x, r.y, r.w, r.h, r.color);
+    console_out_unlock(fl);
     return 0;
 }
 
@@ -258,7 +269,10 @@ static long sys_fb_char(struct lnxrm_fb_char *uch)
     struct lnxrm_fb_char c;
     if (!user_ptr_ok((u64)uch, sizeof(c))) return LNXRM_EFAULT;
     copy_from_user(&c, uch, sizeof(c));
+    u64 fl;
+    console_out_lock(&fl);
     fb_draw_char(c.x, c.y, (char)c.ch, c.fg, c.bg);
+    console_out_unlock(fl);
     return 0;
 }
 
@@ -269,7 +283,10 @@ static long sys_fb_puts(struct lnxrm_fb_str *ustr)
     copy_from_user(&s, ustr, sizeof(s));
     char kbuf[256];
     if (copy_user_str(kbuf, (u64)s.str, sizeof(kbuf)) < 0) return LNXRM_EFAULT;
+    u64 fl;
+    console_out_lock(&fl);
     fb_puts(s.x, s.y, kbuf, s.fg, s.bg);
+    console_out_unlock(fl);
     return 0;
 }
 

@@ -57,8 +57,22 @@ void fb_init(void);
  * visible LFB row by row (a char cell costs 8x16, a scrolled screen costs
  * a full copy), so the screen shows either the old frame or the new one,
  * never a half-drawn one.  It is a no-op in single-buffered mode (back-
- * surface allocation failed, or the mode is too big for the window). */
+ * surface allocation failed, or the mode is too big for the window).
+ * The copy runs under console_out_lock, which every back-surface writer
+ * also holds for its whole write -- that is what stops a scroll on the
+ * other CPU from landing mid-copy (two frames stacked on one screen). */
 void fb_flip(void);
+/* panic() only: present without taking console_out_lock, for callers
+ * that may already hold it (a BUG in the console path must not spin) or
+ * where the machine is dying anyway (see framebuffer.c). */
+void fb_flip_unlocked(void);
+/* Program this CPU's LFB memory type: a WC slot in IA32_PAT when firmware
+ * left none, and -- on the first caller, the BSP -- a WC MTRR over the
+ * aperture when firmware left it to a UC default, whose state every AP
+ * then adopts, so all CPUs store to the LFB with the same type.  The BSP
+ * runs it from fb_init() before the LFB is mapped, every AP from the top
+ * of ap_main() before it can touch the screen. */
+void fb_memtype_program(void);
 int fb_double_buffered(void); /* 1 = a back surface is in use */
 /* The BSP tick calls this: present the back surface if anything drew into
  * it, at most once per couple of ticks.  Console and drawing-syscall

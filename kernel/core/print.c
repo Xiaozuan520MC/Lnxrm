@@ -460,8 +460,10 @@ __attribute__((noreturn)) void panic(const char *fmt, ...)
     /* The panic text sits in the back surface like any other console
      * output, and no tick will ever present it: interrupts are off and
      * the machine halts below.  The last word on screen is the one thing
-     * here that must not depend on the present clock. */
-    fb_flip();
+     * here that must not depend on the present clock -- and it must not
+     * take console_out_lock either: this path is deliberately usable
+     * when the caller already holds it (T-002). */
+    fb_flip_unlocked();
 
     /* C27: best effort -- what the caller was promised goes to the device
      * even as the machine dies.  The try-flush never waits anywhere, so a

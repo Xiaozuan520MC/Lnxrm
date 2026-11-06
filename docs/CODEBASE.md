@@ -395,7 +395,7 @@ kernel/fs/
 - `uart.c`：16550，115200 8N1 + FIFO；COM1 → IRQ4 → 向量 36。
 - `console_putc` 扇出四路：帧缓冲控制台 → VGA 文本 80×25（硬件光标）→ 串口 → 4096 字节环形缓冲（`fb_console_init` 用它回放已滚出的历史）。
 - `kvprintf` 持 `console_out_lock`（irqsave），与 `write(1,…)` 共用（64 字节分块拿锁，限制关中断时长）；格式 `%s %d %u %x %X %p %c %%` + 宽度/`0` 填充/`l/ll/z`。
-- `panic()` 打 `[PANIC]` 后 **`fb_flip()` 一次再 `cli; hlt`**（双缓冲下文本只在后缓冲，panic 后再没有 tick 去呈现）。
+- `panic()` 打 `[PANIC]` 后 **`fb_flip_unlocked()` 一次再 `cli; hlt`**（双缓冲下文本只在后缓冲，panic 后再没有 tick 去呈现；必须无锁版——panic 可能来自控制台路径内部，调用方已持 `console_out_lock`，再拿一把就是关中断自旋到死，T-002）。
 - ANSI 三状态机 `ansi_feed`（`ESC[2J` 清屏、`ESC[nH` 定位、`ESC[...m` SGR），VGA 与帧缓冲两后端各自消费；`ESC[3J` 空操作。
 
 ### 7.2 键盘、鼠标与统一输入队列
@@ -452,7 +452,7 @@ kernel/fs/
 | 控制台 | `fbc_*` / `fb_console_putc` / `fbc_scroll` | ANSI 终端，滚动 = 逐行 `memcpy` + 清末行 |
 | 归属 | `fb_owner_get / fb_claim / fb_disown` | 只记状态，不参与绘制 |
 
-`fb_init`：映射 LFB（`PG_PCD`，PAT 无 WC 槽时落 UC）、按 DISPI 回报的 pitch 定几何、对引导加载器留空的通道布局做 15/16/≥24 bpp 兜底、建后缓冲、`fb_console_init` 回放环形缓冲；VBE 模式非法则提前返回，输出落 VGA 文本后端。
+`fb_init`：映射 LFB（缓存型交给 `fb_memtype_program()` 定：本 CPU 补 PAT 的 WC 槽 + MTRR 快照/采纳/孔径 WC range，固件 UC 覆盖则如实落 UC 并打点名判定行，见 7.5）、按 DISPI 回报的 pitch 定几何、对引导加载器留空的通道布局做 15/16/≥24 bpp 兜底、建后缓冲、`fb_console_init` 回放环形缓冲；VBE 模式非法则提前返回，输出落 VGA 文本后端。
 
 ### 7.5 双缓冲契约（默认开启）
 
@@ -461,8 +461,9 @@ kernel/fs/
 - **后缓冲在独立 PD 窗 `[97,104)`**（14 MiB）：不能塞进 LFB 窗（`[104,108)` 才空，slot 108 归 ACPI），也不能整块分配（buddy 最大 4 MiB，1080p32 一幅 7.9 MiB），所以逐个 `pmm_alloc()` 4 KiB 帧再 `vmm_map_kernel_page()` 拼成**虚拟连续**的面。
 - **`pmm_reserve` 与别名过滤必须成对**：`main.c` 在 `pmm_init` 前按**整窗** reserve `[97,104)`，`vmm.c` 别名环把这 7 槽整体滤掉；两边都按整窗算（窗口实际用多少由 DISPI 的 pitch 决定，而那在两处代码之后才知道），条件一致 `bootinfo.fb.ok && phys_addr`（无帧缓冲时这 14 MiB 仍在 buddy 里）。
 - **内存类型 WB**（与帧自带线性别名同型）：慢速 aperture 从"每像素一次 UC 写"变成"每次呈现一次逐行宽拷贝"。
-- **呈现只拷脏区域**：写入后把包围盒并入脏箱（裁剪到可见区），`fb_flip` 在 `fb_box_lock`（irqsave）内**快照并清空**脏箱、逐行拷贝在锁外。两条结构性规则：**先写后标**（present 最多漏一帧，不会消费"还没发生"的写）与**锁内快照+清空**（标记要么进本次快照、要么留给下一次）。逐行拷贝走 `fb_copy_fwd`（对齐前奏 + u64 宽循环 + 字节收尾——宽路径收尾必须先把字节指针跟到宽循环之后，否则每行末尾 `n % 8` 字节即脏箱右缘漏拷，2026-10-21 修复，`test_fb_dirty_brute` 钉住）。`fbc_scroll` 的裸 `fb_copy_fwd` 是唯一绕过 `fb_store_px` 的写，自己补标；ktest 专用 `fb_poke_back_px()` 不标记。
-- **谁来 present**：控制台每字符只标记其字格；**定时器启动后**由 BSP tick 节流（`FB_PRESENT_TICKS = 2`，≤50 次/秒，总在 tick 处理器里）；**第一次 tick 之前**（含 ktest 与 `kernel_spawn`）没有时钟，由控制台在**写批次边界** present——`kvprintf` 与 `console_write` 都在 `console_out_lock` 下出字，`console_out_unlock` 调 `fb_console_flush()`，**一条消息一帧**（按字符数分帧的旧方案在 ~3 KB 的整个启动日志上只出 3 帧，画面看着就是冻住的）；`FB_PRESENT_CHARS = 1024` 只剩无锁输出的兜底，单批永远到不了（kvprintf 缓冲 1024 B、console_write 64 B 分块）；`panic()` 与 `Stop!` 路径额外手动 `fb_flip()`（之后再无 tick）。
+- **LFB 侧写合并（2026-11-06）**：`fb_memtype_program()` 每 CPU 跑一次（BSP 在 `fb_init`、AP 在 `ap_main` 顶、`idt_init` 之前）——① `IA32_PAT` 无 WC 槽时补 `PAT[7]`（全仓无人选它：早期页表 `0x83`、APIC 用 `[2]`、ABAR/UC 兜底用 `[3]`）；② MTRR 快照与采纳：BSP（首个调用者）存 DEFTYPE+全部 variable range，AP 先关 variable range、清零自身复位态再回放、DEFTYPE 收尾（MTRR per core，AP 复位态与 BSP 不保证一致——不采纳就是 BSP=UC/AP=WC 混写同一 PTE；fixed MTRR 只达 1 MiB 以下，不镜像）；③ 固件「MTRR 开、**无 range 覆盖孔径**、默认 UC/WP」时给孔径**新增**一条 pow2 WC range（只用空槽、不碰固件已有范围；VBE 给的是 BAR 基址，BAR 恒 pow2 对齐且不小于孔径 → 块不出 BAR；撞已有 range/无空槽/对不齐即放弃并点名打日志）。固件 UC **覆盖**孔径时架构性胜过 PAT 的 WC（SDM 有效类型表），如实打 `[fb] LFB cache: IA32_PAT[i]=WC MTRR[j] UC @base -> UC` 行、不承诺 WC（QEMU 即此情形：`mtrr[0]=0xc0000000/1 GiB/UC` 盖住 `0xfd000000`）。present 拷贝尾补 `mfence`：WC 合并缓冲不排空，flip 返回后立刻读 LFB 会读到旧帧。
+- **呈现只拷脏区域，且整段拷贝持 `console_out_lock`**：写入后把包围盒并入脏箱（裁剪到可见区）。present 分两段加锁：`fb_box_lock`（irqsave）内**快照并清空**脏箱，随后**逐行拷贝全程在 `console_out_lock` 下**（`fb_present_held()`）——所有后缓冲写者（控制台批次、4 个绘图 syscall）都为整批持有同一把锁，另一 CPU 的滚动/光标重绘插不进拷贝中缝（旧"拷贝在锁外"留下的正是快速滚屏时两帧叠一屏的撕裂窗）。三条结构性规则：**先写后标**（present 最多漏一帧，不会消费"还没发生"的写）、**box 锁内快照+清空**（标记要么进本次快照、要么留给下一次——标记本身也要过 `console_out_lock`，所以只能落在拷贝前或后）、**拷贝尾 `mfence`**（WC 排空）。逐行拷贝走 `fb_copy_fwd`（对齐前奏 + u64 宽循环 + 字节收尾——宽路径收尾必须先把字节指针跟到宽循环之后，否则每行末尾 `n % 8` 字节即脏箱右缘漏拷，2026-10-21 修复，`test_fb_dirty_brute` 钉住）。`fbc_scroll` 的裸 `fb_copy_fwd` 是唯一绕过 `fb_store_px` 的写，自己补标；ktest 专用 `fb_poke_back_px()` 不标记。
+- **谁来 present**：控制台每字符只标记其字格；**定时器启动后**由 BSP tick 节流（`FB_PRESENT_TICKS = 2`，≤50 次/秒，总在 tick 处理器里），**写批次门 `fb_present_wanted()` 此后永久关死**——它只认 `jiffies == 0`（首 tick 前）；旧条件 `jiffies == fb_last_present` 会在同 tick 内 present 落地后把门重开，快速滚屏时控制台每个 64 B 分块都全屏 present 一次（每次拷贝都是整帧预算），输出一帧一爬（P0-A）；**第一次 tick 之前**（含 ktest 与 `kernel_spawn`）没有时钟，由控制台在**写批次边界** present——`kvprintf` 与 `console_write` 都在 `console_out_lock` 下出字，`console_out_unlock` 调 `fb_console_flush()`，**一条消息一帧**（按字符数分帧的旧方案在 ~3 KB 的整个启动日志上只出 3 帧，画面看着就是冻住的）；4 个绘图 syscall（23–26 clear/fill/char/puts）**整个原语持 `console_out_lock`**，unlock 兼作批次尾（tick 后不再 present，只管互斥）；`FB_PRESENT_CHARS = 1024` 只剩无锁输出的兜底，单批永远到不了（kvprintf 缓冲 1024 B、console_write 64 B 分块）；`panic()` 手动 `fb_flip_unlocked()`（无锁，见上）、`Stop!` 路径手动 `fb_flip()`（之后再无 tick）。三个 present 入口里批次路径（`fb_console_flush`/`fb_present_due`，调用方已持锁）直调 `_held`，`fb_flip`/`fb_tick_flush` 自己 lock→held→unlock；BSP 不可能在 tick 里自死锁（持锁者 IRQ 关）。
 - **失败即退回单缓冲**：模式超 14 MiB 窗或 RAM 不足时 `fb_back` 保持 `NULL`，`fb_ptr` 留在 LFB，flip 全是空操作，其余路径一行不改。没有开关，没有可选缓冲 API。
 - 归属用 `__atomic_compare_exchange_n`（SEQ_CST）而非 check-then-set（两 CPU 可能同时看到空闲屏）；`fb_disown` 只清自己持有的，拒绝也不改归属。
 
@@ -513,8 +514,8 @@ smp_init():
 | `pmm_lock` / `kheap_lock` | `pmm.c` / `kheap.c` | buddy 空闲链+位图 / 堆分箱 | |
 | `cache_lock` | `blk_cache.c` | 块缓存 | **跨越设备 I/O** |
 | `fat_fs_lock` | `include/fat32.h` | 全部 FAT32 操作 | 与 `cache_lock` 嵌套 |
-| `print_lock` | `print.c` | `kvprintf` 与 `console_write` | 内部名 `console_out_lock` |
-| `fb_box_lock` | `framebuffer.c` | 双缓冲脏箱（present 锁内快照+清空） | 拷贝在锁外 |
+| `print_lock` | `print.c` | `kvprintf`、`console_write`，**并覆盖 present 的整段逐行拷贝** | 内部名 `console_out_lock`；绘图 syscall 23–26 也整原语持它 |
+| `fb_box_lock` | `framebuffer.c` | 双缓冲脏箱（present 锁内快照+清空） | 拷贝移交 `console_out_lock` 持有 |
 
 `fat_fs_lock` 是全局锁串行化整个文件系统：简单正确但零并发度，是双核下 FS 性能瓶颈。
 
@@ -598,5 +599,5 @@ smp_init():
 - trampoline 传给共享块的 `ap_main` 是**虚拟地址**。
 - ABI 结构体（`lnxrm_ps_entry` 等）一改，引用它的用户态程序必须全量重编。
 - 自旋锁只用 irqsave 变体；`fat_fs_lock` 内嵌 `cache_lock`，加锁顺序不得颠倒。
-- 双缓冲呈现只拷脏区域：**先写后标**；`fb_flip` 在 `fb_box_lock` 内快照+清空脏箱，拷贝在锁外；绕过 `fb_store_px` 的写（如 `fbc_scroll`）必须自己补标。
+- 双缓冲呈现只拷脏区域：**先写后标**；`fb_flip` 在 `fb_box_lock` 内快照+清空脏箱，**逐行拷贝全程在 `console_out_lock` 内**（绘图 syscall 与控制台批次整批持同一把锁）、拷贝尾 `mfence`；绕过 `fb_store_px` 的写（如 `fbc_scroll`）必须自己补标。
 - 首 tick 前的控制台呈现只认**写批次边界**：`console_out_unlock` → `fb_console_flush()`，一条消息一帧；`FB_PRESENT_CHARS` 只是无锁输出的兜底，锁内单批永远触发不到。
