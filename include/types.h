@@ -64,12 +64,37 @@ LNXRM_STATIC_ASSERT(PD_SLOT_OF(KHEAP_VMA) == 256, "KHEAP_VMA must sit in PD_HI[2
 #define USER_STACK_TOP 0x7fffffbff000UL
 #define USER_MAX_VMA   0x7ffffffff000UL
 
+/* Anonymous-mmap window, top-down: [MMAP_LO, MMAP_TOP).
+ *
+ * MMAP_TOP stops STACK_GUARD below the stack growth floor (USER_STACK_TOP
+ * minus the 512 KiB USTACK_MAX_GROW in mm/pagefault.c); those STACK_GUARD
+ * bytes are the stack guard, mapped by NOBODY -- no VMA may cover them (the
+ * window ends here) and demand_page() refuses them outright -- so a stack
+ * overflow crossing the floor dies as SIGSEGV instead of being demand-paged
+ * into an mmap VMA sitting at the top of the window.  The guard is exactly
+ * the reach stack growth accepts below the running RSP (STACK_GROW_WINDOW
+ * in pagefault.c, static-asserted equal), so no fault growth would treat as
+ * a stack access can land past it.
+ *
+ * The window is 64 GiB wide -- address space here is free, physical frames
+ * are not, and demand paging (page_fault.c) meters the frames one page at a
+ * time through cred_mem_quota(), so a huge mapping costs nothing until it
+ * is touched.
+ *
+ * sys_brk's ceiling is MMAP_LO: the old cap, one MiB below
+ * USER_STACK_TOP, sat INSIDE this window -- a heap and an mmap region could
+ * then have claimed the same pages. */
+#define STACK_GUARD 0x10000UL /* 64 KiB: [MMAP_TOP, stack floor), never mapped */
+#define MMAP_TOP (USER_STACK_TOP - 0x80000UL - STACK_GUARD)
+#define MMAP_LO  (MMAP_TOP - 0x1000000000UL)          /* 64 GiB below */
+
 #define PAGE_SIZE 4096UL
 
 /* Top page of user space: the sigreturn restorer.  It has to be executable
  * (the handler `ret`s into it) and it must not live on the stack, because
- * every other user page is NX.  Nothing else maps above the stack, and brk
- * is capped a megabyte below USER_STACK_TOP, so the top page is free. */
+ * every other user page is NX.  Nothing else maps above the stack: brk
+ * stops at MMAP_LO and the mmap window stops at MMAP_TOP (the stack
+ * floor), so the top page is free. */
 #define USER_SIGRETURN_VA (USER_MAX_VMA - PAGE_SIZE)
 
 #define NR_TASKS   64

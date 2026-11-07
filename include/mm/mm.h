@@ -26,6 +26,21 @@ u64 pmm_alloc_order(int order); /* phys addr or 0 */
 void pmm_free_order(u64 pa, int order);
 u64 pmm_free_bytes(void);  /* bytes currently on the buddy free lists */
 int pmm_max_order(void);   /* first refused order (0..max-1 are valid) */
+
+/* ---- order-0 frame reference counts (mm/pmm.c) ----
+ *
+ * Only order-0 frames are tracked: they are the only ones a user mapping
+ * can hold (vmm_map_user builds 4 KiB pages only), and a COW page shared
+ * between two address spaces is exactly one order-0 frame with two owners.
+ * Every pmm_alloc() of order 0 starts the count at 1 and pmm_free(pa)
+ * drops it; the frame goes back to the buddy only when the count reaches
+ * 0, so "unmap in one space" of a shared page merely drops that space's
+ * reference.  A count of 0 at free time means "nothing tracked this" (a
+ * seed frame, or a path predating the counter) and is handed back as it
+ * always was -- the counter must never make a frame un-freeable.
+ * Higher orders bypass the counter entirely. */
+void pmm_ref(u64 pa);      /* one more owner (fork shares a frame) */
+u16 pmm_refcount(u64 pa);  /* current owners (ktest pins the semantics) */
 /* ktest only: make the next `n` frame allocations fail (0 = off).  This is
  * how the OOM branches are tested without actually running the machine out
  * of memory; every caller must turn the arm back off before asserting. */
@@ -73,7 +88,22 @@ void vmm_destroy_user_aspace(u64 pml4);
  * it runs out of address space (T-004). */
 int vmm_map_user(u64 pml4, u64 va, u64 pa, bool writable, bool user, bool exec);
 u64 vmm_unmap_user(u64 pml4, u64 va); /* returns freed pa or 0 */
+/* Drop the page TABLES (PT/PD/PDPT, and the PML4 user slot if that was
+ * the last of them) if unmapping `va` just emptied every level above it.
+ * munmap calls this per unmapped page; without it each freshly touched
+ * 2 MiB region strands two table frames for the life of the address
+ * space.  Never touches a level that still holds a present entry. */
+void vmm_reclaim_empty_tables(u64 pml4, u64 va);
 u64 vmm_translate_in(u64 pml4, u64 va);
+/* Raw 4 KiB leaf PTE for `va` under `root` (0 = not present / no table).
+ * Callers that need to SEE the flags -- PG_COW above all -- read them here;
+ * vmm_translate_in() only reports the frame. */
+u64 vmm_user_pte(u64 pml4, u64 va);
+/* Overwrite that leaf PTE with `pte` (caller supplies flags + frame) and
+ * flush the TLB entry.  This is how PG_W/PG_COW are flipped on a live page
+ * -- fork's COW conversion, the COW fault fixer, and ktest restoring the
+ * pages a case borrowed.  Returns LNXRM_EFAIL if there is no such leaf. */
+int vmm_user_pte_write(u64 pml4, u64 va, u64 pte);
 /* Present AND writable at `va` in `root`.  With CR0.WP on this is the
  * precondition for every ring-0 store through a user address: the R/W bit
  * is what decides whether the store lands or raises #PF. */
@@ -95,6 +125,14 @@ u64 vmm_count_user_pages(u64 root);
 #define PG_PWT 0x008
 #define PG_PCD 0x010
 #define PG_PS  0x080
+/* Software bit 9 of a 4 KiB PTE: this page is Copy-On-Write (PTE bits 9..11
+ * are ignored by the CPU, so bit 9 is free for the OS).  Set ONLY alongside
+ * a cleared PG_W, on both sides of a forked frame: a write-protect fault
+ * that finds PG_W clear + PG_COW set is a COW break (copy the frame, take
+ * it writable); PG_W clear WITHOUT PG_COW is a genuinely read-only page
+ * (text/.rodata) and stays a SIGSEGV.  Defined here, not in mm/vma.h, so
+ * the page-table vocabulary stays in one header. */
+#define PG_COW 0x200
 /* In a PDE this bit means "big page"; in a 4 KiB PTE it is the third PAT
  * index bit (index = PAT*4 + PCD*2 + PWT), which is what reaches a memory
  * type outside slots 0-3 of IA32_PAT.  vmm.c already relies on PG_PS ==

@@ -34,6 +34,37 @@ static u64 reserved_lo, reserved_hi; /* [lo,hi) excluded (kernel image etc.) */
 static u64 total_pg, free_pg;
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
+/* ---- order-0 reference counts (COW, see mm.h) ----
+ * One u16 per 4 KiB frame of the managed window: PMM_WINDOW_TOP is 2 GiB,
+ * so 524288 slots = 1 MiB of .bss, zeroed with the rest at boot.  Only
+ * order-0 frames are counted (only they back user mappings); orders above
+ * 0 bypass this entirely.  Counts are touched with relaxed atomics: the
+ * interesting races are two address spaces dropping the last two
+ * references of one shared frame concurrently, and a CAS loop settles
+ * that without a global lock (the pmm_lock never covers a counted frame's
+ * residency -- it guards the free lists, which a still-referenced frame is
+ * not on).  u16 headroom is NR_TASKS (64) deep-fork chains at worst. */
+#define REF_SLOTS (PMM_WINDOW_TOP >> 12)
+static u16 frame_ref[REF_SLOTS];
+
+/* Drop one owner.  Returns true when another owner still holds the frame
+ * (so the caller must NOT free it), false when this was the last one --
+ * or when nothing tracked the frame at all (a seed frame, or a path
+ * predating the counter), which is handed back exactly as it always was:
+ * a count of 0 must never make a frame un-freeable. */
+static bool frame_ref_drop(u64 pa)
+{
+    u16 *r = &frame_ref[pa >> 12];
+    u16 v = __atomic_load_n(r, __ATOMIC_RELAXED);
+    for (;;) {
+        if (!v) return false; /* untracked */
+        if (!__atomic_compare_exchange_n(r, &v, (u16)(v - 1), false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue; /* CAS failed: v now holds the live value, retry */
+        return v > 1;
+    }
+}
+
 /* MMIO ranges (the LFB) that must never be handed out as frames.
  * 8, not 4: beyond the LFB and its PD window, start_kernel() has to reserve
  * the two frame ranges whose high-half alias slots are consumed by a fixed
@@ -274,6 +305,11 @@ u64 pmm_alloc_order(int order)
         }
         u64 addr = ci->pcache[--ci->pcache_n];
         __atomic_fetch_sub(&free_pg, 1, __ATOMIC_RELAXED);
+        /* first owner takes the count (see mm.h): store, not add -- a free
+         * frame's count is 0 by construction, so 1 is the truth and a
+         * non-zero residue would be a bug the store must not amplify */
+        if (addr < PMM_WINDOW_TOP)
+            __atomic_store_n(&frame_ref[addr >> 12], 1, __ATOMIC_RELAXED);
         irq_restore(f);
         return addr;
     }
@@ -289,6 +325,11 @@ u64 pmm_alloc_order(int order)
 void pmm_free_order(u64 pa, int order)
 {
     if (order == 0) {
+        /* COW: another address space may still map this frame.  Dropping
+         * our reference is all THIS owner owes -- only the last one hands
+         * the frame to the stash/buddy below.  See mm.h for why an
+         * untracked (0) count still falls through to the real free. */
+        if (pa < PMM_WINDOW_TOP && frame_ref_drop(pa)) return;
         struct cpu_info *ci = this_cpu_data();
         u64 f = irq_save();
         if (ci->pcache_n < PCACHE_N) {
@@ -317,6 +358,21 @@ void pmm_free_order(u64 pa, int order)
 
 u64 pmm_free_bytes(void)
 { return free_pg << MIN_ORDER_BITS; }
+
+void pmm_ref(u64 pa)
+{
+    /* Frames outside the managed window are never handed out as order-0
+     * pages (the buddy only serves [base_addr, top_addr)), so there is no
+     * slot to speak of -- and nothing that could share them either. */
+    if (pa >= PMM_WINDOW_TOP) return;
+    __atomic_fetch_add(&frame_ref[pa >> 12], 1, __ATOMIC_RELAXED);
+}
+
+u16 pmm_refcount(u64 pa)
+{
+    if (pa >= PMM_WINDOW_TOP) return 0;
+    return __atomic_load_n(&frame_ref[pa >> 12], __ATOMIC_RELAXED);
+}
 
 /* The first order the buddy refuses (orders 0..MAX_ORDER-1 are valid).
  * Published so a test can assert the *actual* boundary instead of a

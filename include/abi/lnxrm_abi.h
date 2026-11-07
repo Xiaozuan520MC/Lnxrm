@@ -43,7 +43,14 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  41
+#define LNXRM_SYSCALL_LAST  44
+
+/* mmap() protection bits (same values as Linux PROT_*, shared here so the
+ * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */
+#define LNXRM_PROT_NONE  0
+#define LNXRM_PROT_READ  1
+#define LNXRM_PROT_WRITE 2
+#define LNXRM_PROT_EXEC  4
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST

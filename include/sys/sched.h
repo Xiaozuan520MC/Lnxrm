@@ -3,6 +3,7 @@
 #include <types.h>
 #include <sys/spinlock.h>
 #include <sys/cred.h>
+#include <mm/vma.h>
 
 /* Forward declarations for percpu.h (breaks circular dependency) */
 struct cpu_info;
@@ -78,6 +79,14 @@ struct task {
      * USTACK_MAX_GROW) maps another page here.  0 = no user stack tracked
      * (idle/kernel-only task), which makes every growth attempt decline. */
     u64 ustack_lo;
+
+    /* T-MMAP: the anonymous ranges this task claimed with mmap(), sorted by
+     * start (mm/vma.c).  NULL = none.  mmap only records here -- the pages
+     * arrive on first touch through the #PF demand pager -- so the list is
+     * the truth about the ADDRESS SPACE while the page tables are only the
+     * truth about what has been touched.  fork deep-copies it (sys_fork),
+     * execve drops the old image's list, task_free_slot drops the rest. */
+    struct vma *vmas;
 
     /* T-032: what this task's user space costs, in 4 KiB pages.
      * mem_pages is refreshed from the page tables themselves (at exec,

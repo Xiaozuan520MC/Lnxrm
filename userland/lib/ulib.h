@@ -81,6 +81,27 @@ static inline long ksigreturn(void)
 static inline long kbrk(long addr)
 { return sys_call3(SYS_brk, addr, 0, 0); }
 
+/* 42/43: anonymous mmap/munmap.  mmap takes addr=0 (the kernel picks a
+ * page-aligned base top-down in [MMAP_LO, MMAP_TOP)) and a PROT mask; the
+ * range is only RECORDED here -- each page is zeroed and mapped on first
+ * touch, metered against the same 64 MiB quota as brk.  Returns the base,
+ * or a negative errno (EINVAL for a non-zero addr / unaligned munmap, ENOMEM
+ * when no gap fits).  munmap's len is rounded up to a page. */
+static inline long kmmap(long len, int prot)
+{ return sys_call3(SYS_mmap, 0, len, prot); }
+static inline long kmunmap(long addr, long len)
+{ return sys_call3(SYS_munmap, addr, len, 0); }
+/* 44: mprotect -- re-protect [addr, addr+len) (len rounds up to a page).
+ * Works on ANY user range, mmap'd or not: pages that are present change
+ * now (W and NX), untouched mmap pages change through their VMA so the
+ * demand pager maps them with the new prot on first touch.  Granting write
+ * to a frame another owner also holds MARKS it copy-on-write instead of
+ * copying -- the copy happens on the next write -- so this never allocates
+ * a frame.  Returns 0, EINVAL for an unaligned/empty/out-of-range ask, or
+ * ENOMEM when some page in the range is neither mapped nor claimed. */
+static inline long kmprotect(long addr, long len, int prot)
+{ return sys_call3(SYS_mprotect, addr, len, prot); }
+
 /* Set up by crt0 from the envp vector the kernel placed on the stack. */
 extern char **environ;
 static inline long kdup2(int a, int b)

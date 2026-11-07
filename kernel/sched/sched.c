@@ -548,6 +548,12 @@ struct task *task_alloc_slot(void)
                  * it never mapped.  0 means "no stack tracked", so every growth
                  * attempt declines until exec/spawn/fork sets it. */
                 task_table[i].ustack_lo = 0;
+                /* T-MMAP: and never the previous occupant's mmap list --
+                 * task_free_slot() released it before the slot came back
+                 * here, so this is the belt to that pair of braces (a slot
+                 * claimed straight from a corpse went through the same
+                 * free). */
+                task_table[i].vmas = NULL;
                 t = &task_table[i];
                 break;
             }
@@ -574,6 +580,12 @@ struct task *task_alloc_slot(void)
 void task_free_slot(struct task *t)
 {
     if (!t) return;
+    /* T-MMAP: release the mmap list OUTSIDE task_table_lock -- vma nodes
+     * come from kmalloc, whose own lock must not be nested under the table
+     * lock (and whose free path we otherwise drag into a spinlock).  The
+     * slot is still claimed at this point, so nobody can observe the list
+     * mid-free. */
+    vma_free_all(t);
     u64 flags;
     spin_lock_irqsave(&task_table_lock, &flags);
     /* Belt-and-suspenders: never free a task still linked on a queue. */

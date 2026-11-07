@@ -76,8 +76,13 @@ int vmm_map_user(u64 root, u64 va, u64 pa, bool writable, bool user, bool exec)
     if (pt[i1] & PG_P) {
         /* Already mapped: two ELF segments may share a page (text in front
          * of rodata of the next one).  Widen -- and only widen -- the
-         * existing PTE instead of overwriting it; `pa` is ignored here. */
-        if (writable) pt[i1] |= PG_W;
+         * existing PTE instead of overwriting it; `pa` is ignored here.
+         * A COW page (PG_COW set, PG_W clear) is the exception: widening
+         * it would silently hand write access back to two address spaces
+         * that still share the frame, and the next two writers would corrupt
+         * each other.  Its owner gets the page writable by taking the COW
+         * fault (page_fault.c), which copies first. */
+        if (writable && !(pt[i1] & PG_COW)) pt[i1] |= PG_W;
         if (exec) pt[i1] &= ~PG_NX;
     } else {
         if (!pa) return LNXRM_EFAIL;
@@ -146,6 +151,30 @@ bool vmm_writable_in(u64 root, u64 va)
     return (*pte & (PG_P | PG_W)) == (PG_P | PG_W);
 }
 
+u64 vmm_user_pte(u64 root, u64 va)
+{
+    u64 *pte;
+    u64 big_buf;
+    int r = walk(root, va, &pte, &big_buf);
+    if (r < 0 || r == 1 || !(*pte & PG_P)) return 0;
+    return *pte;
+}
+
+int vmm_user_pte_write(u64 root, u64 va, u64 pte)
+{
+    u64 *slot;
+    u64 big_buf;
+    int r = walk(root, va, &slot, &big_buf);
+    if (r < 0 || r == 1 || !(*slot & PG_P)) return LNXRM_EFAIL;
+    *slot = pte;
+    /* Same unconditional flush vmm_map_user does: the CPU may be holding
+     * the old permission (PG_W) or the old frame in its TLB, and this is
+     * precisely the update -- fork's COW conversion, the COW fault fixer --
+     * whose whole point is that the NEXT access sees the new one. */
+    __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
+    return 0;
+}
+
 u64 vmm_unmap_user(u64 root, u64 va)
 {
     u64 *pte;
@@ -176,6 +205,53 @@ u64 vmm_unmap_user(u64 root, u64 va)
 
 bool vmm_is_user_range(u64 lo, u64 hi)
 { return lo >= USER_BASE && hi <= USER_MAX_VMA && lo < hi; }
+
+/* After unmapping `va`, drop any page TABLES that just went empty along
+ * its path.  vmm_unmap_user() clears the leaf and nothing else, so a
+ * range mapped into a fresh 2 MiB region would leave its PD and PT behind
+ * forever -- two frames per region that munmap would otherwise strand
+ * (and that a ktest "everything back where it was" case rightly fails on).
+ *
+ * Levels unwind bottom-up while each is all-zero: PT -> PD -> PDPT, and
+ * the PDPT's death clears the PML4 slot -- ONLY that slot: PML4[0] and
+ * [511] are the kernel's identity map and high-half alias, shared by
+ * every address space.  Nothing is reclaimed while ANY present entry
+ * remains at that level, so a sibling page two megabytes away keeps its
+ * tables alive.
+ *
+ * The final invlpg matters: the CPU caches intermediate entries too
+ * (paging-structure caches), and a freed PT frame may already be another
+ * table by the time the next walk happens. */
+void vmm_reclaim_empty_tables(u64 root, u64 va)
+{
+    u64 i4 = (va >> 39) & 511, i3 = (va >> 30) & 511, i2 = (va >> 21) & 511;
+    if (i4 != USER_SLOT) return; /* kernel range: no tables to unwind here */
+
+    u64 *p4 = ptable_ptr(root);
+    if (!(p4[i4] & PG_P)) return;
+    u64 *p3 = ptable_ptr(p4[i4] & ~0xfff);
+    if (!(p3[i3] & PG_P)) return;
+    u64 *p2 = ptable_ptr(p3[i3] & ~0xfff);
+    if (p2[i2] & PG_PS) return; /* 2 MiB leaf: not built by vmm_map_user */
+    u64 *p1 = ptable_ptr(p2[i2] & ~0xfff);
+
+    for (int i = 0; i < 512; i++)
+        if (p1[i] & PG_P) return; /* still someone's page */
+    pmm_free(p2[i2] & ~0xfff);
+    p2[i2] = 0;
+
+    for (int i = 0; i < 512; i++)
+        if (p2[i] & PG_P) return;
+    pmm_free(p3[i3] & ~0xfff);
+    p3[i3] = 0;
+
+    for (int i = 0; i < 512; i++)
+        if (p3[i] & PG_P) return;
+    pmm_free(p4[i4] & ~0xfff);
+    p4[i4] = 0;
+
+    __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
+}
 
 void vmm_switch_to(u64 root)
 { __asm__ volatile("mov %0, %%cr3" ::"r"(root) : "memory"); }
@@ -421,21 +497,37 @@ int dup_user_aspace(u64 src, u64 dst)
             for (int i1 = 0; i1 < 512; i1++) {
                 if (!(spt[i1] & PG_P)) continue;
                 u64 va = slot | ((u64)i3 << 30) | ((u64)i2 << 21) | ((u64)i1 << 12);
-                /* defensive: only copy pages that truly resolve */
-                u64 spa = vmm_translate_in(src, va);
-                if (!spa) continue;
-                u64 npa = pmm_alloc();
-                if (!npa) goto fail;
-                /* Read the source through the high-half alias of the frame
-                 * the SRC page table names -- never through `va`.  `va`
-                 * would resolve against the live CR3 (wrong address space
-                 * if it is not `src`) and, when it does resolve to a user
-                 * page, SMAP faults a ring-0 load with no STAC window.  The
-                 * alias is a kernel page: neither hazard applies. */
-                memcpy((void *)PHYS_TO_VIRT(npa), (void *)PHYS_TO_VIRT(spa), PAGE_SIZE);
-                /* copy the flags, PG_NX included: fork must not turn an
-                 * executable page into a data page (or vice versa) */
-                dpt[i1] = npa | (spt[i1] & (0xFFFUL | PG_NX));
+                u64 spte = spt[i1];
+                u64 spa = spte & PTE_PA_MASK;
+                if (!spa) continue; /* defensive: present but names no frame */
+
+                /* Copy-on-write (T-COW): share the frame instead of
+                 * cloning it.  Both address spaces take one reference
+                 * (pmm_ref here, dropped by each side's eventual
+                 * vmm_unmap_user/vmm_destroy via pmm_free), so the child
+                 * costs page TABLES only -- no frame, no 4 KiB memcpy --
+                 * and either side's write later goes through the COW fault
+                 * fixer (page_fault.c), which copies on demand.
+                 *
+                 * A WRITABLE page must lose PG_W on BOTH sides and carry
+                 * PG_COW so the write is trapped; a page that was already
+                 * read-only (text/.rodata) is shared as it stands, with no
+                 * PG_COW -- a write to it is a real violation and must stay
+                 * SIGSEGV, not become a pointless copy.  PG_NX and every
+                 * other flag ride along verbatim in spte. */
+                pmm_ref(spa);
+                if (spte & PG_W) {
+                    spt[i1] = (spte & ~PG_W) | PG_COW;
+                    dpt[i1] = spt[i1];
+                    /* src may be the LIVE address space (fork dups the
+                     * parent's): flush so the parent's cached PG_W entry
+                     * cannot outlive the conversion.  No PCID in use, so
+                     * invlpg is global -- it is equally harmless when src
+                     * is a ktest-built table that no CPU is on. */
+                    __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
+                } else {
+                    dpt[i1] = spte;
+                }
             }
         }
     }

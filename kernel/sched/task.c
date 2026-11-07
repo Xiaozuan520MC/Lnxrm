@@ -6,6 +6,7 @@
 #include <console.h>
 #include <framebuffer.h>
 #include <mm/mm.h>
+#include <mm/pagefault.h>
 #include <elf.h>
 #include <sys/cpu.h>
 #include <sys/spinlock.h>
@@ -37,13 +38,43 @@ u32 next_pid(void)
     return pid;
 }
 
+/* Materialize a not-present user page exactly the way a real #PF would.
+ *
+ * The two gates below run BEFORE the copy, so a lazy page -- an mmap
+ * region's first touch, a stack page below the watermark -- that the copy
+ * itself would have faulted in must be faulted in here.  Without this,
+ * read() into an untouched mmap buffer answers -EFAULT where Linux's
+ * copy_to_user simply takes the #PF and carries on, which would leave
+ * anonymous mmap usable only after the program has poked every page
+ * itself.
+ *
+ * Nothing else changes: the fixers keep every rule (VMA prot, quota, the
+ * stack guard, the RSP window), so a pointer they still refuse fails the
+ * gate exactly as it did before -- a kernel address, a non-canonical one,
+ * a hole in the window and a read-only page under a write all still say
+ * no.  err is the real not-present code (bit 1 set for a write) so
+ * demand_page asks the VMA for the right permission; cs marks it CPL3 and
+ * ussp stays 0, which is outside user space, so stack_grow's RSP window
+ * is skipped -- this pointer was NAMED by the caller, not arrived at by a
+ * running stack, and it is still confined to the stack window, the guard
+ * and the quota. */
+static bool user_page_in(u64 page, bool write)
+{
+    struct intr_frame f;
+    memset(&f, 0, sizeof(f));
+    f.cs = 3;
+    f.err = write ? 2 : 0;
+    return page_fault_try_fix(&f, page);
+}
+
 bool user_ptr_ok(u64 p, u64 n)
 {
     if (!n || !vmm_is_user_range(p, p + n)) return false;
     u64 lo = p & ~4095ULL;
     u64 hi = (p + n - 1) & ~4095ULL;
     for (u64 pg = lo; pg <= hi; pg += 4096)
-        if (!vmm_translate_in(current->pml4, pg)) return false;
+        if (!vmm_translate_in(current->pml4, pg) && !user_page_in(pg, false))
+            return false;
     return true;
 }
 
@@ -52,8 +83,22 @@ bool user_ptr_writable(u64 p, u64 n)
     if (!n || !vmm_is_user_range(p, p + n)) return false;
     u64 lo = p & ~4095ULL;
     u64 hi = (p + n - 1) & ~4095ULL;
-    for (u64 pg = lo; pg <= hi; pg += 4096)
+    for (u64 pg = lo; pg <= hi; pg += 4096) {
+        /* a not-present page is materialized first (see user_page_in) --
+         * then, and only then, is it worth asking whether it is writable */
+        if (!vmm_translate_in(current->pml4, pg) && !user_page_in(pg, true))
+            return false;
+        /* T-COW: after fork every writable page is read-only ON BOTH SIDES
+         * (PG_W clear, PG_COW set), so the writability check below would
+         * reject a perfectly legitimate store into this task's own memory.
+         * Resolve the copy first -- page_cow_break is a no-op for a page
+         * that is not COW, so text/.rodata keep refusing exactly as they
+         * always did.  One rule, at the one gate every kernel store path
+         * already funnels through (copy_to_user, the signal frame push in
+         * signal.c, the vfs writes): no caller has to remember COW. */
+        if (!page_cow_break(current, pg)) return false;
         if (!vmm_writable_in(current->pml4, pg)) return false;
+    }
     return true;
 }
 
@@ -94,6 +139,20 @@ int sys_fork(void)
         task_free_slot(ch);
         return LNXRM_EFAIL;
     }
+    /* T-MMAP: the child claims the same mmap ranges.  Deep copy (one node
+     * per range), NOT shared: the list is per-task bookkeeping, and the
+     * PAGES behind it are already handled by dup_user_aspace -- shared and
+     * write-protected for COW, demand-paged independently for ranges the
+     * parent never touched.  A failed copy unwinds exactly like a failed
+     * page-table dup: the frames are reference-counted, so destroying the
+     * half-built child's tables drops its references and the parent keeps
+     * every page it walked in with. */
+    if (vma_dup(current, ch) < 0) {
+        vmm_destroy_user_aspace(ch->pml4);
+        kfree(ch->kstack);
+        task_free_slot(ch);
+        return LNXRM_EFAIL;
+    }
 
     /* clone fd table */
     memcpy(ch->fds, current->fds, sizeof(ch->fds));
@@ -104,11 +163,12 @@ int sys_fork(void)
     /* T-094: dup_user_aspace copied every stack page, so the child's stack
      * occupies the same window -- inherit the low-watermark too. */
     ch->ustack_lo = current->ustack_lo;
-    /* T-032: dup_user_aspace gave the child a frame of its own for every
-     * user page, so its account is what its own space measures -- a fresh
-     * count, not a copy of a number, and from here on the two accounts
-     * move independently (the quota bites the child that grows, not the
-     * parent).  Its peak starts at what it was born holding. */
+    /* T-032: dup_user_aspace mapped the child's own page TABLES over the
+     * parent's frames (shared, COW -- see the copy in vmm.c), so its
+     * account is what its own space measures -- a fresh count, not a copy
+     * of a number, and from here on the two accounts move independently
+     * (the quota bites the child that grows, not the parent).  Its peak
+     * starts at what it was born holding. */
     ch->mem_pages = vmm_count_user_pages(ch->pml4);
     ch->mem_peak = ch->mem_pages;
     ch->signal_pending = 0;
@@ -253,6 +313,13 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
      * current->pml4 / any interrupt path never sees a stale CR3. */
     current->pml4 = new_pml4;
     vmm_destroy_user_aspace(old_pml4);
+    /* T-MMAP: the new image starts with NO mmap ranges -- the old list
+     * described the address space just destroyed, and keeping it would
+     * make the demand pager map the new image's address space at the old
+     * image's addresses (with the old protection).  Runs after the point
+     * of no return for the same reason ustack_lo is set there: a FAILED
+     * execve rolls back above and must leave the caller's list intact. */
+    vma_free_all(current);
     current->brk_base = (void *)ALIGN_UP(brk_end, PAGE_SIZE);
     current->brk_cur = current->brk_base;
     /* T-094: the new image's stack was mapped 16 KiB below USER_STACK_TOP

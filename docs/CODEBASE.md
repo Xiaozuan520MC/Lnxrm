@@ -31,12 +31,12 @@ kernel/
   core/                syscall.c(分发/门) print.c percpu.c smp.c protect.c selftest.c
   sched/               task.c(生命周期/fork/execve/exit/wait4) sched.c(RR/锁) elf.c signal.c
   irq/                 isr.c(分发/异常/IPI) apic.c acpi.c
-  mm/                  pmm.c(kheap 之上: buddy) kheap.c vmm.c pagefault.c
+  mm/                  pmm.c(kheap 之上: buddy, order-0 帧引用计数) kheap.c vmm.c vma.c(匿名 VMA 列表) pagefault.c(缺页分发: demand/stack/COW)
   fs/                  vfs.c blk_cache.c mbr.c initramfs.c
   fs/fat32/            fat32.c(挂载/链) fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
   drivers/             pci.c ide.c ahci.c uart.c ps2mouse.c framebuffer.c input_event.c
   lib/string.c
-ktest/                 启动自测：ktest.c 框架 + 26 个 t_*.c（在仓库根，不在 kernel/ 下）
+ktest/                 启动自测：ktest.c 框架 + 27 个 t_*.c（在仓库根，不在 kernel/ 下）
   include/             ktest 私有头（-Iktest/include）
 userland/              Makefile + bin/ 16 个程序 .c（自动发现）+ lib/(crt0.S + ulib.c 运行库)
 scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_test.py
@@ -51,7 +51,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | `MAX_CPUS` / `NR_TASKS` / `NR_FDS` | 8 / 64 / 16 | `include/types.h` |
 | `KSTACK_SIZE` | 32768 | `include/sys/sched.h` |
 | `LNXRM_NR_SIGNALS` | 32 | `include/abi/lnxrm_abi.h` |
-| `LNXRM_SYSCALL_LAST` | 41（编号 0–41 共 42 个） | `include/abi/lnxrm_abi.h` |
+| `LNXRM_SYSCALL_LAST` | 44（编号 0–44 共 45 个） | `include/abi/lnxrm_abi.h` |
 | `CACHE_ENTRIES` | 64 | `include/disk.h` |
 | `MAX_MOUNTS` | 4 | `kernel/fs/vfs.c` |
 | `HZ` | 100 | `include/sys/cpu.h` |
@@ -148,18 +148,25 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 - 关键函数：`vmm_map_user`（四级映射，`writable/user/exec` 三权限参数，失败 `ENOMEM`）、`vmm_unmap_user`（清 PTE 返回物理地址）、`vmm_count_user_pages`（**用户页数唯一真相**，记账与 `ps` 都读它）、`vmm_translate_in`、`vmm_map_kernel_page`、`vmm_switch_to`、`master_pml4_phys`。
 - ⚠️ `vmm_destroy_user_aspace()` 释放所有仍 present 的数据页：想自己释放已映射帧，**必须先 `vmm_unmap_user` 再 `pmm_free`**，否则同一帧还两次、空闲链毒化。
 
-### 3.5 fork 深拷贝、NX 与懒惰栈
+### 3.5 COW fork、NX 与懒惰栈
 
-- `dup_user_aspace` 逐页 `pmm_alloc + memcpy` **深拷贝**槽 255，父子各记各的页数。
-- `vmm_map_user` 的 `exec=false` 即打 `PG_NX`：栈/堆/数据默认不可执行；**唯一 `exec=true` 的用户页是信号 restorer**（`signal_map_restorer`，`USER_SIGRETURN_VA`）。
-- 用户栈 exec 时只映 16 KiB；落在 `[USER_STACK_TOP - USTACK_MAX_GROW, ustack_lo)` 的 #PF **懒惰下扩**（下限 512 KiB），否则按栈溢出。用户态 #PF 先试 `page_fault_try_fix()` 再转信号。
+- `dup_user_aspace` **共享帧**（2026-11-07 起不再逐页 `pmm_alloc + memcpy`）：可写页两边清 `PG_W` 置 `PG_COW`（PTE bit 9）并 `invlpg` 源侧，只读页原样共享；每帧 `pmm_ref` 加签，父子各记各的页数。写保护缺页经 `page_fault_try_fix` 的 COW fixer（`page_cow_break`：先复制、再换 PTE、最后放旧引用）取回私有可写页；`!W !COW` 的写保护是真 rodata，落 SIGSEGV。
+- `vmm_map_user` 的 widen（已存在即并权限）**拒绝**给 `PG_COW` 页回写 `PG_W`，否则两个共享者会静默重新共享可写帧。
+- `vmm_map_user` 的 `exec=false` 即打 `PG_NX`：栈/堆/数据默认不可执行；**唯一 `exec=true` 的用户页是信号 restorer**（`signal_map_restorer`，`USER_SIGRETURN_VA`）与 `PROT_EXEC` 的 mmap 段。
+- 用户栈 exec 时只映 16 KiB；落在 `[USER_STACK_TOP - USTACK_MAX_GROW, ustack_lo)` 的 #PF **懒惰下扩**（下限 512 KiB），否则按栈溢出。
+- **栈保护页**（2026-11-07）：`STACK_GUARD` 64 KiB 的 `[MMAP_TOP, USER_STACK_TOP - USTACK_MAX_GROW)` **永不映射**——mmap 窗在它下面收口（`MMAP_TOP` = 栈地板 − `STACK_GUARD`），`demand_page` 落在守护区一律拒绝，`mprotect` 对它回 `ENOMEM`（既无 VMA 也无页）、`munmap` 零相交回 `EINVAL`（`vma_erase` 的约定）。`STACK_GROW_WINDOW` 与它**静态断言相等**（`USER_STACK_TOP - MMAP_TOP == USTACK_MAX_GROW + STACK_GROW_WINDOW`）：栈最深时，凡被认定为栈访问的 fault 都落在守护区内、绝够不到 mmap VMA。`stack_grow` 另有 **RSP 邻近检查**：`f->ussp`（换权时硬件压的用户 RSP；`intr_frame` 没有 `rsp` 字段）在用户空间内时，`cr2 + STACK_GROW_WINDOW < rsp` 一律拒绝——x86-64 SysV 红色区 128 B 加序言一次减帧就是合法触达的全部，再往下是野指针，**取帧之前**先毙；ktest 合成帧 `ussp=0` 自动跳过。
+- 用户态 #PF 走 `page_fault_try_fix()` 三段分发（2026-11-07 起）：**demand**（cr2 落在某 VMA 且 not-present → **先按 VMA prot 拒掉越权的写/取指**，再补零帧、按 prot 给 W/NX、过配额、已 present 则幂等拒绝）→ **stack_grow**（not-present 且非取指）→ **COW**（present **且带写位** + `PG_COW`）；三段各自声明所认的 `err` 位，全不认才转 SIGSEGV/panic。
+- **`err` 位必须逐位认**：`cow_fault` 只认写位（bit1）——否则 NX 取指（`P|I = 0x11`）会被当成"COW 已破环"，什么都没改就回报已修复，`iretq` 重试同一指令再入同一 #PF，**无限故障循环**（NXE 已开，每个栈/堆/mmap 数据页都踩得到）；`stack_grow` 拒取指位（bit4），栈是 NX，长出来也白长。这与 Linux 把 `access_error()` 排在 `handle_mm_fault()` 之前是同一条规则：**先问权限，再动分页器**。
 
-### 3.6 `brk` 与配额
+### 3.6 `brk`、匿名 `mmap` 与配额
 
-- 合法区间 `[brk_base, USER_STACK_TOP - 1 MiB)`，先算术拒绝再取帧。
+- `brk` 合法区间 `[brk_base, MMAP_LO)`，先算术拒绝再取帧；`MMAP_LO` 是 mmap 窗下沿（2026-11-07 从 `USER_STACK_TOP - 1 MiB` 移来——旧上限落在 mmap 窗**内**，堆与 mmap 能争同一页面）。
+- 匿名 `mmap`（42/43，`kernel/mm/vma.c` + `sys_mmap/sys_munmap`）：`addr` 必须为 0，top-down 扫 `[MMAP_LO, MMAP_TOP)` 空隙（`MMAP_TOP` = 栈增长地板 − `STACK_GUARD`），**只登记 VMA 不映射**；首触由 demand fixer 补帧（配额同 brk）。`munmap` 摘 VMA（中段挖洞拆分、零相交 `EINVAL`）→ 逐页 unmap → `vmm_reclaim_empty_tables` 回收空 PT/PD/PDPT。VMA 列表挂 `struct task.vmas`，fork 深拷（`vma_dup`）、execve 与 `task_free_slot` 释放。
+- **`mprotect`（44，`sys_mprotect` + `vma_protect`）**：`[addr, ALIGN_UP(len))` 作用于**任意用户范围**（不只 mmap 段——翻 JIT、改 .text、封栈缓冲），未对齐/零长/回滚/出用户空间 `EINVAL`；范围内存在「既不在场又无 VMA」的页回 `ENOMEM`，**先查全再改动**（跨 VMA 按步长快走，落进 VMA 就跳到它的尾）。**先 `vma_protect` 原子改列表、再改 PTE**（后者只重写刚读过的叶，不可能失败）：`vma_protect` 先数节点（全覆盖 0、切头/切尾 1、中间打洞 2）→ 预分配池 → 才写 prot，`ENOMEM` = 列表零改动（与 `vma_erase` 的拆分同规）。授予 W **永不分配**：独占帧直接 `PG_W`，共享帧（`pmm_refcount > 1` 或已 `PG_COW`）只标 `PG_COW`、复制推迟到下一次写故障——与 Linux `can_change_private_pte_writable()` 同规则（只在 `PageAnonExclusive` 时才改可写）；**撤销写必须同时清 `PG_W | PG_COW`**，否则下一次 COW 缺页会把只读悄悄改回可写。NX 随 `PROT_EXEC` 翻转；`PG_W` 却 `refcount > 1` 的不可能态防御性降级为 COW。
 - 判据是**页表行走** `vmm_count_user_pages()`，配额只来自 `cred_mem_quota()`（0 = 无上限，root/kxld）；`have + delta > quota` 回 `ENOMEM`；shrink 永不拒绝；部分失败回滚。
 - 配额**只来自 `cred_mem_quota()`** —— `struct task` 没有配额字段，`setuid` 改 tier，两套记账必然打架。
-- 生命周期：exec/spawn/fork 后按页表行走重算并重置峰值；brk 成功后增减并抬峰值；槽位回收与下次 `task_alloc_slot` 归零（**复用不继承上一个占用者的读数**）；zombie reap 前仍占页，`ps` 显示其最终大小。
+- 生命周期：exec/spawn/fork 后按页表行走重算并重置峰值；brk/mmap-demand/munmap 后增减并抬峰值；槽位回收与下次 `task_alloc_slot` 归零（**复用不继承上一个占用者的读数**）；zombie reap 前仍占页，`ps` 显示其最终大小。
+- **两个拷贝门会替拷贝补页**（2026-11-07）：`user_ptr_ok` / `user_ptr_writable` 跑在拷贝**之前**，遇到 not-present 页先调一次 `page_fault_try_fix`（`err` = 真实 not-present 码，写门带 bit1，所以 demand 会先问 VMA 要权限），补不上才拒绝——否则 `read()` 进一个没碰过的 mmap 缓冲回 `EFAULT`，匿名 mmap 就只有程序自己逐页戳过才可用（Linux 的 `copy_to_user` 是直接吃 #PF 补页）。该拒的照旧拒：内核地址、非规范地址、窗口里的洞、只读页底下的写，一条不变。
 
 ## 4. 进程、调度与信号
 
@@ -178,12 +185,12 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 
 ### 4.2 fork / execve / exit
 
-- `sys_fork`：槽 + 内核栈 + pid → 新 PML4 → 深拷贝 → 克隆 fd 表（逐个 `refcnt++`）→ 复制 brk/`ustack_lo` → 伪造子进程 `intr_frame`（rax=0、开 IF）→ frame 下方构造 `cpu_ctx` 以 `glue_first` 为入口 → 入队。
-- `sys_execve`：`copy_user_str` 取路径（128 字节上限，argv ≤16×64）→ 读整个文件 → 新 PML4 + 16 KiB 栈 → **先 `vmm_switch_to(new)` 再 `elf_load`**（装载器 `memcpy` 直写用户地址）→ 失败切回旧并回滚 → 成功**先**赋 `current->pml4` **再**销毁旧地址空间 → 关 `O_CLOEXEC`、清 `signal_pending` → 按 SysV ABI 摆 `argc/argv/envp/auxv`。
+- `sys_fork`：槽 + 内核栈 + pid → 新 PML4 → `dup_user_aspace`（**COW 共享**，见 3.5）→ `vma_dup` 深拷 mmap 列表（失败与页表 dup 同款回滚）→ 克隆 fd 表（逐个 `refcnt++`）→ 复制 brk/`ustack_lo` → 伪造子进程 `intr_frame`（rax=0、开 IF）→ frame 下方构造 `cpu_ctx` 以 `glue_first` 为入口 → 入队。
+- `sys_execve`：`copy_user_str` 取路径（128 字节上限，argv ≤16×64）→ 读整个文件 → 新 PML4 + 16 KiB 栈 → **先 `vmm_switch_to(new)` 再 `elf_load`**（装载器 `memcpy` 直写用户地址）→ 失败切回旧并回滚 → 成功**先**赋 `current->pml4` **再**销毁旧地址空间、`vma_free_all`（新镜像零 mmap；失败回滚路径在赋值之前返回，调用方列表原样保留）→ 关 `O_CLOEXEC`、清 `signal_pending` → 按 SysV ABI 摆 `argc/argv/envp/auxv`。
 - `sys_exit`：关所有 fd → 撤控制台等待者 → **`fb_disown(current->pid)`（画屏归属唯一释放点，所有死法都经过）** → 孤儿重挂 pid 1（垂死 init 不领养自己、僵尸也不领养 → `(0,0)`）→ 给父 `SIGCHLD` → `T_ZOMBIE` → 出队 → 唤醒父 → `schedule()`。
 - `kernel_spawn`：第一个用户进程，类 execve 但简化，结尾**切回 master PML4**（跑在内核上下文）。
 - `elf.c` 只接受静态 `ET_EXEC`，`e_entry ∈ [USER_BASE, USER_MAX_VMA)`，返回 `brk_end`；不支持动态链接/共享库/需求分页。
-- 用户内存访问：`user_ptr_ok`（逐页确认已映射）、`user_ptr_writable`（内核写用户页必须逐页确认可写，否则 CR0.WP 下 #PF 且无 fixup 表）、`copy_from/to_user`、`copy_user_str`。
+- 用户内存访问：`user_ptr_ok`（逐页确认已映射）、`user_ptr_writable`（内核写用户页必须逐页确认可写，否则 CR0.WP 下 #PF 且无 fixup 表；**COW 页先在这一道门里被 `page_cow_break` 解析**——fork 后两边都只读，copy_to_user/信号帧 push/vfs 写共用这一个规则）、`copy_from/to_user`、`copy_user_str`。
 
 ### 4.3 调度（`kernel/sched/sched.c`）
 
@@ -227,7 +234,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 - **只追加不重排**：唯一定义源 `include/abi/lnxrm_syscalls.def`（X-macro）——编号紧凑连续、新调用追加末尾并把 `LNXRM_SYSCALL_LAST` 加一、永不重排已有编号；`lnxrm_abi.h` 逐编号编译期校验（忘改宏直接编译失败）。
 - 未知编号落 `default`，打 `[sys] unknown syscall …` 回 `-38`。
 
-### 5.2 42 项总表（编号 0–41，连续无空洞）
+### 5.2 45 项总表（编号 0–44，连续无空洞）
 
 | # | 名字 | 用途 | 实现文件 |
 |---|---|---|---|
@@ -241,7 +248,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | 7 | `dup2` | 复制 fd | `kernel/fs/vfs.c` |
 | 8 | `nanosleep` | 睡眠；信号打断回 EINTR 并回填余量 | `kernel/sched/sched.c` |
 | 9 | `getpid` | 进程号 | `kernel/core/syscall.c` |
-| 10 | `fork` | 复制进程（深拷贝地址空间） | `kernel/sched/task.c` |
+| 10 | `fork` | 复制进程（地址空间 COW 共享 + VMA 列表深拷） | `kernel/sched/task.c` |
 | 11 | `execve` | 装载静态 ELF64 | `kernel/sched/task.c` |
 | 12 | `exit` | 退出（释放画屏归属） | `kernel/sched/task.c` |
 | 13 | `wait4` | 等子进程，支持 WNOHANG | `kernel/sched/task.c` |
@@ -270,6 +277,9 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | 39 | `input_pop` | 统一输入队列出一个 24 字节事件（成功回 1，空回 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/drivers/input_event.c` |
 | 40 | `input_info` | 统一队列计数快照（32 字节，分类型和恒等 `pushed_total`） | `kernel/drivers/input_event.c` |
 | 41 | `input_wait` | 阻塞弹出：空则睡 wait list，事件到达唤醒一个，信号打断 `EINTR`，ms 超时（0=非阻塞、-1=永等），成功 1 / 超时 0；`CAP_SYS_ADMIN` | `kernel/drivers/input_event.c` |
+| 42 | `mmap` | 匿名映射：`addr` 必须 0、top-down 选址 `[MMAP_LO, MMAP_TOP)`、只登记 VMA（需求分页），`prot` 为 `LNXRM_PROT_*` | `kernel/core/syscall.c` + `kernel/mm/vma.c` |
+| 43 | `munmap` | 摘除 `[addr, ALIGN_UP(len))`：VMA 挖洞拆分、逐页 unmap、空页表回收；零相交/未对齐 `EINVAL` | `kernel/core/syscall.c` + `kernel/mm/vma.c` |
+| 44 | `mprotect` | 把 `[addr, ALIGN_UP(len))` 改成 `prot`，**任意用户范围**（不只 mmap 段）：在场页立即翻 W/NX，未触碰的改 VMA 交给需求分页；范围里有洞 `ENOMEM`、未对齐/零长/出用户空间 `EINVAL`；授予 W 不分配（共享帧标 `PG_COW` 推迟复制） | `kernel/core/syscall.c` + `kernel/mm/vma.c` |
 
 图形 6 个（23–27 + 32）。统一输入队列（39/40/41）把两个生产者的**已解码结果**合成一条流：`KEY` 只出自 IRQ1 扫描码解码（`kbd_inject(35)` 是合成终端输入，**不进队列**），`REL/BTN/WHEEL` 出自 aux 包尾——34–38 的环、语义、门原样保留（叠加，不改道）。
 
@@ -294,7 +304,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | `lnxrm_timespec / utsname / ps_entry / dirent` | 16 / 320 / 48（含 `kind/uid/mem_kib/peak_kib`）/ 72 字节 |
 | `lnxrm_fb_info / fb_rect / fb_char / fb_str` | 16 / 20 / 20 / 24 字节，`_Static_assert` 锁布局 |
 
-⚠️ **ABI 结构体一改，引用它的用户态程序必须全量重编**（否则按旧步长读错位字段）。用户态入口是 `ulib.h` 的 `int 0x80` 内联包装（第三参数手动搬 `r10`，clobber 必含 `r10`），42 个全覆盖；`crt0.S` 从栈取 argc/argv 调 `main`。
+⚠️ **ABI 结构体一改，引用它的用户态程序必须全量重编**（否则按旧步长读错位字段）。用户态入口是 `ulib.h` 的 `int 0x80` 内联包装（第三参数手动搬 `r10`，clobber 必含 `r10`），45 个全覆盖；`crt0.S` 从栈取 argc/argv 调 `main`。
 
 ## 6. 文件系统
 
@@ -532,20 +542,20 @@ smp_init():
 
 ### 9.1 内核自测（`ktest/`）
 
-框架与用例分离：`ktest/ktest.c` + **26 个 `t_*.c`**；`KTEST(suite, stage, fn)` 注册进 `.ktest` 段，按 `EARLY/MM/LATE` 三阶段在 `start_kernel` 里跑。编译开关 `KTEST=1`；`make smoke` 强制 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
+框架与用例分离：`ktest/ktest.c` + **27 个 `t_*.c`**；`KTEST(suite, stage, fn)` 注册进 `.ktest` 段，按 `EARLY/MM/LATE` 三阶段在 `start_kernel` 里跑。编译开关 `KTEST=1`；`make smoke` 强制 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
 
-当前判据（2026-11-05 实机 boot 日志，加用例先改这里）：
+当前判据（2026-11-07 q35 boot 日志，加用例先改这里）：
 
 | 阶段 | cases | checks | failed |
 |---|---|---|---|
-| early | 25 | 398 | 0 |
+| early | 25 | 404 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 85 | 3219 | 0 |
-| 合计 | 127 | 4054 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 95 | 3467 | 0 |
+| 合计 | 137 | 4308 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (127 cases, 4054 checks) [2 skipped]` 与 `[selftest] 4054/4054 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**（`WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 任何模式都停机）。`MACHINE=pc` 下为 `127 cases, 4032 checks [3 skipped]`（`ahci` 整例 skip + early 少 21 checks，均为机器差异，0 failed 同判据）。
+汇总行 `[ktest] selftest PASS (137 cases, 4308 checks) [2 skipped]` 与 `[selftest] 4308/4308 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**（`WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 任何模式都停机）。`MACHINE=pc` 下同判据 0 failed（`ahci` 整例 skip + early 少 21 checks，均为机器差异，未在此钉具体数字）。
 
-31 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mouse oom pmm prop syscall task usercopy vfs vmm`，覆盖 ABI 布局与编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、系统调用指针门、信号与任务、VFS/FAT32（含多盘挂载分流）、块注册表（分区与满槽）、AHCI 中断路由与首命令中断完成（无 AHCI 设备即 skip）、键盘/鼠标/统一输入队列。
+32 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mmap mouse oom pmm prop syscall task usercopy vfs vmm`，覆盖 ABI 布局与编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、系统调用指针门、信号与任务、VFS/FAT32（含多盘挂载分流）、块注册表（分区与满槽）、AHCI 中断路由与首命令中断完成（无 AHCI 设备即 skip）、键盘/鼠标/统一输入队列、mmap 分发与需求分页/COW fork/`mprotect` 授受与共享帧、栈守护与 RSP 邻近、#PF 错误码逐位判别、拷贝门补页（`t_mmap.c` 十例）。
 
 ### 9.2 端到端冒烟（`scripts/smoke_test.py`，`make smoke`）
 
@@ -575,7 +585,14 @@ smp_init():
 - `0x6F00` 哨兵必须按 **DWORD** 读（两个写入者都只写低 4 字节）。
 - `arch/kernel.ld` / `arch/entry64.S` / `kernel/mm/vmm.c` 三处页表与段布局硬编码手工同步。
 - 新地址空间只复制**除槽 255 外**的 PML4 条目；槽 0/511 永远共享。
-- 释放已映射的用户帧必须**先 `vmm_unmap_user` 再 `pmm_free`**，否则同一帧还两次。
+- 释放已映射的用户帧必须**先 `vmm_unmap_user` 再 `pmm_free`**，否则同一帧还两次；COW 共享帧同理——`pmm_free` 只减 `frame_ref`，归零才回 buddy（order-0 计数，`ref==0` 照旧放行）。
+- `PG_COW` 只与 `PG_W` 清除**成对**出现（`dup_user_aspace` 与 `page_cow_break` 是唯二写点）；`!W !COW` 的写保护是真 rodata 必须落 SIGSEGV，`!W + COW` 才可破；`vmm_map_user` 的 widen 永不给 `PG_COW` 页回写 `PG_W`。
+- COW 破环顺序恒为**先复制 → 再换 PTE → 最后 `pmm_free` 旧帧**：本方引用在复制完成前钉住旧帧内容，计数归零必然晚于所有复制者。
+- mmap 窗恒为 `[MMAP_LO, MMAP_TOP)`，`MMAP_TOP` = 栈增长地板 − `STACK_GUARD`，`brk` 上限 = `MMAP_LO`；**守护区 `[MMAP_TOP, 栈地板)` 永不映射**（无 VMA、`demand_page` 拒、`mprotect` 对它回 `ENOMEM`、`munmap` 零相交回 `EINVAL`），`STACK_GROW_WINDOW == STACK_GUARD` 由静态断言钉死：堆、mmap、守护、栈四段两两不相交。
+- `PG_W ⇒ pmm_refcount == 1`：授予写只给独占帧，共享者一律标 `PG_COW` 推迟到写故障复制；**撤销写必须连 `PG_COW` 一起清**，留着它会让下一次 COW 缺页把只读悄悄改回可写。
+- 用户 #PF 的 `err` 位**逐位认**：`cow_fault` 只认写位（bit1）、`stack_grow` 拒取指位（bit4）——否则 NX 取指会被当成"COW 已破环"，回报已修复却不改任何东西，`iretq` 重试同一指令 → 无限故障循环；`demand_page` 先按 VMA prot 拒掉越权的写/取指，**再**取帧（先问权限，再动分页器）。
+- 拷贝门遇到 not-present 页**先走缺页修复再判**（`user_page_in`），修不好才拒——内核地址、非规范地址、窗口里的洞、只读页底下的写仍然一律拒；别把「lazy」当成「unmapped」，也别把「unmapped」当成「lazy」。
+- `user_ptr_writable` 是 COW 解析的**唯一门**（内核写用户内存前先 `page_cow_break`）；调用点不得各自绕过它去直写用户页。
 - buddy 最大块 4 MiB（`MAX_ORDER 11`）；`kmalloc` 超 4096 字节走 buddy，OOM 返回 `NULL`，调用方必须检查。
 - 内存配额唯一来源是 `cred_mem_quota()`，`struct task` 不存配额字段；页数真相是 `vmm_count_user_pages()` 的页表行走，记账与 `ps` 都用它。
 - 改 `struct task` 必须**全量重编**（`struct cpu_info` 内嵌按值的 `runq_head`，其内部偏移跟着变，按旧偏移读写运行队列就是 #GP）。
