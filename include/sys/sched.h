@@ -1,7 +1,6 @@
 /* Scheduler and task definitions (includes POSIX-like signal support). */
 #pragma once
 #include <types.h>
-#include <sys/spinlock.h>
 #include <sys/cred.h>
 #include <mm/vma.h>
 
@@ -18,7 +17,7 @@ extern "C" {
  * types.h (included below) pulls that header in. */
 #define _NSIG LNXRM_NR_SIGNALS
 
-LNXRM_STATIC_ASSERT(SIGKILL == 9 && SIGSTOP == 19 && SIGCONT == 18,
+LNXRM_STATIC_ASSERT(SIGKILL == 7 && SIGSTOP == 13 && SIGCONT == 12,
                     "signal numbering must match the ABI header");
 
 /* ---- interrupt frame & task context ---- */
@@ -143,6 +142,10 @@ extern struct task *current;
 #endif
 
 #define KSTACK_SIZE 32768
+
+/* Which live task owns address-space root `pml4` (NULL = none).  #PF
+ * diagnostics only -- see sched.c. */
+struct task *task_find_by_pml4(u64 pml4);
 
 int sys_fork(void);
 long sys_execve(const char *path, char *const argv[], char *const envp[]);

@@ -511,15 +511,7 @@ done_check:
     rc = free_dirent_record(m, &loc);
     if (rc) return rc;
 
-    struct fat_chain chf;
-    fat_chain_start(&chf, m, dir_clus);
-    while (fat_chain_more(&chf)) {
-        u32 clus = chf.clus;
-        fat_chain_advance(&chf); /* next cluster must be read before this one is freed */
-        if (fat_set_entry(m, clus, 0))
-            return LNXRM_EIO; /* already reported; clusters leak, none cross-link */
-    }
-    return 0;
+    return fat_free_chain(m, dir_clus);
 }
 
 int fat_unlink_impl(void *mnt, const char *path)
@@ -546,15 +538,7 @@ int fat_unlink_impl(void *mnt, const char *path)
     if (rc) return rc; /* entry (partly) there, chain untouched */
 
     u32 first = ((u32)r.de.fstclushi << 16) | r.de.fstcluslo;
-    struct fat_chain chf;
-    fat_chain_start(&chf, m, first);
-    while (fat_chain_more(&chf)) {
-        u32 clus = chf.clus;
-        fat_chain_advance(&chf); /* next cluster must be read before this one is freed */
-        if (fat_set_entry(m, clus, 0))
-            return LNXRM_EIO; /* already reported; clusters leak, none cross-link */
-    }
-    return 0;
+    return fat_free_chain(m, first);
 }
 
 /* ---------------- rename / move ---------------- */

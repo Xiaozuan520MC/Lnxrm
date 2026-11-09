@@ -50,7 +50,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 |---|---|---|
 | `MAX_CPUS` / `NR_TASKS` / `NR_FDS` | 8 / 64 / 16 | `include/types.h` |
 | `KSTACK_SIZE` | 32768 | `include/sys/sched.h` |
-| `LNXRM_NR_SIGNALS` | 32 | `include/abi/lnxrm_abi.h` |
+| `LNXRM_NR_SIGNALS` | 14（编号 1..13） | `include/abi/lnxrm_abi.h` |
 | `LNXRM_SYSCALL_LAST` | 44（编号 0–44 共 45 个） | `include/abi/lnxrm_abi.h` |
 | `CACHE_ENTRIES` | 64 | `include/disk.h` |
 | `MAX_MOUNTS` | 4 | `kernel/fs/vfs.c` |
@@ -186,7 +186,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 ### 4.2 fork / execve / exit
 
 - `sys_fork`：槽 + 内核栈 + pid → 新 PML4 → `dup_user_aspace`（**COW 共享**，见 3.5）→ `vma_dup` 深拷 mmap 列表（失败与页表 dup 同款回滚）→ 克隆 fd 表（逐个 `refcnt++`）→ 复制 brk/`ustack_lo` → 伪造子进程 `intr_frame`（rax=0、开 IF）→ frame 下方构造 `cpu_ctx` 以 `glue_first` 为入口 → 入队。
-- `sys_execve`：`copy_user_str` 取路径（128 字节上限，argv ≤16×64）→ 读整个文件 → 新 PML4 + 16 KiB 栈 → **先 `vmm_switch_to(new)` 再 `elf_load`**（装载器 `memcpy` 直写用户地址）→ 失败切回旧并回滚 → 成功**先**赋 `current->pml4` **再**销毁旧地址空间、`vma_free_all`（新镜像零 mmap；失败回滚路径在赋值之前返回，调用方列表原样保留）→ 关 `O_CLOEXEC`、清 `signal_pending` → 按 SysV ABI 摆 `argc/argv/envp/auxv`。
+- `sys_execve`：`copy_user_str` 取路径（128 字节上限，argv ≤16×64）→ 读整个文件 → 新 PML4 + 16 KiB 栈 → **先 `vmm_switch_to(new)` 再 `elf_load`**（装载器 `memcpy` 直写用户地址）→ 失败切回旧并回滚 → 成功**先**赋 `current->pml4` **再**销毁旧地址空间、`vma_free_all`（新镜像零 mmap；失败回滚路径在赋值之前返回，调用方列表原样保留）→ 关 `O_CLOEXEC`、清 `signal_pending` → 按 SysV ABI 摆 `argc/argv/envp/auxv`。**分段**：`struct exec_args` + `exec_copy_args`/`exec_read_image`/`exec_commit`/`exec_build_stack`，`sys_execve`（49 行）只做编排与失败回滚。
 - `sys_exit`：关所有 fd → 撤控制台等待者 → **`fb_disown(current->pid)`（画屏归属唯一释放点，所有死法都经过）** → 孤儿重挂 pid 1（垂死 init 不领养自己、僵尸也不领养 → `(0,0)`）→ 给父 `SIGCHLD` → `T_ZOMBIE` → 出队 → 唤醒父 → `schedule()`。
 - `kernel_spawn`：第一个用户进程，类 execve 但简化，结尾**切回 master PML4**（跑在内核上下文）。
 - `elf.c` 只接受静态 `ET_EXEC`，`e_entry ∈ [USER_BASE, USER_MAX_VMA)`，返回 `brk_end`；不支持动态链接/共享库/需求分页。
@@ -205,7 +205,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 
 ### 4.4 信号（`kernel/sched/signal.c`）
 
-- 32 槽；`SIGKILL 9`/`SIGSTOP 19` 不可屏蔽不可忽略，`SIGCONT 18` 额外唤醒 `T_STOPPED`；默认终止集只有 6 个（`INT TERM QUIT ILL ABRT SEGV`），其余默认忽略。
+- 14 槽（`_NSIG` = 14，编号 1..13 连续无空洞，索引 0 空置）；`SIGKILL 7`/`SIGSTOP 13` 不可屏蔽不可忽略，`SIGCONT 12` 额外唤醒 `T_STOPPED`；默认终止集只有 6 个（`INT TERM QUIT ILL ABRT SEGV`），其余默认忽略。2026-11-07 起编号从 Linux 的 1..28 压实而来（删掉 15 个无人引用的号），此后只准追加。
 - per-task：`sig_handlers[32]`（`SIG_DFL`=0、`SIG_IGN`=1、否则 handler 地址）、`sig_masks[32]`、`sig_blocked`、`signal_pending`、`sig_in_handler`、`saved_tf`、`sig_saved_blocked`、`sig_fault_rip`。
 - `send_signal`：入口守卫（范围 + `T_UNUSED` 直接返回，槽可能已被 waitpid 释放/复用）→ KILL/STOP 硬置位并唤醒 → 其余置位，目标在睡就转 RUNNABLE 入队。
 - `do_signal_check`：三个调用点都在 `iretq` **之前**且带 ring-3 守卫（syscall 返回、IRQ 返回、异常路径）；一次只投一帧，handler 运行期间的第二信号保持 pending。
@@ -230,9 +230,10 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 ### 5.1 调用约定与分发
 
 - 向量 `int 0x80`，编号 `rax`，参数 `rdi/rsi/r10`，返回 `rax`；IDT 128 号门 DPL=3。
-- 入口桩 `isr128` 压出帧 → `call syscall_entry` → `syscall_do`（**分发表就是一个大 `switch`**）→ 写回 `rax` → 置 IF → 返回前 `do_signal_check()`。
+- 入口桩 `isr128` 压出帧 → `call syscall_entry` → `syscall_do`（**一张 `sysents[]` 表**：`{入口, 门, 门名}` 一行一个调用，分发器只做「查表 → 过门 → 一次间接调用」）→ 写回 `rax` → 置 IF → 返回前 `do_signal_check()`。
 - **只追加不重排**：唯一定义源 `include/abi/lnxrm_syscalls.def`（X-macro）——编号紧凑连续、新调用追加末尾并把 `LNXRM_SYSCALL_LAST` 加一、永不重排已有编号；`lnxrm_abi.h` 逐编号编译期校验（忘改宏直接编译失败）。
-- 未知编号落 `default`，打 `[sys] unknown syscall …` 回 `-38`。
+- 门也是表里的数据（`GATE_ADMIN` 7 个 / `GATE_FB` 5 个），**门与入口同一行**：新增一个受限调用不可能只加调用忘了加门。参数拆包在 `h_*` 包装里（帧字段 → C 类型），与旧行为逐条等价。
+- 未知编号（`nr > LNXRM_SYSCALL_LAST` 或该行 `fn == NULL`）打 `[sys] unknown syscall …` 回 `-38`，且**不先过门**——没实现的调用不该先问它从没资格拿的能力。
 
 ### 5.2 45 项总表（编号 0–44，连续无空洞）
 
@@ -343,7 +344,7 @@ kernel/fs/
 |---|---|
 | `blk_io_read/write` | 驱动的非 0 原样上抛；注入故障回 `EIO`。**全内核只有这里调 `dev->read/write`** |
 | `fat_read/write_sector` | **只有 0 或 `LNXRM_EIO`**，不透传驱动私有码 |
-| `fat_scan_dir` / `fat_resolve_path` / `fat_dir_iter` | 三态 `1 / 0 / 负`：「读不到」与「没找到」「扫到末尾」不共用一个值 |
+| `fat_scan_dir` / `fat_resolve_path` / `fat_dir_iter` | 三态 `1 / 0 / 负`：「读不到」与「没找到」「扫到末尾」不共用一个值。`fat_scan_dir_at` 内部分段：`struct dir_scan` + `lfn_record`（LFN 状态机）+ `fat_entry_name` + `dir_scan_cluster`（返回 `DIR_SCAN_MORE/STOP/END`，`END` 由外层 `break` 且 `rc=0`，对应原 `goto done`） |
 | 语义层 `fat_*_impl` / VFS | 负数一路向上传，`EIO` 不被改写成 `ENOENT`/`EACCES`/`0` |
 
 对外表现：限流 16 条的 `[fat32] I/O error <op> LBA <n>`，操作回 `LNXRM_EIO = -5`。
@@ -371,7 +372,7 @@ kernel/fs/
 
 ### 6.6 FAT32 与 on-disk redo journal
 
-**挂载**（`fat_mount_impl`）：读扇区 0 → 校验 BPB（55AA @[510]、`"FAT32"` @[82]、簇因子 2 的幂；`bytes_per_sector == 512` —— 全部扇区缓冲与块缓存按 512 搬移，≠512 直接拒；spc/fatsz/reserved 非零、`num_fats ∈ {1,2}`、`root_cluster >= 2`）→ 算 `data_start_lba`/`max_cluster` → **FAT 分帧读进内存**（表项数 > 2^28 直接 `reject`；`max_cluster` 是独占上限，最后 FAT 格可达）→ `fat_journal_mount` 回放。
+**挂载**（`fat_mount`）：读扇区 0 → 校验 BPB（55AA @[510]、`"FAT32"` @[82]、簇因子 2 的幂；`bytes_per_sector == 512` —— 全部扇区缓冲与块缓存按 512 搬移，≠512 直接拒；spc/fatsz/reserved 非零、`num_fats ∈ {1,2}`、`root_cluster >= 2`）→ 算 `data_start_lba`/`max_cluster` → **FAT 分帧读进内存**（表项数 > 2^28 直接 `reject`；`max_cluster` 是独占上限，最后 FAT 格可达）→ `fat_journal_mount` 回放。分阶段函数 `fat_bpb_ok`/`fat_layout`/`fat_fat_alloc`/`fat_fat_read`，**九处拒绝统一走 `fat_reject()`**（`fat_pages_free` + `kfree`）。
 
 **目录槽模型**：可用槽 = 从未用过的尾槽（0x00，终止符本身）与已删除记录（0xE5）；其余首字节都是活记录——**包括 0x05**（规范里 8.3 别名对 0xE5 的转义，而 LFN 第五片首字节恰是序号 5）。写端两处认领（`parent_entry_add()` / `dir_claim_run()`）共享同一判定；槽不够先 `dir_chain_extend()` 扩链（分配簇→尾链→整簇清零，失败自回滚）再落位——**目录永不再因满而 ENOSPC**；目录链最后一个槽从不可认领（终止符必须活过每次落位）。**扫描端止于 0x00**，尾槽之后的残留字节浮不出伪记录；坏簇/自环被步数预算或自环即断拦下。
 
@@ -432,7 +433,7 @@ kernel/fs/
 | 驱动 | 要点 |
 |---|---|
 | `ide.c` | 硬编码主通道 `0x1F0`、主设备、PIO、单命令 ≤256 扇区。选盘 → 4 次状态读当 400 ns → `s==0x00\|\|0xFF` 判无设备 → 等 DRDY → `0xEC` → `ide_wait_drq()`（**ERR 判定点**）→ IDENTIFY → `ata_total_sectors()` 取容量，0 则不注册。**LBA48**：`ide_issue(lba,n,cmd)` 按最后一个扇区选 `0x20/0x30`（LBA28）或 `0x24/0x34`（EXT），`last > 0xFFFFFFFFFFFF` 直接拒，首次走 EXT 打 `[ide] LBA48:`；**写完发 `0xE7` CACHE FLUSH 并由 `ide_wait_flush()` 判 BSY/ERR/DRDY**，失败打 `[ide] FLUSH CACHE (E7) failed` 回 `EFAIL`（与 AHCI 一致；`ide_wait_ready` 仍不判 ERR，是既有决定：发命令前判错会把上一条的 ERR 变成死等）。`ide_lock` 包住整个循环。轮询预算两档：探测 `IDE_PROBE_ITERS`、读写 `IDE_POLL_ITERS`（QEMU 在 vCPU 线程里同步落宿主文件，宿主回写压力下 BSY 可持数十毫秒，旧 10 万次预算会把正常命令饿成 EIO） |
-| `ahci.c` | `ahci_init → pci_scan → ahciProbe`（class 过滤）→ 映射 ABAR → HBA 复位 → `ahciProbePort` → `blk_register`（多盘：`sd_names[8]` 按注册序命名）。**中断驱动**：`GHC_IE` 使能 + 每端口 `PxIM` arm INTA → `ahciRouteIrq()` 把端口中断经 IOAPIC 接到 vector 32+line 并 unmask；`issueCmd` 下发顺序 = 清 `PxIS` → **开中断** → 写 `P_CI` → 完成经 `ahciIsr()`（排空 IS、`irq_done` 回执）→ 轮询 `P_CI` 只作超时兜底（超时 dump TFD/IS/SERR 后判失败）；探测期与超时路径用 `ahciPortReclaim()` 回收 CLB/FIS/CT，停不下来则保留内存。下发 `buildH2dFis`：**先查 `IS_TFES` 再查 `PxTFD.ERR`**（完成 ≠ 成功），超时用 TSC 折算。单 PRD，缓冲必须物理连续的 512 字节。自测 `ahci_irq_selftest()`（无 AHCI 设备回 -1 即 ktest skip） |
+| `ahci.c` | `ahci_init → pci_scan → ahciProbe`（class 过滤）→ 映射 ABAR → HBA 复位 → `ahciProbePort` → `blk_register`（多盘：`sd_names[8]` 按注册序命名）。**中断驱动**：`GHC_IE` 使能 + 每端口 `PxIM` arm INTA → `ahciRouteIrq()` 把端口中断经 IOAPIC 接到 vector 32+line 并 unmask；`issueCmd` 下发顺序 = 清 `PxIS` → **开中断** → 写 `P_CI` → 完成经 `ahciIsr()`（排空 IS、`irq_done` 回执）→ 轮询 `P_CI` 只作超时兜底（超时 dump TFD/IS/SERR 后判失败）；探测期与超时路径用 `ahciPortReclaim()` 回收 CLB/FIS/CT，停不下来则保留内存。下发 `buildH2dFis`：**先查 `IS_TFES` 再查 `PxTFD.ERR`**（完成 ≠ 成功），超时用 TSC 折算。单 PRD，缓冲必须物理连续的 512 字节。自测 `ahci_irq_selftest()`（无 AHCI 设备回 -1 即 ktest skip）；**probe 分段**（原 `ahciProbe` 334 行 / 9 条「port skipped」清理梯子 → 48 行）：`ahciPortBringup` 顺序调 `ahciWaitLink`→`ahciPortAlloc`→`ahciPortProgram`→`ahciPortIdentify`→`ahciPortPublish`，资源记在 `struct ahci_port_res`、**单出口 `ahciPortRelease()`** 兜全部失败路径（`keep` 置位后才免回收） |
 | `pci.c` | 传统 `0xCF8/0xCFC` 配置窗口，`pci_scan` 递归（visited + 深度上限），支持多功能设备 |
 
 ⚠️ **`make run` 默认 `MACHINE=q35`，AHCI 是主路径**（`sda`）；`MACHINE=pc` 是 IDE/hda，无 SATA 控制器，`ahciProbe` 的 class 过滤对所有设备提前返回，AHCI 路径零执行、`ktest/t_ahci.c` 自动 skip；`mbr.c` 是第二步 fallback，整盘 FAT 总能先成功。`smoke` 固定 pc + TCG + `-m 256`。
@@ -532,7 +533,7 @@ smp_init():
 ### 8.5 中断与异常
 
 - `entry64.S` 的 `ISR_NOERR`/`ISR_ERR` 压出统一 `struct intr_frame`（`r15…rax rbx` 然后 `intno err rip cs rflags ussp usss`；`rbx` 刻意排 `rax` 之后——SysV callee-saved）。
-- `isr_common` 三段分流：`0xF0..0xF2` → `ipi_dispatch` → `apic_eoi`；`< 32` → 异常（ring-3 转信号，ring-0 panic）；`≥ 32` → **先 `apic_eoi` 再调 handler**（handler 可能 `schedule()` 切走，延迟 EOI 会卡住该向量）；返回用户态前 `do_signal_check()`。
+- `isr_common` 三段分流：`0xF0..0xF2` → `ipi_dispatch` → `apic_eoi`；`< 32` → 异常（ring-3 转信号，ring-0 panic）；`≥ 32` → **先 `apic_eoi` 再调 handler**（handler 可能 `schedule()` 切走，延迟 EOI 会卡住该向量）；返回用户态前 `do_signal_check()`。**分段**（`isr_common` 仅 32 行/嵌套 3，原 264 行/嵌套 6）：`handle_ipi`、`exception_report`/`fault_to_signal`/`kernel_context_dump`、`pf_walk`+`pf_error_print`+`pf_tables_dump`（#PF）、`irq_path`；输出格式串序列与重构前逐字一致。
 - `idt_init`：0–47 → `isr_stub_table`；128 → `isr128`（DPL=3）；**49–255 全指向 catch-all**，IPI 向量必须显式覆盖否则重调度 IPI 被当 #XM。
 - #PF 错误码逐位解码，用 `rflags.AC` 区分 WP 违例与 SMAP 违例（错误码相同）；ring-0 入口无条件清 `AC`。
 - 向量：32 = LAPIC timer，33 = 键盘，36 = COM1，`0xF0` reschedule、`0xF2` stop，spurious IRQ7/15 有专门分支。
@@ -562,7 +563,7 @@ smp_init():
 六阶段全过才退出 0：`toolchain` → `build` → `artifacts` → `boot`（无头 QEMU，**21 条有序 marker**）→ `shell`（串口驱动 `/bin/sh`：ls、cat、systest）→ `forged FAT`（篡改簇链的镜像，要求驱动**报告**且不跟随）。
 
 - 有序 marker 按游标顺序匹配；`--smp N` 只替换两条 SMP 相关 marker，另加一条负向断言（`-smp 1` 时不得出现 AP marker）。
-- 用户态判据 `SYSTEST_TAGS` **106 条**正则（`uname.ret=0`、`unknown.99=-38`、`kill.init.term=-13`、`input.pop.empty=-11`…）外加 `systest.done=1`；键盘/鼠标自检在 systest 进程内完成。
+- 用户态判据 `SYSTEST_TAGS` **120 条**正则（`uname.ret=0`、`unknown.99=-38`、`kill.init.term=-13`、`input.pop.empty=-11`、`mmap.hole=-12`…，含 `systest.done=1`）；键盘/鼠标自检在 systest 进程内完成。**信号与 ABI 常量的号码从 `lnxrm_abi.h` 现读**（`abi_define()`，含 `LNXRM_SYSCALL_LAST`；`past.42/past.43` 据此现算为 `SYSCALL_LAST+1..+3`），不写死。判据一律 `br""` 字节串正则（region 是 `bytes`），列表后有启动期 `_str_tags` 断言防混入 `str`。
 - LATE 阶段另搜 6 条报告行（块缓存 LRU、写后读一致、FAT 区不缓存、journal 先写日志+重放），因为 `.ktest` 段内先后是编译器的事。
 - 负面判据：日志不得出现 `WARN(`、`2097151`、`4294967295`、`[PANIC]`。
 - 当前 `make smoke` **205/205**；transcript 写 `build/smoke/serial.log`（非默认 smp 档写 `serial-smpN.log`）。日志里的 `[fat32] I/O error` 是错误注入用例**故意**打的，不是回归。
@@ -570,6 +571,8 @@ smp_init():
 ### 9.3 用户态自检（`userland/systest.c`）
 
 按系统调用编号分节的全量自检：错误码路径、信号与等待（含 WNOHANG）、`fb_*` 图形、故意段错误隔离、降权子进程段（`setuid(1000)` 后逐个撞权限检查点）、超长路径段、内存记账与配额段、画屏归属段（三层 fork：抢屏 → 撞墙 → 持有者退出）、键盘段（空环快照 + `EAGAIN` + 注入 `kbd0` 读回 + 降权拒绝）、鼠标段（空环快照 + 只读探针 + 降权拒绝，真实指针在环里时打 `mouse.skip`）、统一队列段（`capacity=63`/`sane`/`sum` 恒等 + 空队 `EAGAIN` + 降权拒绝），末尾打 `systest.done=1`。由 smoke 的 `shell` 阶段在串口上驱动。
+
+**结构**：每一段是一个 `static void t_*(void)`（36 个，段注释原地变成函数头上的文档），`main` 只剩 47 行——`env` 子进程早退、按原顺序的 36 次调用、`systest.done=1`、末尾色卡。**输出一字不变**（新增的 `t_mmap_surface` 是追加，原有段落未动），120 条 `SYSTEST_TAGS` 判据不涉及。
 
 ## 10. 关键不变式
 

@@ -215,20 +215,24 @@ static struct blkdev ide_bd = {
  * CPUs can't interleave and make task A's command use task B's LBA. */
 static spinlock_t ide_lock = SPINLOCK_INIT;
 
-static int ide_blk_read(struct blkdev *b, u64 lba, u32 count, void *buf)
+/* Shared body of ide_blk_read / ide_blk_write: bounds-check the request as
+ * a whole (a request past the end of the device fails rather than reading
+ * what it can), then walk it IDE_MAX_CHUNK at a time under ide_lock.  `write`
+ * selects the direction routine; the const the write path asks for is
+ * dropped here and never written through. */
+static int ide_blk_xfer(struct blkdev *b, u64 lba, u32 count, void *buf, bool write)
 {
     u8 *p = buf;
     u64 flags;
     spin_lock_irqsave(&ide_lock, &flags);
-    /* Same bound the old per-sector loop enforced: a request reaching past the
-     * end of the device fails as a whole rather than reading what it can. */
     if (count && lba + count > b->num_sectors) {
         spin_unlock_irqrestore(&ide_lock, flags);
         return LNXRM_EFAIL;
     }
     while (count) {
         u32 n = count > IDE_MAX_CHUNK ? IDE_MAX_CHUNK : count;
-        if (ide_read_sectors(lba, n, p)) {
+        int rc = write ? ide_write_sectors(lba, n, p) : ide_read_sectors(lba, n, p);
+        if (rc) {
             spin_unlock_irqrestore(&ide_lock, flags);
             return LNXRM_EFAIL;
         }
@@ -240,27 +244,14 @@ static int ide_blk_read(struct blkdev *b, u64 lba, u32 count, void *buf)
     return 0;
 }
 
+static int ide_blk_read(struct blkdev *b, u64 lba, u32 count, void *buf)
+{
+    return ide_blk_xfer(b, lba, count, buf, false);
+}
+
 static int ide_blk_write(struct blkdev *b, u64 lba, u32 count, const void *buf)
 {
-    const u8 *p = buf;
-    u64 flags;
-    spin_lock_irqsave(&ide_lock, &flags);
-    if (count && lba + count > b->num_sectors) {
-        spin_unlock_irqrestore(&ide_lock, flags);
-        return LNXRM_EFAIL;
-    }
-    while (count) {
-        u32 n = count > IDE_MAX_CHUNK ? IDE_MAX_CHUNK : count;
-        if (ide_write_sectors(lba, n, p)) {
-            spin_unlock_irqrestore(&ide_lock, flags);
-            return LNXRM_EFAIL;
-        }
-        lba += n;
-        p += n * 512;
-        count -= n;
-    }
-    spin_unlock_irqrestore(&ide_lock, flags);
-    return 0;
+    return ide_blk_xfer(b, lba, count, (void *)buf, true);
 }
 
 void ide_init(void)
@@ -305,11 +296,7 @@ void ide_init(void)
     /* capacity: words 60-61, with the 48-bit words 100-103 taking precedence */
     u64 sectors = ata_total_sectors(ident);
     char model[41];
-    for (int i = 0; i < 20; i++) {
-        model[i * 2] = (char)(ident[27 + i] >> 8);
-        model[i * 2 + 1] = (char)(ident[27 + i] & 0xFF);
-    }
-    model[40] = 0;
+    ata_model_string(ident, model);
 
     if (!sectors) {
         /* Registering a device whose size we could not read would hand every

@@ -91,6 +91,22 @@ struct task *get_current(void)
 { return this_cpu_data()->_current; }
 #endif
 
+/* Diagnostic only: which LIVE task, if any, owns address-space root `pml4`.
+ * The #PF report calls this when CR3 != current->pml4: an owner means the
+ * CPU is paging with another task's (still valid) tables, no owner means
+ * the root was destroyed -- execve frees the old pml4 -- and its frame has
+ * been recycled, so the CPU is walking garbage.  Walks the whole table on
+ * purpose: this only runs from the exception path. */
+struct task *task_find_by_pml4(u64 pml4)
+{
+    if (!pml4) return NULL;
+    for (int i = 0; i < NR_TASKS; i++) {
+        struct task *t = &task_table[i];
+        if (t->state != T_UNUSED && t->pml4 == pml4) return t;
+    }
+    return NULL;
+}
+
 static void switch_to(struct task *next);
 
 /* Per-CPU pick_next: find runnable task from this CPU's queue. */
@@ -444,7 +460,21 @@ static void switch_to(struct task *next)
     if (prev) prev->cpu_id = -1;
 
     tss_set_rsp0((u64)next->kstack_top);
-    if (prev != next && prev && prev->pml4 != next->pml4) vmm_switch_to(next->pml4);
+    /* Load the next address space by comparing against the LIVE CR3, never
+     * against prev->pml4.  "CR3 == current->pml4" is an invariant this
+     * kernel cannot actually guarantee -- sys_execve() loads the new root
+     * before it publishes current->pml4 -- and the old comparison assumed
+     * it, so once it broke nothing ever repaired it: the desync survived
+     * every later switch between tasks whose pml4 happened to compare
+     * equal, and the task then ran ring-3 code against somebody else's
+     * page tables (#PF on an instruction fetch, while the report walked
+     * current->pml4 and cheerfully printed "present").  Reading CR3 costs
+     * one instruction and makes every switch self-healing. */
+    if (prev != next) {
+        u64 cr3_now;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_now));
+        if (cr3_now != next->pml4) vmm_switch_to(next->pml4);
+    }
 
     this_cpu_data()->_current = next;
     swtch((u64 *)&prev->ctx, &next->ctx.sp);

@@ -326,6 +326,12 @@ struct fat_chain {
 void fat_chain_start(struct fat_chain *ch, struct fat_mount *m, u32 first);
 bool fat_chain_more(struct fat_chain *ch);
 void fat_chain_advance(struct fat_chain *ch);
+/* Free every cluster of the chain starting at `first`, one entry at a time.
+ * Returns 0 or LNXRM_EIO (already reported): an entry that cannot be cleared
+ * leaks its cluster, and the walk stops right there so two files can never
+ * end up sharing it.  Read-then-free ordering is the caller's contract with
+ * itself -- the next cluster has to be known before this one goes. */
+int fat_free_chain(struct fat_mount *m, u32 first);
 
 static inline u64 cluster_lba(struct fat_mount *m, u32 clus)
 { return m->data_start_lba + (u64)(clus - 2) * m->sectors_per_cluster; }

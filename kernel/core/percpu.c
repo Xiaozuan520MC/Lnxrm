@@ -1,7 +1,6 @@
 /* Per-CPU data management and GS segment setup. */
 #include <sys/percpu.h>
 #include <sys/cpu.h>
-#include <mm/mm.h>
 #include <console.h>
 
 struct cpu_info cpu_table[MAX_CPUS] __attribute__((aligned(CPU_DATA_SIZE)));

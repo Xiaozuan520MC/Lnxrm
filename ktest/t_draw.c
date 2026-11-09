@@ -9,7 +9,6 @@
  * the far corner), and everything written on purpose is restored from a
  * raw snapshot so the console underneath stays readable. */
 #include <sys/ktest.h>
-#include <console.h>
 #include <framebuffer.h>
 
 struct corners {

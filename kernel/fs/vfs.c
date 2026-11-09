@@ -4,7 +4,6 @@
 #include <console.h>
 #include <mm/mm.h>
 #include <sys/sched.h>
-#include <io.h>
 #include <sys/cpu.h>
 #include <disk.h>
 

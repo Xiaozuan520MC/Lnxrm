@@ -2,7 +2,6 @@
 #pragma once
 #include <types.h>
 #include <sys/sched.h>
-#include <sys/spinlock.h>
 
 #ifdef __cplusplus
 extern "C" {

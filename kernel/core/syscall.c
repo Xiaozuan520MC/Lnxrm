@@ -597,191 +597,244 @@ static long path2_syscall(u64 upath, u64 upath2, long (*fn)(const char *, const 
     return fn(path, path2);
 }
 
-/* Read the syscall arguments out of the trap frame and run fn.
- * This is the whole dispatch table: register ABI plumbing lives in
- * syscall_entry(), everything else is a plain C call. */
-static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
-{
-    long ret = LNXRM_ENOSYS;
+/* ================= dispatch =================
+ *
+ * One row per system call: the entry point, the gates that must answer
+ * before it runs, and the name those gates print when they refuse.  The
+ * h_* functions are only the frame-to-C translation each switch case
+ * used to do -- one call wide, no dispatch logic of their own.
+ *
+ * Adding a call: a number in lnxrm_syscalls.def, one wrapper, one row
+ * here.  LNXRM_SYSCALL_LAST is the table's bound, so every number above
+ * it still answers ENOSYS without needing a row of its own. */
+typedef long (*sys_fn)(struct intr_frame *f, u64 a3);
 
-    switch (nr) {
-    case SYS_read:
-        ret = sys_read((int)f->rdi, (void *)f->rsi, a3);
-        break;
-    case SYS_write:
-        ret = sys_write((int)f->rdi, (const void *)f->rsi, a3);
-        break;
-    case SYS_open: {
-        char path[128];
-        ret = copy_user_str(path, f->rdi, sizeof(path)) == 0 ? sys_open(path, (int)f->rsi)
-                                                             : LNXRM_EFAULT;
-        break;
-    }
-    case SYS_close:
-        ret = sys_close((int)f->rdi);
-        break;
-    case SYS_lseek:
-        ret = sys_lseek((int)f->rdi, (long)f->rsi, (int)a3);
-        break;
-    case SYS_brk:
-        ret = sys_brk(f->rdi);
-        break;
-    case SYS_mmap:
-        ret = sys_mmap(f->rdi, f->rsi, a3);
-        break;
-    case SYS_munmap:
-        ret = sys_munmap(f->rdi, f->rsi);
-        break;
-    case SYS_mprotect:
-        ret = sys_mprotect(f->rdi, f->rsi, a3);
-        break;
-    case SYS_getdent:
-        ret = sys_getdent((int)f->rdi, (void *)f->rsi, a3);
-        break;
-    case SYS_dup2:
-        ret = sys_dup2((int)f->rdi, (int)f->rsi);
-        break;
-    case SYS_nanosleep:
-        ret = sys_nanosleep(f->rdi, (struct lnxrm_timespec *)a3);
-        break;
-    case SYS_getpid:
-        ret = current->pid;
-        break;
-    case SYS_fork:
-        ret = sys_fork();
-        break;
-    case SYS_execve:
-        ret = sys_execve((const char *)f->rdi, (char *const *)f->rsi, (char *const *)a3);
-        break;
-    case SYS_exit:
-        sys_exit((int)f->rdi);   /* noreturn: no break needed */
-    case SYS_wait4:
-        ret = sys_waitpid((int)f->rdi, (int *)f->rsi, (int)a3);
-        break;
-    case SYS_kill:
-        ret = sys_kill((int)f->rdi, (int)f->rsi);
-        break;
-    case SYS_uname:
-        ret = sys_uname((struct lnxrm_utsname *)f->rdi);
-        break;
-    case SYS_sigaction:
-        ret = sys_sigaction((int)f->rdi, (const struct lnxrm_sigaction *)f->rsi,
-                            (struct lnxrm_sigaction *)a3);
-        break;
-    case SYS_sigprocmask:
-        ret = sys_sigprocmask((int)f->rdi, (const u64 *)f->rsi, (u64 *)a3);
-        break;
-    case SYS_getppid:
-        /* T-050: the stored pid half of the link; 0 when there is no parent
-         * (init, or an orphan whose parent was reaped before reparenting). */
-        ret = (int32_t)current->parent_pid;
-        break;
-    case SYS_ps:
-        /* T-031: the process table is an enumeration of everyone else's
-         * state -- CAP_SYS_ADMIN (fdisk's twin, diskinfo, is gated the
-         * same way below). */
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "ps")) != 0) break;
-        ret = sys_ps((struct lnxrm_ps_entry *)f->rdi, (int)f->rsi);
-        break;
-    case SYS_sigreturn:
-        ret = sys_sigreturn();
-        break;
-    case SYS_diskinfo:
-        /* T-031: fdisk died with user/fdisk.c, and listing the block
-         * devices was all it ever did -- so its gate is this one. */
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "diskinfo")) != 0) break;
-        ret = blk_list_all((void *)f->rdi, (int)f->rsi);
-        break;
-    case SYS_mkdir:
-        ret = path_syscall(f->rdi, sys_mkdir);
-        break;
-    case SYS_fb_info:
-        ret = sys_fb_info((struct lnxrm_fb_info *)f->rdi);
-        break;
+enum {
+    /* T-031: the process table and the block-device list enumerate
+     * everyone else's state, and so do the raw key/mouse bytes and the
+     * unified event queue -- one CAP_SYS_ADMIN receipt each, printed by
+     * cap_gate naming the row that said no. */
+    GATE_ADMIN = 1u << 0,
     /* T-033: both gates, in this order, on all five surface calls --
      * capability (may you draw at all) then ownership (are you the one
      * on the screen).  fb_flip is the fifth: it publishes rather than
-     * draws, but it touches the surface just as directly.  fb_info above
-     * has neither: it draws nothing. */
-    case SYS_fb_clear:
-        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_clear")) != 0) break;
-        if ((ret = fb_owner_gate("fb_clear")) != 0) break;
-        ret = sys_fb_clear((u32)f->rdi);
-        break;
-    case SYS_fb_fill:
-        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_fill")) != 0) break;
-        if ((ret = fb_owner_gate("fb_fill")) != 0) break;
-        ret = sys_fb_fill((struct lnxrm_fb_rect *)f->rdi);
-        break;
-    case SYS_fb_char:
-        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_char")) != 0) break;
-        if ((ret = fb_owner_gate("fb_char")) != 0) break;
-        ret = sys_fb_char((struct lnxrm_fb_char *)f->rdi);
-        break;
-    case SYS_fb_puts:
-        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_puts")) != 0) break;
-        if ((ret = fb_owner_gate("fb_puts")) != 0) break;
-        ret = sys_fb_puts((struct lnxrm_fb_str *)f->rdi);
-        break;
-    case SYS_fb_flip:
-        if ((ret = cap_gate(CAP_FB, "CAP_FB", "fb_flip")) != 0) break;
-        if ((ret = fb_owner_gate("fb_flip")) != 0) break;
-        ret = sys_fb_flip();
-        break;
-    case SYS_unlink:
-        ret = path_syscall(f->rdi, sys_unlink);
-        break;
-    case SYS_rmdir:
-        ret = path_syscall(f->rdi, sys_rmdir);
-        break;
-    case SYS_rename:
-        ret = path2_syscall(f->rdi, f->rsi, sys_rename);
-        break;
-    case SYS_setuid:
-        ret = sys_setuid((u32)f->rdi);
-        break;
-    case SYS_sync:
-        ret = sys_sync(); /* C27: flush staged bytes to every device */
-        break;
-    case SYS_kbd_get:
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "kbd_get")) != 0) break;
-        ret = kbd_get_byte();
-        break;
-    case SYS_kbd_inject:
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "kbd_inject")) != 0) break;
-        ret = sys_kbd_inject((const char *)f->rdi, (u32)f->rsi);
-        break;
-    case SYS_kbd_info:
-        ret = sys_kbd_info((struct lnxrm_kbd_info *)f->rdi);
-        break;
-    case SYS_mouse_get:
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "mouse_get")) != 0)
-            break;
-        ret = sys_mouse_get((struct lnxrm_mouse_state *)f->rdi);
-        break;
-    case SYS_mouse_info:
-        ret = sys_mouse_info((struct lnxrm_mouse_info *)f->rdi);
-        break;
-    case SYS_input_pop:
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "input_pop")) != 0)
-            break;
-        ret = sys_input_pop((struct lnxrm_input_event *)f->rdi);
-        break;
-    case SYS_input_info:
-        ret = sys_input_info((struct lnxrm_input_info *)f->rdi);
-        break;
-    case SYS_input_wait:
-        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", "input_wait")) != 0)
-            break;
-        ret = sys_input_wait((struct lnxrm_input_event *)f->rdi, (u64)f->rsi);
-        break;
-    default:
+     * draws, but it touches the surface just as directly.  fb_info has
+     * neither: it draws nothing. */
+    GATE_FB = 1u << 1,
+};
+
+struct sysent {
+    sys_fn fn;        /* NULL: a number this kernel does not implement */
+    u8 gates;         /* GATE_* bits, applied in the order listed above */
+    const char *name; /* what a refused gate reports */
+};
+
+/* ---- argument marshalling: trap-frame fields -> C types ---- */
+static long h_read(struct intr_frame *f, u64 a3)
+{
+    return sys_read((int)f->rdi, (void *)f->rsi, a3);
+}
+static long h_write(struct intr_frame *f, u64 a3)
+{
+    return sys_write((int)f->rdi, (const void *)f->rsi, a3);
+}
+static long h_open(struct intr_frame *f, u64 a3)
+{
+    char path[128];
+    return copy_user_str(path, f->rdi, sizeof(path)) == 0 ? sys_open(path, (int)f->rsi)
+                                                          : LNXRM_EFAULT;
+}
+static long h_close(struct intr_frame *f, u64 a3) { return sys_close((int)f->rdi); }
+static long h_lseek(struct intr_frame *f, u64 a3)
+{
+    return sys_lseek((int)f->rdi, (long)f->rsi, (int)a3);
+}
+static long h_brk(struct intr_frame *f, u64 a3) { return sys_brk(f->rdi); }
+static long h_mmap(struct intr_frame *f, u64 a3) { return sys_mmap(f->rdi, f->rsi, a3); }
+static long h_munmap(struct intr_frame *f, u64 a3) { return sys_munmap(f->rdi, f->rsi); }
+static long h_mprotect(struct intr_frame *f, u64 a3) { return sys_mprotect(f->rdi, f->rsi, a3); }
+static long h_getdent(struct intr_frame *f, u64 a3)
+{
+    return sys_getdent((int)f->rdi, (void *)f->rsi, a3);
+}
+static long h_dup2(struct intr_frame *f, u64 a3) { return sys_dup2((int)f->rdi, (int)f->rsi); }
+static long h_nanosleep(struct intr_frame *f, u64 a3)
+{
+    return sys_nanosleep(f->rdi, (struct lnxrm_timespec *)a3);
+}
+static long h_getpid(struct intr_frame *f, u64 a3) { return current->pid; }
+static long h_fork(struct intr_frame *f, u64 a3) { return sys_fork(); }
+static long h_execve(struct intr_frame *f, u64 a3)
+{
+    return sys_execve((const char *)f->rdi, (char *const *)f->rsi, (char *const *)a3);
+}
+/* sys_exit is noreturn, so this row never comes back -- the old switch
+ * fell out of `case SYS_exit` into `case SYS_wait4` for want of a break;
+ * wait4 is now simply its own row. */
+static long h_exit(struct intr_frame *f, u64 a3) { sys_exit((int)f->rdi); }
+static long h_wait4(struct intr_frame *f, u64 a3)
+{
+    return sys_waitpid((int)f->rdi, (int *)f->rsi, (int)a3);
+}
+static long h_kill(struct intr_frame *f, u64 a3) { return sys_kill((int)f->rdi, (int)f->rsi); }
+static long h_uname(struct intr_frame *f, u64 a3)
+{
+    return sys_uname((struct lnxrm_utsname *)f->rdi);
+}
+static long h_sigaction(struct intr_frame *f, u64 a3)
+{
+    return sys_sigaction((int)f->rdi, (const struct lnxrm_sigaction *)f->rsi,
+                         (struct lnxrm_sigaction *)a3);
+}
+static long h_sigprocmask(struct intr_frame *f, u64 a3)
+{
+    return sys_sigprocmask((int)f->rdi, (const u64 *)f->rsi, (u64 *)a3);
+}
+/* T-050: the stored pid half of the link; 0 when there is no parent
+ * (init, or an orphan whose parent was reaped before reparenting). */
+static long h_getppid(struct intr_frame *f, u64 a3) { return (int32_t)current->parent_pid; }
+static long h_ps(struct intr_frame *f, u64 a3)
+{
+    return sys_ps((struct lnxrm_ps_entry *)f->rdi, (int)f->rsi);
+}
+static long h_sigreturn(struct intr_frame *f, u64 a3) { return sys_sigreturn(); }
+static long h_diskinfo(struct intr_frame *f, u64 a3)
+{
+    /* T-031: fdisk died with user/fdisk.c, and listing the block devices
+     * was all it ever did -- so its gate is this one. */
+    return blk_list_all((void *)f->rdi, (int)f->rsi);
+}
+static long h_mkdir(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, sys_mkdir); }
+static long h_fb_info(struct intr_frame *f, u64 a3)
+{
+    return sys_fb_info((struct lnxrm_fb_info *)f->rdi);
+}
+static long h_fb_clear(struct intr_frame *f, u64 a3) { return sys_fb_clear((u32)f->rdi); }
+static long h_fb_fill(struct intr_frame *f, u64 a3)
+{
+    return sys_fb_fill((struct lnxrm_fb_rect *)f->rdi);
+}
+static long h_fb_char(struct intr_frame *f, u64 a3)
+{
+    return sys_fb_char((struct lnxrm_fb_char *)f->rdi);
+}
+static long h_fb_puts(struct intr_frame *f, u64 a3)
+{
+    return sys_fb_puts((struct lnxrm_fb_str *)f->rdi);
+}
+static long h_fb_flip(struct intr_frame *f, u64 a3) { return sys_fb_flip(); }
+static long h_unlink(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, sys_unlink); }
+static long h_rmdir(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, sys_rmdir); }
+static long h_rename(struct intr_frame *f, u64 a3)
+{
+    return path2_syscall(f->rdi, f->rsi, sys_rename);
+}
+static long h_setuid(struct intr_frame *f, u64 a3) { return sys_setuid((u32)f->rdi); }
+/* C27: flush staged bytes to every device */
+static long h_sync(struct intr_frame *f, u64 a3) { return sys_sync(); }
+static long h_kbd_get(struct intr_frame *f, u64 a3) { return kbd_get_byte(); }
+static long h_kbd_inject(struct intr_frame *f, u64 a3)
+{
+    return sys_kbd_inject((const char *)f->rdi, (u32)f->rsi);
+}
+static long h_kbd_info(struct intr_frame *f, u64 a3)
+{
+    return sys_kbd_info((struct lnxrm_kbd_info *)f->rdi);
+}
+static long h_mouse_get(struct intr_frame *f, u64 a3)
+{
+    return sys_mouse_get((struct lnxrm_mouse_state *)f->rdi);
+}
+static long h_mouse_info(struct intr_frame *f, u64 a3)
+{
+    return sys_mouse_info((struct lnxrm_mouse_info *)f->rdi);
+}
+static long h_input_pop(struct intr_frame *f, u64 a3)
+{
+    return sys_input_pop((struct lnxrm_input_event *)f->rdi);
+}
+static long h_input_info(struct intr_frame *f, u64 a3)
+{
+    return sys_input_info((struct lnxrm_input_info *)f->rdi);
+}
+static long h_input_wait(struct intr_frame *f, u64 a3)
+{
+    return sys_input_wait((struct lnxrm_input_event *)f->rdi, (u64)f->rsi);
+}
+
+/* The table itself, in lnxrm_syscalls.def order.  Rows are complete on
+ * purpose: clang's -Wmissing-field-initializers (under -Wextra) flags a
+ * partial one, so the two zero fields are spelled out rather than left. */
+static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
+    [SYS_read]      = { h_read, 0, NULL },
+    [SYS_write]     = { h_write, 0, NULL },
+    [SYS_open]      = { h_open, 0, NULL },
+    [SYS_close]     = { h_close, 0, NULL },
+    [SYS_lseek]     = { h_lseek, 0, NULL },
+    [SYS_brk]       = { h_brk, 0, NULL },
+    [SYS_getdent]   = { h_getdent, 0, NULL },
+    [SYS_dup2]      = { h_dup2, 0, NULL },
+    [SYS_nanosleep] = { h_nanosleep, 0, NULL },
+    [SYS_getpid]    = { h_getpid, 0, NULL },
+    [SYS_fork]      = { h_fork, 0, NULL },
+    [SYS_execve]    = { h_execve, 0, NULL },
+    [SYS_exit]      = { h_exit, 0, NULL },
+    [SYS_wait4]     = { h_wait4, 0, NULL },
+    [SYS_kill]      = { h_kill, 0, NULL },
+    [SYS_uname]     = { h_uname, 0, NULL },
+    [SYS_sigaction] = { h_sigaction, 0, NULL },
+    [SYS_sigprocmask] = { h_sigprocmask, 0, NULL },
+    [SYS_getppid]   = { h_getppid, 0, NULL },
+    [SYS_ps]        = { h_ps, GATE_ADMIN, "ps" },
+    [SYS_sigreturn] = { h_sigreturn, 0, NULL },
+    [SYS_diskinfo]  = { h_diskinfo, GATE_ADMIN, "diskinfo" },
+    [SYS_mkdir]     = { h_mkdir, 0, NULL },
+    [SYS_fb_info]   = { h_fb_info, 0, NULL },
+    [SYS_fb_clear]  = { h_fb_clear, GATE_FB, "fb_clear" },
+    [SYS_fb_fill]   = { h_fb_fill, GATE_FB, "fb_fill" },
+    [SYS_fb_char]   = { h_fb_char, GATE_FB, "fb_char" },
+    [SYS_fb_puts]   = { h_fb_puts, GATE_FB, "fb_puts" },
+    [SYS_unlink]    = { h_unlink, 0, NULL },
+    [SYS_rmdir]     = { h_rmdir, 0, NULL },
+    [SYS_rename]    = { h_rename, 0, NULL },
+    [SYS_setuid]    = { h_setuid, 0, NULL },
+    [SYS_fb_flip]   = { h_fb_flip, GATE_FB, "fb_flip" },
+    [SYS_sync]      = { h_sync, 0, NULL },
+    [SYS_kbd_get]   = { h_kbd_get, GATE_ADMIN, "kbd_get" },
+    [SYS_kbd_inject] = { h_kbd_inject, GATE_ADMIN, "kbd_inject" },
+    [SYS_kbd_info]  = { h_kbd_info, 0, NULL },
+    [SYS_mouse_get] = { h_mouse_get, GATE_ADMIN, "mouse_get" },
+    [SYS_mouse_info] = { h_mouse_info, 0, NULL },
+    [SYS_input_pop] = { h_input_pop, GATE_ADMIN, "input_pop" },
+    [SYS_input_info] = { h_input_info, 0, NULL },
+    [SYS_input_wait] = { h_input_wait, GATE_ADMIN, "input_wait" },
+    [SYS_mmap]      = { h_mmap, 0, NULL },
+    [SYS_munmap]    = { h_munmap, 0, NULL },
+    [SYS_mprotect]  = { h_mprotect, 0, NULL },
+};
+
+/* Look the row up, refuse what the gates refuse, then run it.  Register
+ * ABI plumbing lives in syscall_entry(); everything after that is this. */
+static long syscall_do(struct intr_frame *f, u64 nr, u64 a3)
+{
+    const struct sysent *e = nr <= (u64)LNXRM_SYSCALL_LAST ? &sysents[nr] : NULL;
+
+    if (!e || !e->fn) {
         /* Anything the table does not name: numbers above LNXRM_SYSCALL_LAST. */
         kprintf("[sys] unknown syscall %lu from pid %u\n", (unsigned long)nr,
                 current ? current->pid : 0);
-        ret = LNXRM_ENOSYS;
+        return LNXRM_ENOSYS;
     }
-    return ret;
+
+    long ret;
+    if (e->gates & GATE_ADMIN) {
+        if ((ret = cap_gate(CAP_SYS_ADMIN, "CAP_SYS_ADMIN", e->name)) != 0) return ret;
+    }
+    if (e->gates & GATE_FB) {
+        if ((ret = cap_gate(CAP_FB, "CAP_FB", e->name)) != 0) return ret;
+        if ((ret = fb_owner_gate(e->name)) != 0) return ret;
+    }
+    return e->fn(f, a3);
 }
 
 void syscall_entry(struct intr_frame *f)

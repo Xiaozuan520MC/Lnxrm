@@ -256,13 +256,8 @@ int fat_write_impl(void *mnt, void *node, u64 off, const void *buf, size_t n)
         u32 first = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
         int rc = dirent_writeback_at(m, r, true);
         if (rc) return rc;
-        struct fat_chain ch;
-        for (fat_chain_start(&ch, m, first); fat_chain_more(&ch);) {
-            u32 clus = ch.clus;
-            fat_chain_advance(&ch); /* next hop must be read before this one is freed */
-            if (fat_set_entry(m, clus, 0))
-                return LNXRM_EIO; /* record already emptied: clusters leak */
-        }
+        rc = fat_free_chain(m, first); /* record already emptied: clusters leak */
+        if (rc) return rc;
         r->de.filesize = 0;
         r->de.fstclushi = 0;
         r->de.fstcluslo = 0;

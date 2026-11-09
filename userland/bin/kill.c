@@ -5,7 +5,10 @@ int main(int argc, char **argv)
 {
     if (argc < 2) {
         xputs("usage: kill <pid> [signal]\n");
-        xputs("  signal: 0 (probe) .. 31, default 15 (SIGTERM)\n");
+        /* derived, not spelled out: when the ABI grows a signal this
+         * line and the range check below move together with it */
+        xprintf("  signal: 0 (probe) .. %d, default %d (SIGTERM)\n",
+                (long)(LNXRM_NR_SIGNALS - 1), (long)SIGTERM);
         return 1;
     }
 
@@ -22,8 +25,8 @@ int main(int argc, char **argv)
         sig = 0;
         const char *t = argv[2];
         while (*t >= '0' && *t <= '9') sig = sig * 10 + (*t++ - '0');
-        if (*t || sig >= 32) {
-            xputs("kill: signal must be 0..31\n");
+        if (*t || sig >= LNXRM_NR_SIGNALS) {
+            xprintf("kill: signal must be 0..%d\n", (long)(LNXRM_NR_SIGNALS - 1));
             return 1;
         }
     }

@@ -156,19 +156,26 @@ static void evq_wake(struct task *wakees)
     }
 }
 
+/* Take the oldest event off the queue.  evq_lock must be held; returns
+ * false when the queue is empty, otherwise fills *out and advances the
+ * read index (the producer's write index is untouched, so a full queue
+ * still reads as full and the producer keeps dropping new events). */
+static bool evq_take(struct lnxrm_input_event *out)
+{
+    u32 r = ev_r;
+    if (r == ev_w) return false;
+    *out = evq[r]; /* 24 bytes under the lock: the only reader is the syscall */
+    __atomic_store_n(&ev_r, (r + 1) % IEVQ_SZ, __ATOMIC_SEQ_CST);
+    return true;
+}
+
 long input_event_pop(struct lnxrm_input_event *out)
 {
     u64 f;
     spin_lock_irqsave(&evq_lock, &f);
-    u32 r = ev_r;
-    if (r == ev_w) {
-        spin_unlock_irqrestore(&evq_lock, f);
-        return -1;
-    }
-    *out = evq[r]; /* 24 bytes under the lock: the only reader is the syscall */
-    __atomic_store_n(&ev_r, (r + 1) % IEVQ_SZ, __ATOMIC_SEQ_CST);
+    bool have = evq_take(out);
     spin_unlock_irqrestore(&evq_lock, f);
-    return 0;
+    return have ? 0 : -1;
 }
 
 /* Blocking pop for syscall 41 (input_wait).  Returns 1 with *out filled,
@@ -196,16 +203,14 @@ long input_event_wait(struct lnxrm_input_event *out, u64 ms)
         /* Fast path: an event is already waiting. */
         {
             u64 f;
+            struct lnxrm_input_event e;
             spin_lock_irqsave(&evq_lock, &f);
-            u32 r = ev_r;
-            if (r != ev_w) {
-                struct lnxrm_input_event e = evq[r];
-                __atomic_store_n(&ev_r, (r + 1) % IEVQ_SZ, __ATOMIC_SEQ_CST);
-                spin_unlock_irqrestore(&evq_lock, f);
+            bool have = evq_take(&e);
+            spin_unlock_irqrestore(&evq_lock, f);
+            if (have) {
                 if (copy_to_user(out, &e, sizeof(e)) < 0) return LNXRM_EFAULT;
                 return 1;
             }
-            spin_unlock_irqrestore(&evq_lock, f);
         }
 
         /* An actionable signal (not pending-but-ignored) cuts the wait. */
@@ -227,18 +232,14 @@ long input_event_wait(struct lnxrm_input_event *out, u64 ms)
         /* Park: link onto the wait list under evq_lock, then sleep.
          * The unlink-on-wake below keeps the list free of stale entries. */
         u64 f;
+        struct lnxrm_input_event e;
         spin_lock_irqsave(&evq_lock, &f);
         /* Recheck under the lock: a producer may have arrived between the
          * unlocked checks above and this one. */
-        {
-            u32 r = ev_r;
-            if (r != ev_w) {
-                struct lnxrm_input_event e = evq[r];
-                __atomic_store_n(&ev_r, (r + 1) % IEVQ_SZ, __ATOMIC_SEQ_CST);
-                spin_unlock_irqrestore(&evq_lock, f);
-                if (copy_to_user(out, &e, sizeof(e)) < 0) return LNXRM_EFAULT;
-                return 1;
-            }
+        if (evq_take(&e)) {
+            spin_unlock_irqrestore(&evq_lock, f);
+            if (copy_to_user(out, &e, sizeof(e)) < 0) return LNXRM_EFAULT;
+            return 1;
         }
         current->wait_next = ev_waiters;
         ev_waiters = current;

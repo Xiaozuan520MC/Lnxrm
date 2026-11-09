@@ -9,7 +9,6 @@
 #include <sys/percpu.h>
 #include <sys/cpu.h>   /* console_waiter_arm/disarm, input_push/pop (T-054) */
 #include <mm/mm.h>     /* vmm_new_user_aspace: a fabricated zombie must own a real aspace */
-#include <console.h>
 
 static void test_current_is_bsp_idle(void)
 {

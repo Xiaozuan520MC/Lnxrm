@@ -11,7 +11,6 @@
  *
  * Every case must leave both allocators exactly as it found them. */
 #include <sys/ktest.h>
-#include <console.h>
 #include <mm/mm.h>
 
 /* kmalloc()'s buddy path: anything past a page skips the free lists, so one

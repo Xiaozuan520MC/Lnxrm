@@ -75,143 +75,198 @@ static void lfn_reset(struct lfn_state *lf)
  * from the beginning of the directory, DIRIT_END = the listing has ended.
  * The old cookie was a sequential index and made every getdent rescan the
  * directory from its first cluster -- O(n²) device traffic per ls. */
+/* The state one directory scan carries: the buffer it reads into, the
+ * long-name assembly in progress, and where the results go.  Keeping them
+ * together is what lets the per-cluster walk be its own function instead
+ * of a fourth loop nested inside the scan. */
+struct dir_scan {
+    struct fat_mount *m;
+    u8 *buf;
+    struct lfn_state lf;
+    dirent_cb cb;
+    void *ctx;
+    u32 eps; /* dirents per sector */
+};
 
-int fat_scan_dir_at(struct fat_mount *m, u32 dirclus, u64 resume, dirent_cb cb, void *ctx)
+/* One long-name record, in or out of a run.  An LFN record is never a
+ * directory entry of its own, so the caller always moves to the next
+ * record afterwards -- everything this can do is "advance or abandon the
+ * run in progress". */
+static void lfn_record(struct lfn_state *lf, const u8 *raw)
+{
+    int seq = raw[0] & 0x1F;
+    bool marked = (raw[0] & 0x40) != 0;
+
+    if (marked) {
+        /* First record of a run (highest seq).  An unterminated run from
+         * before is dropped, never extended into it. */
+        if (lf->total) lfn_reset(lf);
+        if (seq >= 1 && seq <= LFN_SEQ_MAX) {
+            lf->total = seq;
+            lf->expect = seq - 1;
+            lf->sum = raw[13];
+        }
+    } else {
+        /* C17: a run only continues with the same alias checksum and
+         * strictly descending sequence numbers; a hole (or a checksum of a
+         * stranger) is corruption: reset and let the 8.3 record fall back
+         * to its alias. */
+        if (!lf->total || seq < 1 || seq != lf->expect || lf->sum != raw[13]) {
+            lfn_reset(lf);
+            return;
+        }
+        lf->expect = seq - 1;
+    }
+    if (!lf->total) return;
+
+    /* Assemble UTF16 pieces (stored in reverse order); access through a
+     * raw byte pointer because the pieces span past the 11-byte short-name
+     * array. */
+    char piece[14];
+    int pi = 0;
+    static const int poff[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+    for (int k = 0; k < 13; k++) {
+        u16 chr = (u16)(raw[poff[k]] | (raw[poff[k] + 1] << 8));
+        /* 0xFFFF (and 0x0000) pad the final piece. */
+        if (chr == 0xFFFF || chr == 0) break;
+        piece[pi++] = (char)chr;
+    }
+    piece[pi] = 0;
+
+    size_t base = (size_t)(seq - 1) * 13;
+    if (base + pi >= sizeof(lf->longname)) {
+        lfn_reset(lf); /* longer than the buffer: use the alias */
+        return;
+    }
+    memcpy(&lf->longname[base], piece, pi);
+    if ((int)(base + pi) > lf->name_end) lf->name_end = (int)(base + pi);
+}
+
+/* The name this record goes by: the long one when the run before it is
+ * complete, its checksum matches this very record's alias and the result
+ * fits, the 8.3 alias otherwise (C17). */
+static const char *fat_entry_name(const struct fat_dirent *e,
+                                  const struct lfn_state *lf,
+                                  char shortn[13], char assembled[261])
+{
+    fat_short_to_name(e->name, e->ntres, shortn);
+    if (lf->total && lf->expect == 0 && lf->name_end > 0 &&
+        lf->sum == fat_lfn_checksum(e->name)) {
+        memcpy(assembled, lf->longname, (size_t)lf->name_end);
+        assembled[lf->name_end] = 0;
+        return assembled;
+    }
+    return shortn;
+}
+
+/* One cluster of the directory, sector by sector, delivering entries to
+ * the callback.  Returns:
+ *   DIR_SCAN_MORE (0) -- the chain has more clusters to visit;
+ *   DIR_SCAN_END  (2) -- the 0x00 terminator ended the DIRECTORY, so every
+ *                        remaining cluster is past the end of it and must
+ *                        not be scanned (the old code `goto done` from
+ *                        here, which skipped them all);
+ *   DIR_SCAN_STOP (1) -- the callback asked to stop, which is exactly the
+ *                        value fat_scan_dir_at() hands back for it;
+ *   a negative errno when a sector could not be read.
+ *
+ * T-005: an unreadable sector ends the scan with an error.  Reading on
+ * would walk whatever the buffer held before (uninitialised heap on the
+ * first sector) and hand it to `cb` as directory entries -- "not found" out
+ * of data that was never read. */
+enum { DIR_SCAN_MORE = 0, DIR_SCAN_STOP = 1, DIR_SCAN_END = 2 };
+
+static int dir_scan_cluster(struct dir_scan *s, u32 c, u32 from_sec,
+                            u32 first_i)
+{
+    u64 clba = cluster_lba(s->m, c);
+    for (u32 sec = from_sec; sec < s->m->sectors_per_cluster; sec++) {
+        int rc = fat_read_sector(s->m, clba + sec, s->buf);
+        if (rc) {
+            fat_warn_io(s->m, "read dir", clba + sec);
+            return rc;
+        }
+        for (u32 i = (sec == from_sec ? first_i : 0); i < s->eps; i++) {
+            u32 off = (sec * s->eps + i) * DIRENT_SIZE;
+            struct fat_dirent *e =
+                (struct fat_dirent *)(s->buf + i * DIRENT_SIZE);
+            /* 0x00 terminates the directory (only ever in the tail); a
+             * fifth long-name piece opens with 0x05 and must scan on. */
+            if (e->name[0] == ENT_END) return DIR_SCAN_END;
+            if (!entry_used(e)) {
+                /* Deleted entry: any LFN run around it is orphaned. */
+                lfn_reset(&s->lf);
+                continue;
+            }
+            if ((e->attr & ATTR_LFN) == ATTR_LFN) {
+                lfn_record(&s->lf, (const u8 *)e);
+                continue;
+            }
+            if (e->attr & ATTR_VOLUME) continue;
+
+            char shortn[13];
+            char assembled[261]; /* C31: same bound as the piece buffer */
+            const char *nm = fat_entry_name(e, &s->lf, shortn, assembled);
+            lfn_reset(&s->lf);
+            if (s->cb(nm, e, c, off, s->ctx)) return DIR_SCAN_STOP;
+        }
+    }
+    return DIR_SCAN_MORE;
+}
+
+int fat_scan_dir_at(struct fat_mount *m, u32 dirclus, u64 resume, dirent_cb cb,
+                    void *ctx)
 {
     u8 *buf = cluster_buf_alloc(m);
     if (!buf) return LNXRM_ENOMEM; /* T-004: a dry heap ends the scan */
-    struct lfn_state lf;
-    lfn_reset(&lf);
+
+    struct dir_scan s;
+    memset(&s, 0, sizeof s); /* a fresh LFN run, as lfn_reset() leaves it */
+    s.m = m;
+    s.buf = buf;
+    s.cb = cb;
+    s.ctx = ctx;
+    s.eps = m->bytes_per_sector / DIRENT_SIZE;
 
     /* C30: sectors, not clusters.  A 32-byte dirent never crosses a
-     * 512-byte sector, so the scan steps sector by sector -- a resume
-     * reads only the sectors the cursor has not served yet, one lookup
-     * each, instead of re-reading whole clusters per call.  The paged FAT
+     * 512-byte sector, so the scan steps sector by sector -- a resume reads
+     * only the sectors the cursor has not served yet, one lookup each,
+     * instead of re-reading whole clusters per call.  The paged FAT
      * (m->fat_pages) is in RAM, so chain advancement is arithmetic: skipped
      * clusters cost no device read.  LFN state starts fresh at a resume,
-     * which is exact, because a long-name run always sits contiguously right
-     * before its
-     * own 8.3 record -- the next entry's pieces can never lie at or
-     * before the cursor. */
+     * which is exact, because a long-name run always sits contiguously
+     * right before its own 8.3 record -- the next entry's pieces can never
+     * lie at or before the cursor. */
     u32 start_clus = (u32)(resume >> 32);
     u32 start_off = (u32)resume;
     bool skipping = resume != DIRIT_START;
-    u32 eps = m->bytes_per_sector / DIRENT_SIZE;
 
+    int rc = 0;
     struct fat_chain ch;
-    for (fat_chain_start(&ch, m, dirclus); fat_chain_more(&ch); fat_chain_advance(&ch)) {
-        u32 c = ch.clus;
+    for (fat_chain_start(&ch, m, dirclus); fat_chain_more(&ch);
+         fat_chain_advance(&ch)) {
         u32 from_sec = 0, first_i = 0;
         if (skipping) {
-            if (c != start_clus) continue; /* O(1): no read, no scan */
+            if (ch.clus != start_clus) continue; /* O(1): no read, no scan */
             skipping = false;
             /* The cursor names a byte offset, so the first sector it still
              * wants is only entered at its own slot -- resuming from 32
-             * (second entry) must NOT rescan the sector's first entry, or
-             * a 1-sector cluster re-delivers entry 0 forever and never
-             * reaches the second one. */
+             * (second entry) must NOT rescan the sector's first entry, or a
+             * 1-sector cluster re-delivers entry 0 forever and never reaches
+             * the second one. */
             from_sec = start_off / m->bytes_per_sector; /* may be the end */
             first_i = (start_off % m->bytes_per_sector) / DIRENT_SIZE;
         }
-        /* T-005: an unreadable sector ends the scan with an error.  Reading
-         * on would walk whatever the buffer held before (uninitialised heap
-         * on the first sector) and hand it to `cb` as directory entries --
-         * "not found" out of data that was never read. */
-        u64 clba = cluster_lba(m, c);
-        for (u32 sec = from_sec; sec < m->sectors_per_cluster; sec++) {
-            int rc = fat_read_sector(m, clba + sec, buf);
-            if (rc) {
-                fat_warn_io(m, "read dir", clba + sec);
-                kfree(buf);
-                return rc;
-            }
-            for (u32 i = (sec == from_sec ? first_i : 0); i < eps; i++) {
-                u32 off = (sec * eps + i) * DIRENT_SIZE;
-                struct fat_dirent *e = (struct fat_dirent *)(buf + i * DIRENT_SIZE);
-                /* 0x00 terminates the directory (only ever in the tail); a
-                 * fifth long-name piece opens with 0x05 and must scan on. */
-                if (e->name[0] == ENT_END) goto done;
-                if (!entry_used(e)) {
-                    /* Deleted entry: any LFN run around it is orphaned. */
-                    lfn_reset(&lf);
-                    continue;
-                }
-                if ((e->attr & ATTR_LFN) == ATTR_LFN) {
-                    /* LFN entry: assemble UTF16 pieces (stored in reverse
-                     * order); access through a raw byte pointer because the
-                     * pieces span past the 11-byte short-name array */
-                    const u8 *raw = (const u8 *)e;
-                    int seq = raw[0] & 0x1F;
-                    bool marked = (raw[0] & 0x40) != 0;
-                    if (marked) {
-                        /* First record of a run (highest seq).  An
-                         * unterminated run from before is dropped, never
-                         * extended into it. */
-                        if (lf.total) lfn_reset(&lf);
-                        if (seq >= 1 && seq <= LFN_SEQ_MAX) {
-                            lf.total = seq;
-                            lf.expect = seq - 1;
-                            lf.sum = raw[13];
-                        }
-                    } else {
-                        /* C17: a run only continues with the same alias
-                         * checksum and strictly descending sequence
-                         * numbers; a hole (or a checksum of a stranger) is
-                         * corruption: reset and let the 8.3 record fall
-                         * back to its alias. */
-                        if (!lf.total || seq < 1 || seq != lf.expect ||
-                            lf.sum != raw[13]) {
-                            lfn_reset(&lf);
-                            continue;
-                        }
-                        lf.expect = seq - 1;
-                    }
-                    if (!lf.total) continue;
-                    char piece[14];
-                    int pi = 0;
-                    static const int poff[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
-                    for (int k = 0; k < 13; k++) {
-                        u16 chr = (u16)(raw[poff[k]] | (raw[poff[k] + 1] << 8));
-                        /* 0xFFFF (and 0x0000) pad the final piece. */
-                        if (chr == 0xFFFF || chr == 0) break;
-                        piece[pi++] = (char)chr;
-                    }
-                    piece[pi] = 0;
-                    size_t base = (size_t)(seq - 1) * 13;
-                    if (base + pi >= sizeof(lf.longname)) {
-                        lfn_reset(&lf); /* longer than the buffer: use the alias */
-                        continue;
-                    }
-                    memcpy(&lf.longname[base], piece, pi);
-                    if ((int)(base + pi) > lf.name_end) lf.name_end = (int)(base + pi);
-                    continue;
-                }
-                if (e->attr & ATTR_VOLUME) continue;
-
-                char shortn[13];
-                fat_short_to_name(e->name, e->ntres, shortn);
-                const char *nm = shortn;
-                char assembled[261]; /* C31: same bound as the piece buffer */
-                /* C17: the long name is only trusted when the run is
-                 * complete and its checksum matches this very record's
-                 * alias. */
-                if (lf.total && lf.expect == 0 && lf.name_end > 0 &&
-                    lf.sum == fat_lfn_checksum(e->name)) {
-                    memcpy(assembled, lf.longname, (size_t)lf.name_end);
-                    assembled[lf.name_end] = 0;
-                    nm = assembled;
-                }
-                lfn_reset(&lf);
-                if (cb(nm, e, c, off, ctx)) {
-                    kfree(buf);
-                    return 1;
-                }
-            }
+        rc = dir_scan_cluster(&s, ch.clus, from_sec, first_i);
+        if (rc == DIR_SCAN_END) {
+            rc = 0; /* the terminator ended the directory, not an error */
+            break;
         }
+        if (rc) break; /* DIR_SCAN_STOP (1) or a negative errno */
     }
-done:
+
     kfree(buf);
-    return 0;
+    return rc;
 }
 
 /* Full scan from the directory start -- the name-lookup path. */

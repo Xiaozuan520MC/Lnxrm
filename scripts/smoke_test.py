@@ -173,6 +173,28 @@ def boot_markers(smp):
     return marks
 
 
+def abi_define(name):
+    """The value the ABI header gives `LNXRM_<name>`, read not repeated.
+
+    A child killed by a signal exits with `-sig`, and the ENOSYS tags below
+    spell the last legal syscall number, so those tags all depend on numbers
+    this file must not restate.  Writing them here was fine while the tables
+    were frozen; the 2026-11-07 signal compaction (15 numbers nothing used)
+    moved SIGTERM 15 -> 10 and SIGSEGV 11 -> 9, and the mmap batch pushed
+    LNXRM_SYSCALL_LAST 31 -> 44, each of which would have quietly falsified
+    tags.  Reading the header keeps the next change from doing the same."""
+    path = os.path.join(ROOT, "include", "abi", "lnxrm_abi.h")
+    with open(path, encoding="utf-8") as fh:
+        m = re.search(r"^#define\s+LNXRM_%s\s+(\d+)\s*$" % name, fh.read(), re.M)
+    if not m:
+        raise SystemExit("smoke: LNXRM_%s not found in %s" % (name, path))
+    return int(m.group(1))
+
+
+SIGTERM = abi_define("SIGTERM")
+SIGSEGV = abi_define("SIGSEGV")
+SYSCALL_LAST = abi_define("SYSCALL_LAST")
+
 SYSTEST_TAGS = [
     ("uname.ret", br"uname\.ret=0"),
     ("unknown.99 = -ENOSYS", br"unknown\.99=-38"),
@@ -180,8 +202,29 @@ SYSTEST_TAGS = [
     # 当 33 成为合法编号（sync）时会跨行误匹配到下一条的 -38 而假通过。
     # 39/40 在 2026-10-30（统一输入队列 input_pop/info）成为真编号，钉号
     # 随表尾走：systest 的 past 表总是 LAST+1..+3，这里跟着同一个表尾。
-    ("past.42 = -ENOSYS", br"past\.42=[\s\S]{0,60}?unknown syscall 42[\s\S]{0,60}?-38"),
-    ("past.43 = -ENOSYS", br"past\.43=[\s\S]{0,60}?unknown syscall 43[\s\S]{0,60}?-38"),
+    # 2026-11-08 mmap 批次把 LAST 从 31 提到 44 时，这里还写着 42/43，
+    # 三条判据全落空（past.45 打出来没人验），故与 systest 的 past 表
+    # 一起从表尾现算。
+] + [
+    ("past.%d = -ENOSYS" % _n,
+     br"past\.%d=[\s\S]{0,60}?unknown syscall %d[\s\S]{0,60}?-38"
+     % (_n, _n))
+    for _n in (SYSCALL_LAST + 1, SYSCALL_LAST + 2, SYSCALL_LAST + 3)
+] + [
+    # 42/43/44 + 32: mmap records a range (first touch demands the frame),
+    # mprotect revokes write on a present page, munmap leaves a hole that
+    # must answer ENOMEM instead of silently succeeding, and the owner
+    # process lands its flip.
+    ("mmap.base in the mmap window", br"mmap\.base=[1-9]\d{9,}"),
+    ("mmap page readable after touch", br"mmap\.read=170"),
+    ("mmap.prot = 0", br"mmap\.prot=0"),
+    ("mmap.reread = 170 after write revoked", br"mmap\.reread=170"),
+    ("mmap.zerolen = -EINVAL", br"mmap\.zerolen=-22"),
+    ("mmap.unaligned = -EINVAL", br"mmap\.unaligned=-22"),
+    ("mmap.unmap = 0", br"mmap\.unmap=0"),
+    ("mmap.hole = -ENOMEM", br"mmap\.hole=-12"),
+    ("mmap.tail = 0", br"mmap\.tail=0"),
+    ("fb.flip = 0", br"fb\.flip=0"),
     ("open.fd >= 0", br"open\.fd=\d+"),
     ("read.after.seek = 15", br"read\.after\.seek=15"),
     ("read.at.end = tail only", br"read\.at\.end=[1-9]\d*"),
@@ -234,7 +277,7 @@ SYSTEST_TAGS = [
     # or "pid 1 refused" just means kill never works at all.
     ("kill child term = 0", br"kill\.child\.term=0"),
     ("kill child reaped", br"kill\.child\.wait=[1-9]\d*"),
-    ("kill child status = -SIGTERM", br"kill\.child\.status=-15"),
+    ("kill child status = -SIGTERM", br"kill\.child\.status=-%d" % SIGTERM),
     # denial receipt: which layer said no (kxld rule vs uid/cap gate)
     ("kxld denial receipt", br"\[kxld\] denied kill: pid"),
     ("diskinfo.count > 0", br"diskinfo\.count=[1-9]\d*"),
@@ -266,8 +309,8 @@ SYSTEST_TAGS = [
     # denial receipt: which capability said no (never a silent refusal)
     ("cap denial receipt", br"\[cap\] denied"),
     ("wait.code = 3", br"wait\.code=3"),
-    ("segv.status = -SIGSEGV", br"segv\.status=-11"),
-    ("nx.status = -SIGSEGV", br"nx\.status=-11"),
+    ("segv.status = -SIGSEGV", br"segv\.status=-%d" % SIGSEGV),
+    ("nx.status = -SIGSEGV", br"nx\.status=-%d" % SIGSEGV),
     ("read into .rodata = -EFAULT", br"read\.ro\.ret=-14"),
     # T-033: one surface, one owner.  The first drawer claims it, a second
     # privileged process is refused and takes nothing with it, and the
@@ -323,6 +366,13 @@ SYSTEST_TAGS = [
     ("sync write landed", br"sync\.wrote=12"),
     ("systest.done = 1", br"systest\.done=1"),
 ]
+
+# Every tag searches the serial transcript, which is bytes: a plain str
+# pattern does not fail at definition time, it blows up in re.search in
+# the middle of a run (that is how the 2026-11-08 mmap tags shipped).
+_str_tags = [label for label, pat in SYSTEST_TAGS if not isinstance(pat, bytes)]
+if _str_tags:
+    raise SystemExit("smoke: str pattern in SYSTEST_TAGS: %s" % _str_tags)
 
 
 class Report:

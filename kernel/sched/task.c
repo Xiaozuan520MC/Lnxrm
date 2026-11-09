@@ -206,48 +206,102 @@ int sys_fork(void)
 }
 
 /* ================= execve ================= */
-long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
+
+/* Map the fresh user stack -- 16 KiB below USER_STACK_TOP -- plus the
+ * sigreturn restorer into `pml4`.  Returns 0, or LNXRM_ENOMEM; on failure
+ * every frame it did map stays in `pml4`, which is harmless because both
+ * callers answer by destroying that address space.  What they free after
+ * that differs (image; image + kernel stack + slot), so the unwind stays
+ * at each call site. */
+static int user_stack_map(u64 pml4)
 {
+    for (u64 va = USER_STACK_TOP - 0x4000; va < USER_STACK_TOP; va += PAGE_SIZE) {
+        u64 pa = pmm_alloc();
+        if (!pa) return LNXRM_ENOMEM;
+        memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
+        if (vmm_map_user(pml4, va, pa, true, true, false) < 0) {
+            pmm_free(pa); /* never reached a PTE: hand it straight back */
+            return LNXRM_ENOMEM;
+        }
+    }
+    return signal_map_restorer(pml4);
+}
+
+/* ---- execve, in pieces ----
+ *
+ * execve is a pipeline: copy what the caller handed over, read the image,
+ * build a new address space, load into it, commit, lay out the stack.  The
+ * whole thing used to be one 187-line function whose first half was a
+ * ladder of "free the image and close the file" exits -- each stage
+ * remembering which of the four resources it had already taken.  Splitting
+ * it at the stage boundaries leaves sys_execve() as the ordering, and the
+ * one cleanup rule it still needs is "free img, destroy new_pml4", which
+ * both live in the caller.
+ *
+ * POSIX says exec failure RETURNS to the caller: nothing below may exit on
+ * a failed stage (this sys_exit(-8)'d once, after CR3 had already been
+ * switched, leaving current->pml4 pointing at a destroyed pml4). */
+#define EXEC_MAX_ARGS 16
+#define EXEC_ARG_LEN  64
+
+struct exec_args {
     char path[128];
-    char argv[16][64];
-    char envp[16][64];
-    int argc = 0;
-    int envc = 0;
+    char argv[EXEC_MAX_ARGS][EXEC_ARG_LEN];
+    char envp[EXEC_MAX_ARGS][EXEC_ARG_LEN];
+    int argc;
+    int envc;
+};
 
-    /* Path, argv and envp strings may straddle unmapped pages: copy them
-     * through the per-byte validated helper instead of reading user
-     * memory raw. */
-    if (copy_user_str(path, (u64)upath, sizeof(path)) < 0) return LNXRM_EFAULT;
+/* Path, argv and envp strings may straddle unmapped pages: copy them
+ * through the per-byte validated helper instead of reading user memory
+ * raw.
+ *
+ * A NULL argv/envp stays legal (userland/sh.c execs with envp NULL); a
+ * NON-NULL but unreachable array used to be accepted and dropped -- the
+ * new image then ran with argc 0 instead of the caller being told the
+ * pointer was bad.  Refuse it, and refuse a bad entry pointer or entry
+ * string instead of truncating the array there. (2026-10-20)
+ *
+ * envp used to be accepted and silently dropped; it is copied for real so
+ * the new image's stack carries it (crt0 publishes it as `environ`). */
+static long exec_copy_args(struct exec_args *a, const char *upath,
+                           char *const uargv[], char *const uenvp[])
+{
+    if (copy_user_str(a->path, (u64)upath, sizeof(a->path)) < 0)
+        return LNXRM_EFAULT;
 
-    /* A NULL argv/envp stays legal (userland/sh.c execs with envp NULL); a
-     * NON-NULL but unreachable array used to be accepted and dropped --
-     * the new image then ran with argc 0 instead of the caller being told
-     * the pointer was bad.  Refuse it, and refuse a bad entry pointer or
-     * entry string instead of truncating the array there. (2026-10-20) */
     if (uargv) {
         if (!UCP((u64)uargv)) return LNXRM_EFAULT;
-        for (int i = 0; i < 16; i++) {
-            const char *a;
-            if (copy_from_user(&a, &uargv[i], sizeof(a)) < 0) return LNXRM_EFAULT;
-            if (!a) break;
-            if (copy_user_str(argv[i], (u64)a, sizeof(argv[i])) < 0) return LNXRM_EFAULT;
-            argc++;
+        for (int i = 0; i < EXEC_MAX_ARGS; i++) {
+            const char *s;
+            if (copy_from_user(&s, &uargv[i], sizeof(s)) < 0)
+                return LNXRM_EFAULT;
+            if (!s) break;
+            if (copy_user_str(a->argv[i], (u64)s, sizeof(a->argv[i])) < 0)
+                return LNXRM_EFAULT;
+            a->argc++;
         }
     }
 
-    /* envp used to be accepted and silently dropped; copy it for real so
-     * the new image's stack carries it (crt0 publishes it as `environ`). */
     if (uenvp) {
         if (!UCP((u64)uenvp)) return LNXRM_EFAULT;
-        for (int i = 0; i < 16; i++) {
-            const char *e;
-            if (copy_from_user(&e, &uenvp[i], sizeof(e)) < 0) return LNXRM_EFAULT;
-            if (!e) break;
-            if (copy_user_str(envp[i], (u64)e, sizeof(envp[i])) < 0) return LNXRM_EFAULT;
-            envc++;
+        for (int i = 0; i < EXEC_MAX_ARGS; i++) {
+            const char *s;
+            if (copy_from_user(&s, &uenvp[i], sizeof(s)) < 0)
+                return LNXRM_EFAULT;
+            if (!s) break;
+            if (copy_user_str(a->envp[i], (u64)s, sizeof(a->envp[i])) < 0)
+                return LNXRM_EFAULT;
+            a->envc++;
         }
     }
+    return 0;
+}
 
+/* The image, whole, in a buffer the caller frees.  Every failure path
+ * here closes what it opened and hands nothing back half-built. */
+static long exec_read_image(const char *path, void **img_out, size_t *sz_out)
+{
     struct file *f = NULL;
     long err = vfs_open_file(path, O_RDONLY, &f);
     if (err < 0) return err;
@@ -264,82 +318,60 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
         return LNXRM_EIO;
     }
     vfs_close_file(f);
+    *img_out = img;
+    *sz_out = sz;
+    return 0;
+}
 
-    u64 old_pml4 = current->pml4;
-    u64 new_pml4 = vmm_new_user_aspace();
-    if (!new_pml4) {
-        kfree(img);
-        return LNXRM_ENOMEM;
-    }
-
-    /* map a fresh user stack (16 KiB) below USER_STACK_TOP */
-    for (u64 va = USER_STACK_TOP - 0x4000; va < USER_STACK_TOP; va += PAGE_SIZE) {
-        u64 pa = pmm_alloc();
-        if (!pa) {
-            kfree(img); /* was leaked */
-            vmm_destroy_user_aspace(new_pml4);
-            return LNXRM_ENOMEM;
-        }
-        memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
-        if (vmm_map_user(new_pml4, va, pa, true, true, false) < 0) {
-            pmm_free(pa); /* nothing is reachable yet, so unwind it all */
-            kfree(img);
-            vmm_destroy_user_aspace(new_pml4);
-            return LNXRM_ENOMEM;
-        }
-    }
-    if (signal_map_restorer(new_pml4) < 0) {
-        kfree(img);
-        vmm_destroy_user_aspace(new_pml4);
-        return LNXRM_ENOMEM;
-    }
-
-    u64 entry = 0, brk_end = 0;
+/* The point of no return, in one place: the new address space is adopted,
+ * the old one goes away, and everything that describes "this process" --
+ * heap, stack watermark, accounting, open files, name, signal state --
+ * starts describing the new image instead.  It runs only after elf_load
+ * has succeeded, which is what makes a FAILED execve roll back cleanly
+ * above and leave the caller's address space, vma list and signal
+ * dispositions untouched. */
+static void exec_commit(const struct exec_args *a, u64 old_pml4, u64 new_pml4,
+                        u64 brk_end)
+{
+    /* The point of no return, in two adjacent steps: load the new root,
+     * then publish it.  Nothing between them can schedule (this is ring 0
+     * and the task is not idle), and switch_to() re-checks the live CR3, so
+     * the two can never disagree across a context switch.  CR3 goes first
+     * because vmm_destroy_user_aspace(old_pml4) below must never run while
+     * the CPU is still paging through the table it is about to free. */
     vmm_switch_to(new_pml4);
-    entry = elf_load(new_pml4, img, sz, &brk_end);
-    kfree(img);
-    if (!entry) {
-        /* ELF load failed: roll back to the caller's original address
-         * space.  Previously this sys_exit(-8)'d after already switching
-         * CR3, leaving current->pml4 pointing at a destroyed (or never
-         * assigned) pml4 and leaking new_pml4. POSIX says exec failure
-         * returns to the caller. */
-        vmm_switch_to(old_pml4);
-        vmm_destroy_user_aspace(new_pml4);
-        return LNXRM_ENOEXEC;
-    }
-
-    /* Assign the new address space BEFORE destroying the old one so
-     * current->pml4 / any interrupt path never sees a stale CR3. */
     current->pml4 = new_pml4;
     vmm_destroy_user_aspace(old_pml4);
+
     /* T-MMAP: the new image starts with NO mmap ranges -- the old list
-     * described the address space just destroyed, and keeping it would
-     * make the demand pager map the new image's address space at the old
-     * image's addresses (with the old protection).  Runs after the point
-     * of no return for the same reason ustack_lo is set there: a FAILED
+     * described the address space just destroyed, and keeping it would make
+     * the demand pager map the new image's address space at the old
+     * image's addresses (with the old protection).  Runs after the point of
+     * no return for the same reason ustack_lo is set there: a FAILED
      * execve rolls back above and must leave the caller's list intact. */
     vma_free_all(current);
     current->brk_base = (void *)ALIGN_UP(brk_end, PAGE_SIZE);
     current->brk_cur = current->brk_base;
+
     /* T-094: the new image's stack was mapped 16 KiB below USER_STACK_TOP
      * above; record its low-watermark so a deep recursion can grow it.  Set
-     * here, after the point of no return, so a failed execve (which rolls
-     * back to the old aspace) never leaves a stale watermark. */
+     * after the point of no return, so a failed execve (which rolls back to
+     * the old aspace) never leaves a stale watermark. */
     current->ustack_lo = USER_STACK_TOP - 0x4000;
 
     /* T-032: a new image starts a new account (and a new peak).  Counted
      * from the page tables, so it covers the stack loop, the sigreturn
-     * restorer and whatever elf_load mapped, however many pages that
-     * turns out to be -- nobody has to remember to add them up. */
+     * restorer and whatever elf_load mapped, however many pages that turns
+     * out to be -- nobody has to remember to add them up. */
     current->mem_pages = vmm_count_user_pages(current->pml4);
     current->mem_peak = current->mem_pages;
 
     /* Close O_CLOEXEC descriptors (the old body was an empty if). */
     for (int i = 0; i < NR_FDS; i++)
-        if (current->fds[i] && (current->fds[i]->flags & O_CLOEXEC)) sys_close(i);
+        if (current->fds[i] && (current->fds[i]->flags & O_CLOEXEC))
+            sys_close(i);
 
-    strncpy(current->name, path, TASK_NAME_LEN - 1);
+    strncpy(current->name, a->path, TASK_NAME_LEN - 1);
 
     /* execve replaces the process image, so it also replaces the signal
      * disposition: handlers, masks and any live handler frame go back to
@@ -351,54 +383,105 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     current->sig_fault_rip = 0;
     memset(current->sig_handlers, 0, sizeof(current->sig_handlers));
     memset(current->sig_masks, 0, sizeof(current->sig_masks));
+}
 
-    /* User stack per the SysV AMD64 process-entry layout:
-     *   [strings]
-     *   argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL | auxv NULL
-     * rsp is 16-byte aligned at entry, as the ABI requires. */
+/* User stack per the SysV AMD64 process-entry layout:
+ *   [strings]
+ *   argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL | auxv NULL
+ * rsp is 16-byte aligned at entry, as the ABI requires.  Returns the rsp
+ * the new image starts from. */
+static u64 exec_build_stack(const struct exec_args *a)
+{
     u64 sp = USER_STACK_TOP;
-    u64 argv_ptrs[17];
-    u64 envp_ptrs[17];
+    u64 argv_ptrs[EXEC_MAX_ARGS + 1];
+    u64 envp_ptrs[EXEC_MAX_ARGS + 1];
 
-    /* Whole argv/envp/auxv build is one SMAP window: every store below
-     * goes through a user VA (U/S=1), and this runs after cpu_init() so
-     * CR4.SMAP is already on.  No blocking call inside, so the window
-     * cannot leak across a schedule(). */
+    /* Whole argv/envp/auxv build is one SMAP window: every store below goes
+     * through a user VA (U/S=1), and this runs after cpu_init() so CR4.SMAP
+     * is already on.  No blocking call inside, so the window cannot leak
+     * across a schedule(). */
     u64 ac_smap = smap_enter();
+
     sp -= 64;
     *(u64 *)sp = 0;
-    for (int i = envc - 1; i >= 0; i--) {
-        size_t len = strlen(envp[i]) + 1;
+    for (int i = a->envc - 1; i >= 0; i--) {
+        size_t len = strlen(a->envp[i]) + 1;
         sp -= len;
-        memcpy((void *)sp, envp[i], len);
+        memcpy((void *)sp, a->envp[i], len);
         envp_ptrs[i] = sp;
     }
-    for (int i = argc - 1; i >= 0; i--) {
-        size_t len = strlen(argv[i]) + 1;
+    for (int i = a->argc - 1; i >= 0; i--) {
+        size_t len = strlen(a->argv[i]) + 1;
         sp -= len;
-        memcpy((void *)sp, argv[i], len);
+        memcpy((void *)sp, a->argv[i], len);
         argv_ptrs[i] = sp;
     }
 
-    {
-        /* argc + argv + NULL + envp + NULL + two AT_NULL words */
-        u64 slots = 1 + (u64)argc + 1 + (u64)envc + 1 + 2;
-        u64 bytes = slots * 8;
-        u64 pad = (16 - (bytes & 15)) & 15;
-        u64 *p;
+    /* argc + argv + NULL + envp + NULL + two AT_NULL words */
+    u64 slots = 1 + (u64)a->argc + 1 + (u64)a->envc + 1 + 2;
+    u64 bytes = slots * 8;
+    u64 pad = (16 - (bytes & 15)) & 15;
 
-        sp &= ~15UL;
-        sp -= bytes + pad;
-        p = (u64 *)sp;
-        *p++ = (u64)argc;
-        for (int i = 0; i < argc; i++) *p++ = argv_ptrs[i];
-        *p++ = 0;
-        for (int i = 0; i < envc; i++) *p++ = envp_ptrs[i];
-        *p++ = 0;
-        *p++ = 0; /* auxv AT_NULL tag */
-        *p++ = 0;
-    }
+    sp &= ~15UL;
+    sp -= bytes + pad;
+    u64 *p = (u64 *)sp;
+    *p++ = (u64)a->argc;
+    for (int i = 0; i < a->argc; i++) *p++ = argv_ptrs[i];
+    *p++ = 0;
+    for (int i = 0; i < a->envc; i++) *p++ = envp_ptrs[i];
+    *p++ = 0;
+    *p++ = 0; /* auxv AT_NULL tag */
+    *p++ = 0;
+
     smap_leave(ac_smap);
+    return sp;
+}
+
+long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
+{
+    struct exec_args a;
+    memset(&a, 0, sizeof a);
+    long err = exec_copy_args(&a, upath, uargv, uenvp);
+    if (err < 0) return err;
+
+    void *img = NULL;
+    size_t sz = 0;
+    if ((err = exec_read_image(a.path, &img, &sz)) < 0) return err;
+
+    u64 old_pml4 = current->pml4;
+    u64 new_pml4 = vmm_new_user_aspace();
+    if (!new_pml4) {
+        kfree(img);
+        return LNXRM_ENOMEM;
+    }
+
+    /* map a fresh user stack (16 KiB) below USER_STACK_TOP */
+    if (user_stack_map(new_pml4) < 0) {
+        kfree(img); /* was leaked */
+        vmm_destroy_user_aspace(new_pml4);
+        return LNXRM_ENOMEM;
+    }
+
+    u64 entry = 0, brk_end = 0;
+    /* Deliberately NO vmm_switch_to() here: elf_load() maps and fills every
+     * frame through the high-half alias and an explicit `pml4` root, so it
+     * works under ANY address space (see elf.c).  Switching CR3 this early
+     * opened a ~15-line window in which CR3 was the new root while
+     * current->pml4 still named the old one -- the exact state the #PF
+     * report calls (*MISMATCH*).  The switch now happens at the point of
+     * no return, two instructions before current->pml4 is published. */
+    entry = elf_load(new_pml4, img, sz, &brk_end);
+    kfree(img);
+    if (!entry) {
+        /* ELF load failed: the caller's address space was never left, so
+         * there is nothing to switch back to -- POSIX says exec failure
+         * returns to the caller. */
+        vmm_destroy_user_aspace(new_pml4);
+        return LNXRM_ENOEXEC;
+    }
+
+    exec_commit(&a, old_pml4, new_pml4, brk_end);
+    u64 sp = exec_build_stack(&a);
 
     struct intr_frame *f2 = current->tf;
     f2->rip = entry;
@@ -607,26 +690,7 @@ int kernel_spawn(const char *path)
     }
     vfs_close_file(f);
 
-    for (u64 va = USER_STACK_TOP - 0x4000; va < USER_STACK_TOP; va += PAGE_SIZE) {
-        u64 pa = pmm_alloc();
-        if (!pa) {
-            kfree(img);
-            vmm_destroy_user_aspace(t->pml4);
-            kfree(t->kstack);
-            task_free_slot(t);
-            return LNXRM_ENOMEM;
-        }
-        memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
-        if (vmm_map_user(t->pml4, va, pa, true, true, false) < 0) {
-            pmm_free(pa);
-            kfree(img);
-            vmm_destroy_user_aspace(t->pml4);
-            kfree(t->kstack);
-            task_free_slot(t);
-            return LNXRM_ENOMEM;
-        }
-    }
-    if (signal_map_restorer(t->pml4) < 0) {
+    if (user_stack_map(t->pml4) < 0) {
         kfree(img);
         vmm_destroy_user_aspace(t->pml4);
         kfree(t->kstack);
@@ -634,11 +698,14 @@ int kernel_spawn(const char *path)
         return LNXRM_ENOMEM;
     }
 
-    vmm_switch_to(t->pml4);
+    /* elf_load() fills frames through the high-half alias and an explicit
+     * `t->pml4` root, so CR3 need not point there yet -- and must not: this
+     * runs as the idle task, whose own root is master_pml4_phys(), so
+     * switching here would hold CR3 != current->pml4 across the whole load.
+     * The switch moves down to the first direct user-VA store. */
     u64 entry = elf_load(t->pml4, img, sz, (u64 *)&t->brk_base);
     kfree(img);
     if (!entry) {
-        vmm_switch_to(master_pml4_phys());
         vmm_destroy_user_aspace(t->pml4);
         kfree(t->kstack);
         task_free_slot(t);
@@ -647,7 +714,9 @@ int kernel_spawn(const char *path)
 
     /* Initial user stack: path string + argc/argv/NULL words.  Direct
      * user-VA stores, so they need their own SMAP window (this is the
-     * kernel_spawn twin of sys_execve's argv/auxv build below). */
+     * kernel_spawn twin of sys_execve's argv/auxv build below) -- and CR3
+     * has to name the new address space while they run. */
+    vmm_switch_to(t->pml4);
     u64 sp = USER_STACK_TOP - 256;
     u64 ac_sp = smap_enter();
     strcpy((char *)sp, path);

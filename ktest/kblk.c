@@ -1,7 +1,6 @@
 /* The device half of kblk.h.  Raw blkdev, no cache, no injection: this is
  * the lowest layer the parser and mount code see. */
 #include "kblk.h"
-#include <sys/ktest.h>
 #include <mm/mm.h>
 #include <string.h>
 

@@ -150,6 +150,24 @@ static int cache_writeback(int idx)
 }
 
 /* all helpers below assume cache_lock is held */
+
+/* Reserve a slot for a miss: pick the victim, account the eviction and
+ * flush it if it is dirty.  Returns the slot index, or a negative error --
+ * and in the error case the lock has ALREADY been dropped, because the
+ * writeback needed it released, so the caller has nothing left to undo. */
+static int cache_reserve_victim(u64 flags)
+{
+    int idx = cache_find_victim();
+    cache_note_eviction(idx);
+    if (cache[idx].valid && cache[idx].dirty) {
+        int ret = cache_writeback(idx);
+        if (ret != 0) {
+            spin_unlock_irqrestore(&cache_lock, flags);
+            return ret;
+        }
+    }
+    return idx;
+}
 static int cache_flush_locked(struct blkdev *dev)
 {
     int ret = 0;
@@ -186,17 +204,8 @@ int blk_cache_read(struct blkdev *dev, u64 lba, void *buf)
 
     /* Cache miss: need to read from disk */
     bump(&stats.misses);
-    idx = cache_find_victim();
-    cache_note_eviction(idx);
-
-    /* Writeback if victim is dirty */
-    if (cache[idx].valid && cache[idx].dirty) {
-        int ret = cache_writeback(idx);
-        if (ret != 0) {
-            spin_unlock_irqrestore(&cache_lock, flags);
-            return ret;
-        }
-    }
+    idx = cache_reserve_victim(flags);
+    if (idx < 0) return idx;
 
     /* Read from disk into cache entry */
     int ret = blk_io_read(dev, lba, 1, cache[idx].data);
@@ -243,17 +252,8 @@ int blk_cache_write(struct blkdev *dev, u64 lba, const void *buf)
     if (idx < 0) {
         /* Cache miss: need to allocate new entry */
         bump(&stats.misses);
-        idx = cache_find_victim();
-        cache_note_eviction(idx);
-
-        /* Writeback if victim is dirty */
-        if (cache[idx].valid && cache[idx].dirty) {
-            int ret = cache_writeback(idx);
-            if (ret != 0) {
-                spin_unlock_irqrestore(&cache_lock, flags);
-                return ret;
-            }
-        }
+        idx = cache_reserve_victim(flags);
+        if (idx < 0) return idx;
 
         /* Initialize new cache entry */
         cache[idx].lba = lba;

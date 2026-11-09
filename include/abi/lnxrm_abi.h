@@ -62,37 +62,38 @@ enum {
 #undef LNXRM_SYS
 };
 
-/* ---- signals (shared by the kernel's signal code and user handlers) ---- */
-#define LNXRM_SIGHUP  1
-#define LNXRM_SIGINT  2
-#define LNXRM_SIGQUIT 3
-#define LNXRM_SIGILL  4
-#define LNXRM_SIGTRAP 5
-#define LNXRM_SIGABRT 6
-#define LNXRM_SIGBUS  7
-#define LNXRM_SIGFPE  8
-#define LNXRM_SIGKILL 9
-#define LNXRM_SIGUSR1 10
-#define LNXRM_SIGSEGV 11
-#define LNXRM_SIGUSR2 12
-#define LNXRM_SIGPIPE 13
-#define LNXRM_SIGALRM 14
-#define LNXRM_SIGTERM 15
-#define LNXRM_SIGSTKFLT 16
-#define LNXRM_SIGCHLD 17
-#define LNXRM_SIGCONT 18
-#define LNXRM_SIGSTOP 19
-#define LNXRM_SIGTSTP 20
-#define LNXRM_SIGTTIN 21
-#define LNXRM_SIGTTOU 22
-#define LNXRM_SIGURG  23
-#define LNXRM_SIGXCPU 24
-#define LNXRM_SIGXFSZ 25
-#define LNXRM_SIGVTALRM 26
-#define LNXRM_SIGPROF 27
-#define LNXRM_SIGWINCH 28
+/* ---- signals (shared by the kernel's signal code and user handlers) ----
+ *
+ * Numbering is compact: entry i is exactly i, no holes, the same rule
+ * lnxrm_syscalls.def follows.  Only 13 signals exist and every number in
+ * [1, LNXRM_NR_SIGNALS) has a name, so a number the kernel accepts is
+ * always a number somebody can spell -- there is no anonymous band.
+ *
+ * History: this table used to mirror Linux's 1..28 numbering with 15
+ * entries nothing in this tree gave a name to or any behaviour (SIGHUP,
+ * TRAP, USR2, PIPE, ALRM, STKFLT, TSTP, TTIN, TTOU, URG, XCPU, XFSZ,
+ * VTALRM, PROF, WINCH).  Those were dropped and the survivors compacted
+ * (2026-11-07), the same treatment the syscall table got for its three
+ * retired calls.  Like that table: append only from here -- renumbering
+ * would silently retarget every `kill(pid, N)` in a built binary. */
+#define LNXRM_SIGINT  1
+#define LNXRM_SIGQUIT 2
+#define LNXRM_SIGILL  3
+#define LNXRM_SIGABRT 4
+#define LNXRM_SIGBUS  5
+#define LNXRM_SIGFPE  6
+#define LNXRM_SIGKILL 7
+#define LNXRM_SIGUSR1 8
+#define LNXRM_SIGSEGV 9
+#define LNXRM_SIGTERM 10
+#define LNXRM_SIGCHLD 11
+#define LNXRM_SIGCONT 12
+#define LNXRM_SIGSTOP 13
 
-#define LNXRM_NR_SIGNALS 32
+/* One past the last signal.  sig_handlers[]/sig_masks[] are this big
+ * (index 0 goes unused: signal numbers start at 1) and _NSIG on the
+ * kernel side is the exclusive bound every gate compares against. */
+#define LNXRM_NR_SIGNALS 14
 
 /* Unwrapped names: identical to the kernel's, so both sides agree by
  * construction instead of by hand-maintained duplicates. */

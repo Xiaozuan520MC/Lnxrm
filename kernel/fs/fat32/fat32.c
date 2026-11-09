@@ -161,6 +161,18 @@ void fat_chain_advance(struct fat_chain *ch)
     }
 }
 
+int fat_free_chain(struct fat_mount *m, u32 first)
+{
+    struct fat_chain ch;
+    for (fat_chain_start(&ch, m, first); fat_chain_more(&ch);) {
+        u32 clus = ch.clus;
+        fat_chain_advance(&ch); /* next cluster must be read before this one is freed */
+        if (fat_set_entry(m, clus, 0))
+            return LNXRM_EIO; /* already reported; clusters leak, none cross-link */
+    }
+    return 0;
+}
+
 int fat_set_entry(struct fat_mount *m, u32 clus, u32 val)
 {
     if (clus >= m->max_cluster) return LNXRM_EINVAL;
@@ -372,179 +384,230 @@ struct fs_ops fat32_ops = {
 };
 
 /* ---------------- mount ---------------- */
+/* ---- mount, in pieces ----
+ *
+ * fat_mount() was 196 lines of validation in a row, and every rejection
+ * was the same two statements repeated nine times -- kfree(m); return NULL;
+ * -- so each new check was another chance to hand back one of the two
+ * allocations (the mount object, and later the FAT frames) and forget the
+ * other.  The stages below keep their own failures: a stage returns false
+ * with its reason already printed, and fat_reject() does the whole
+ * teardown in one place. */
+
+/* Hand a half-built mount back: the FAT frames first (they exist only
+ * after the page array is up, and fat_pages_free() is a no-op before
+ * that), then the object.  Every rejection in fat_mount() funnels through
+ * here. */
+static void *fat_reject(struct fat_mount *m)
+{
+    fat_pages_free(m);
+    kfree(m);
+    return NULL;
+}
+
+/* C38: a volume is FAT32 only when the BPB itself says so -- the boot
+ * signature, the filesystem type and a power-of-two cluster factor (the
+ * allocation and merge logic divides and masks by it).
+ *
+ * C29: every sector-sized buffer in the driver and the block cache moves
+ * exactly CACHE_SECTOR_SIZE bytes, so anything else is mounted only after
+ * it overflows -- reject here, at the only layer that sees both numbers.
+ * Not a valid FAT32 filesystem either way; both used to be silent, which
+ * is why "no disk" was all the evidence there was. */
+static bool fat_bpb_ok(const u8 *bpb, const struct fat_mount *m,
+                       const struct blkdev *dev)
+{
+    if (bpb[510] != 0x55 || bpb[511] != 0xAA ||
+        memcmp(&bpb[82], "FAT32", 5) != 0 ||
+        !bpb[13] || (bpb[13] & (bpb[13] - 1)) != 0)
+        return false;
+
+    if (m->bytes_per_sector != dev->sector_size ||
+        m->bytes_per_sector != CACHE_SECTOR_SIZE ||
+        !m->sectors_per_cluster || !m->fatsz || !m->reserved_sectors ||
+        (m->num_fats != 1 && m->num_fats != 2) || m->root_cluster < 2 ||
+        (*(u16 *)&bpb[22] && bpb[13]))
+        return false;
+
+    return true;
+}
+
+/* Volume geometry from the BPB: totsec clamped to the real device, the
+ * data-region start, the cluster range -- with every "this BPB is a lie"
+ * rejection attached to the number that exposed it.  Returns false with
+ * the reason printed where there is one to print.  *totsec_out carries the
+ * clamped size back for the mount banner, which reports the VOLUME's size
+ * (a BPB that lies about it is already refused by the checks above). */
+static bool fat_layout(struct fat_mount *m, struct blkdev *dev, const u8 *bpb,
+                       u32 *totsec_out)
+{
+    u32 totsec16 = *(u16 *)&bpb[19];
+    u32 totsec32 = *(u32 *)&bpb[32];
+    u32 totsec = totsec16 ? totsec16 : totsec32;
+    u16 rootents = *(u16 *)&bpb[17];
+
+    /* totsec must not exceed the real device; a forged BPB could make
+     * cluster->LBA math run off the end of the disk. */
+    if (totsec && dev->num_sectors && totsec > dev->num_sectors)
+        totsec = (u32)dev->num_sectors;
+
+    u64 data_start = m->reserved_sectors +
+                     (u64)m->num_fats * m->fatsz +
+                     (rootents * 32 + m->bytes_per_sector - 1) /
+                         m->bytes_per_sector;
+    if (data_start >= totsec) return false;
+    m->data_start_lba = data_start;
+    m->max_cluster = totsec > data_start
+                         ? (totsec - data_start) / m->sectors_per_cluster + 2
+                         : 2;
+    m->cluster_size = m->bytes_per_sector * m->sectors_per_cluster;
+
+    /* C32: FAT entry arithmetic in 64 bits.  fatsz * bytes_per_sector
+     * overflows a 32-bit product long before either field does, and the old
+     * u32 `fat_entries` then clamped every volume whose FAT crossed 4 GiB to
+     * half its true size.  FAT32's own cluster count stops at 2^28-11, so
+     * anything leaning on a bigger table is not a FAT32 volume even if the
+     * BPB says so -- refuse it here, with a reason, instead of dying later
+     * on a kmalloc the log cannot explain. */
+    u64 fat_entries = (u64)m->fatsz * m->bytes_per_sector / 4;
+    if (fat_entries > (1u << 28)) {
+        kprintf("[fat32] reject %s: FAT too large, %llu entries is not a "
+                "FAT32 volume (cap 2^28)\n",
+                dev->name, fat_entries);
+        return false;
+    }
+
+    /* CRITICAL: clamp the cluster range to what the FAT table can hold.
+     * Without this, chain walks / allocation scans read & WRITE past the end
+     * of the cached FAT heap buffer, corrupting neighbouring objects (this
+     * was the source of the "mystery" function-pointer corruption).
+     * C33: the bound is exclusive -- cluster N lives in FAT cell N, so cells
+     * 0..fat_entries-1 make every cluster < fat_entries addressable,
+     * including the very last cell.  The old `fat_entries - 1` left the
+     * final cell of every volume permanently unreachable. */
+    if ((u64)m->max_cluster > fat_entries)
+        m->max_cluster = fat_entries ? (u32)fat_entries : 2;
+
+    /* The root directory cluster is turned into an LBA before any chain
+     * walk could object to it, so a BPB that names a cluster past the end
+     * of the volume must kill the mount here. */
+    if (m->root_cluster >= m->max_cluster) {
+        kprintf("[fat32] reject %s: root cluster %u outside volume "
+                "(data clusters 2..%u)\n",
+                dev->name, m->root_cluster, m->max_cluster - 1);
+        return false;
+    }
+
+    *totsec_out = totsec;
+    return true;
+}
+
+/* The whole FAT is loaded into RAM up front, frame by frame (see the
+ * paged allocation below).  On the 64 MiB test image that is a couple of
+ * hundred kilobytes and invisible; on a real volume it is proportional to
+ * the partition size.  Say how much before starting, otherwise the log
+ * stops at "trying FAT32" and a machine that is merely busy looks wedged.
+ *
+ * Paged FAT: one order-0 frame per PAGE_SIZE of table, so no single
+ * allocation has to be contiguous across the whole FAT (an 8 MiB table used
+ * to fail every kmalloc above the buddy's biggest block).  The page array
+ * itself is tiny -- fat_npages pointers -- and each frame is one
+ * pmm_alloc()ed block.  A partial fill is left for fat_reject() to unwind:
+ * fat_pages_free() skips the slots that are still NULL. */
+static bool fat_fat_alloc(struct fat_mount *m)
+{
+    m->fat_bytes = (u64)m->fatsz * m->bytes_per_sector;
+    kprintf("[fat32] %s: loading FAT, %llu sectors (%llu MiB)\n", m->dev->name,
+            (u64)m->fatsz, m->fat_bytes >> 20);
+
+    m->fat_npages = (u32)((m->fat_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    m->fat_pages = kmalloc((size_t)m->fat_npages * sizeof(u8 *));
+    if (!m->fat_pages) {
+        kprintf("[fat32] reject %s: no memory for %u FAT frames\n",
+                m->dev->name, m->fat_npages);
+        return false;
+    }
+    memset(m->fat_pages, 0, (size_t)m->fat_npages * sizeof(u8 *));
+
+    for (u32 i = 0; i < m->fat_npages; i++) {
+        u64 pa = pmm_alloc();
+        if (!pa) {
+            kprintf("[fat32] reject %s: out of memory at FAT frame %u/%u\n",
+                    m->dev->name, i, m->fat_npages);
+            return false;
+        }
+        m->fat_pages[i] = (u8 *)PHYS_TO_VIRT(pa);
+    }
+    return true;
+}
+
+/* Fill the frames through one contiguous bounce buffer per read, sized to
+ * the block driver's max transfer (256 sectors = 128 KiB), so the command
+ * count matches the old whole-FAT read -- going frame by frame would cost
+ * one non-NCQ round trip (200 us-1 ms) per 4 KiB on real hardware, i.e.
+ * minutes for a large table.  Every sector divides PAGE_SIZE, so each lands
+ * wholly inside one frame and the scatter is a plain per-sector copy. */
+static bool fat_fat_read(struct fat_mount *m)
+{
+    u32 chunk = 256; /* sectors per bounce read */
+    u8 *bounce = kmalloc((size_t)chunk * m->bytes_per_sector);
+    if (!bounce) {
+        kprintf("[fat32] reject %s: no memory for FAT read bounce\n",
+                m->dev->name);
+        return false;
+    }
+
+    u32 done = 0;
+    int rc = 0;
+    while (done < m->fatsz && !rc) {
+        u32 n = m->fatsz - done;
+        if (n > chunk) n = chunk;
+        rc = blk_io_read(m->dev, m->reserved_sectors + done, n, bounce);
+        if (rc) break;
+        for (u32 s = 0; s < n; s++) {
+            u64 off = (u64)(done + s) * m->bytes_per_sector;
+            memcpy(fat_sector_ptr(m, off),
+                   bounce + (size_t)s * m->bytes_per_sector,
+                   m->bytes_per_sector);
+        }
+        done += n;
+    }
+    kfree(bounce);
+
+    if (rc) {
+        kprintf("[fat32] reject %s: FAT read failed at sector %u/%u\n",
+                m->dev->name, done, m->fatsz);
+        return false;
+    }
+    return true;
+}
+
 void *fat_mount(struct blkdev *dev)
 {
     u8 bpb[512];
+    u32 totsec = 0;
     if (blk_io_read(dev, 0, 1, bpb)) return NULL;
 
     struct fat_mount *m = kmalloc(sizeof(*m));
     if (!m) return NULL; /* T-004: mount reports failure, it does not die */
     memset(m, 0, sizeof(*m));
     m->dev = dev;
+
+    /* BPB fields, straight off sector 0.  fatsz and totsec each come in a
+     * 16-bit and a 32-bit flavour; the 32-bit one only counts when the
+     * 16-bit one says 0, which is FAT's own rule. */
     m->bytes_per_sector = *(u16 *)&bpb[11];
     m->sectors_per_cluster = bpb[13];
     m->reserved_sectors = *(u16 *)&bpb[14];
     m->num_fats = bpb[16];
     u32 fatsz16 = *(u16 *)&bpb[22];
-    u32 fatsz32 = *(u32 *)&bpb[36];
-    m->fatsz = fatsz16 ? fatsz16 : fatsz32;
+    m->fatsz = fatsz16 ? fatsz16 : *(u32 *)&bpb[36];
     m->root_cluster = *(u32 *)&bpb[44];
-    u32 totsec16 = *(u16 *)&bpb[19];
-    u32 totsec32 = *(u32 *)&bpb[32];
-    u32 totsec = totsec16 ? totsec16 : totsec32;
 
-    /* C38: a volume is FAT32 only when the BPB itself says so -- the boot
-     * signature, the filesystem type and a power-of-two cluster factor
-     * (the allocation and merge logic below divides and masks by it). */
-    if (bpb[510] != 0x55 || bpb[511] != 0xAA ||
-        memcmp(&bpb[82], "FAT32", 5) != 0 ||
-        !bpb[13] || (bpb[13] & (bpb[13] - 1)) != 0) {
-        kfree(m);
-        return NULL;
-    }
-
-    /* C29: every sector-sized buffer in the driver and the block cache
-     * moves exactly CACHE_SECTOR_SIZE bytes, so anything else is mounted
-     * only after it overflows -- reject here, at the only layer that sees
-     * both numbers. */
-    if (m->bytes_per_sector != dev->sector_size ||
-        m->bytes_per_sector != CACHE_SECTOR_SIZE ||
-        !m->sectors_per_cluster || !m->fatsz || !m->reserved_sectors ||
-        (m->num_fats != 1 && m->num_fats != 2) || m->root_cluster < 2 ||
-        (*(u16 *)&bpb[22] && bpb[13])) {
-        /* Not a valid FAT32 filesystem */
-        kfree(m);
-        return NULL;
-    }
-    u16 rootents = *(u16 *)&bpb[17];
-
-    /* totsec must not exceed the real device; a forged BPB could make
-     * cluster->LBA math run off the end of the disk. */
-    if (totsec && dev->num_sectors && totsec > dev->num_sectors) totsec = (u32)dev->num_sectors;
-
-    u32 fat_start = m->reserved_sectors;
-    u64 data_start = fat_start + (u64)m->num_fats * m->fatsz +
-                     (rootents * 32 + m->bytes_per_sector - 1) / m->bytes_per_sector;
-    if (data_start >= totsec) {
-        kfree(m);
-        return NULL;
-    }
-    m->data_start_lba = data_start;
-    m->max_cluster = totsec > data_start ? (totsec - data_start) / m->sectors_per_cluster + 2 : 2;
-    m->cluster_size = m->bytes_per_sector * m->sectors_per_cluster;
-
-    /* C32: FAT entry arithmetic in 64 bits.  fatsz * bytes_per_sector
-     * overflows a 32-bit product long before either field does, and the
-     * old u32 `fat_entries` then clamped every volume whose FAT crossed
-     * 4 GiB to half its true size.  FAT32's own cluster count stops at
-     * 2^28-11, so anything leaning on a bigger table is not a FAT32
-     * volume even if the BPB says so -- refuse it here, with a reason,
-     * instead of dying later on a kmalloc the log cannot explain. */
-    u64 fat_entries = (u64)m->fatsz * m->bytes_per_sector / 4;
-    if (fat_entries > (1u << 28)) {
-        kprintf("[fat32] reject %s: FAT too large, %llu entries is not a "
-                "FAT32 volume (cap 2^28)\n",
-                dev->name, fat_entries);
-        kfree(m);
-        return NULL;
-    }
-
-    /* CRITICAL: clamp the cluster range to what the FAT table can hold.
-     * Without this, chain walks / allocation scans read & WRITE past the
-     * end of the cached FAT heap buffer, corrupting neighbouring objects
-     * (this was the source of the "mystery" function-pointer corruption). */
-    /* C33: the bound is exclusive -- cluster N lives in FAT cell N, so
-     * cells 0..fat_entries-1 make every cluster < fat_entries addressable,
-     * including the very last cell.  The old `fat_entries - 1` left the
-     * final cell of every volume permanently unreachable. */
-    if ((u64)m->max_cluster > fat_entries)
-        m->max_cluster = fat_entries ? (u32)fat_entries : 2;
-
-    /* The root directory cluster is turned into an LBA before any chain walk
-     * could object to it, so a BPB that names a cluster past the end of the
-     * volume must kill the mount here. */
-    if (m->root_cluster >= m->max_cluster) {
-        kprintf("[fat32] reject %s: root cluster %u outside volume "
-                "(data clusters 2..%u)\n",
-                dev->name, m->root_cluster, m->max_cluster - 1);
-        kfree(m);
-        return NULL;
-    }
-
-    m->fat_bytes = (u64)m->fatsz * m->bytes_per_sector;
-    /* The whole FAT is loaded into RAM up front, frame by frame (see the
-     * paged allocation below).  On the 64 MiB test image that is a couple of
-     * hundred kilobytes and invisible; on a real volume it is proportional
-     * to the partition size.  Say how much before starting, otherwise the log
-     * stops at "trying FAT32" and a machine that is merely busy looks wedged. */
-    kprintf("[fat32] %s: loading FAT, %llu sectors (%llu MiB)\n", dev->name, (u64)m->fatsz,
-            m->fat_bytes >> 20);
-    /* Paged FAT: one order-0 frame per PAGE_SIZE of table, so no single
-     * allocation has to be contiguous across the whole FAT (an 8 MiB table
-     * used to fail every kmalloc above the buddy's biggest block).  The page
-     * array itself is tiny -- fat_npages pointers -- and each frame is one
-     * pmm_alloc()ed block. */
-    m->fat_npages = (u32)((m->fat_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
-    m->fat_pages = kmalloc((size_t)m->fat_npages * sizeof(u8 *));
-    if (!m->fat_pages) {
-        kprintf("[fat32] reject %s: no memory for %u FAT frames\n", dev->name,
-                m->fat_npages);
-        kfree(m);
-        return NULL;
-    }
-    memset(m->fat_pages, 0, (size_t)m->fat_npages * sizeof(u8 *));
-    for (u32 i = 0; i < m->fat_npages; i++) {
-        u64 pa = pmm_alloc();
-        if (!pa) {
-            kprintf("[fat32] reject %s: out of memory at FAT frame %u/%u\n",
-                    dev->name, i, m->fat_npages);
-            fat_pages_free(m);
-            kfree(m);
-            return NULL;
-        }
-        m->fat_pages[i] = (u8 *)PHYS_TO_VIRT(pa);
-    }
-    /* Fill the frames through one contiguous bounce buffer per read, sized
-     * to the block driver's max transfer (256 sectors = 128 KiB), so the
-     * command count matches the old whole-FAT read -- going frame by frame
-     * would cost one non-NCQ round trip (200 us-1 ms) per 4 KiB on real
-     * hardware, i.e. minutes for a large table.  Every sector divides
-     * PAGE_SIZE, so each lands wholly inside one frame and the scatter is a
-     * plain per-sector copy. */
-    {
-        u32 chunk = 256; /* sectors per bounce read */
-        u8 *bounce = kmalloc((size_t)chunk * m->bytes_per_sector);
-        if (!bounce) {
-            kprintf("[fat32] reject %s: no memory for FAT read bounce\n",
-                    dev->name);
-            fat_pages_free(m);
-            kfree(m);
-            return NULL;
-        }
-        u32 done = 0;
-        int rc = 0;
-        while (done < m->fatsz && !rc) {
-            u32 n = m->fatsz - done;
-            if (n > chunk) n = chunk;
-            rc = blk_io_read(dev, fat_start + done, n, bounce);
-            if (rc) break;
-            for (u32 s = 0; s < n; s++) {
-                u64 off = (u64)(done + s) * m->bytes_per_sector;
-                memcpy(fat_sector_ptr(m, off),
-                       bounce + (size_t)s * m->bytes_per_sector,
-                       m->bytes_per_sector);
-            }
-            done += n;
-        }
-        kfree(bounce);
-        if (rc) {
-            kprintf("[fat32] reject %s: FAT read failed at sector %u/%u\n",
-                    dev->name, done, m->fatsz);
-            fat_pages_free(m);
-            kfree(m);
-            return NULL;
-        }
-    }
+    if (!fat_bpb_ok(bpb, m, dev)) return fat_reject(m);
+    if (!fat_layout(m, dev, bpb, &totsec)) return fat_reject(m);
+    if (!fat_fat_alloc(m)) return fat_reject(m);
+    if (!fat_fat_read(m)) return fat_reject(m);
 
     /* Lay out the journal in the unused reserved sectors and roll forward
      * any transaction the last session committed but did not get to apply.
@@ -554,17 +617,16 @@ void *fat_mount(struct blkdev *dev)
      * before anything can look at either. */
     fat_journal_mount(m);
 
-    kprintf("[fat32] mounted %s: %u MiB, %u B/sector x %u/cluster, "
-            "root=%u\n",
-            dev->name, totsec * m->bytes_per_sector >> 20, m->bytes_per_sector,
-            m->sectors_per_cluster, m->root_cluster);
+    kprintf("[fat32] mounted %s: %u MiB, %u B/sector x %u/cluster, root=%u\n",
+            dev->name, totsec * m->bytes_per_sector >> 20,
+            m->bytes_per_sector, m->sectors_per_cluster, m->root_cluster);
 
     /* C51: only the first mount claims fat_priv.  The VFS can now place a
      * second volume (a data disk at /mnt...), and letting each one take this
-     * over would repoint every caller that works through fat_priv -- the
-     * boot self-tests above all -- at a volume that is not the root.  The
-     * volume that takes "/" sets it explicitly instead (vfs.c), so probe
-     * order alone never decides which volume "the active one" means. */
+     * over would repoint every caller that works through fat_priv -- the boot
+     * self-tests above all -- at a volume that is not the root.  The volume
+     * that takes "/" sets it explicitly instead (vfs.c), so probe order
+     * alone never decides which volume "the active one" means. */
     if (!fat_priv) fat_priv = m;
     return m;
 }

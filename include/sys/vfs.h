@@ -163,6 +163,19 @@ static inline u64 ata_total_sectors(const u16 *id)
     return l28;
 }
 
+/* ATA IDENTIFY words 27-46: the model name, 20 words byte-swapped into 40
+ * characters and NUL-terminated in `out[41]`.  The AHCI and IDE probes both
+ * print exactly this line, so they share the decode rather than each keeping
+ * its own copy of the byte order. */
+static inline void ata_model_string(const u16 *id, char out[41])
+{
+    for (int i = 0; i < 20; i++) {
+        out[i * 2] = (char)(id[27 + i] >> 8);
+        out[i * 2 + 1] = (char)(id[27 + i] & 0xFF);
+    }
+    out[40] = 0;
+}
+
 /* block devices (drivers/ide.c + drivers/ahci.c register; fs/fat32.c consumes) */
 struct blkdev {
     const char *name;

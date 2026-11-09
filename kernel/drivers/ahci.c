@@ -877,7 +877,381 @@ static void ahciPortReclaim(volatile u8 *px, struct AhciPort *port, int pnum, bo
     kfree(port);
 }
 
-static int ahciProbe(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid, u8 class_)
+/* ---- one port's probe, in pieces ----
+ *
+ * ahciProbe() used to be a 334-line loop body with nine different "port
+ * skipped" exits, each repeating the subset of dmaFree()/kfree()/reclaim
+ * that happened to exist at that point -- a ladder where every new exit
+ * path is another chance to leak the buffer the previous stage had just
+ * allocated.  Everything a port acquires now lives in one struct and is
+ * handed back by one function, so a stage only has to say "no" and the
+ * single exit does the accounting. */
+struct ahci_port_res {
+    volatile u8 *px;       /* this port's register block */
+    int p;                 /* port number, for the messages */
+    CmdHdr *clb;
+    void *fis;
+    CmdTbl *ct;
+    struct AhciPort *port; /* NULL until the object exists */
+    u16 *ident;            /* NULL until IDENTIFY is allocated */
+    struct blkdev *bd;     /* NULL once blk_register owns it */
+    bool started;          /* portStart succeeded: stop before freeing */
+    bool keep;             /* published: port and its DMA buffers stay */
+};
+
+/* The one exit for the whole probe.  ident is ours even on success (the
+ * old code freed it there too); bd is set only while nobody else owns it,
+ * so a refusal to publish is the one place it still gets freed; and keep
+ * suppresses the reclaim only after the device is registered -- from then
+ * on the registry owns the port object and the buffers the HBA fetches
+ * from.  With no port object yet the three DMA buffers are the whole
+ * estate, and dmaFree() takes NULL for whichever ones were never handed
+ * out. */
+static void ahciPortRelease(struct ahci_port_res *r)
+{
+    dmaFree(r->ident);
+    if (r->bd) kfree(r->bd);
+    if (r->keep) return;
+    if (r->port) {
+        ahciPortReclaim(r->px, r->port, r->p, r->started);
+        return;
+    }
+    dmaFree(r->clb);
+    dmaFree(r->fis);
+    dmaFree(r->ct);
+}
+
+/* ABAR's register set runs 0x0000..0x10FF: the 0x100-byte generic header
+ * followed by one 0x80-byte block per implemented port, up to 32 ports.
+ * That is 0x1100 bytes -- past the first page, so mapping a single 4 KiB
+ * page left every port register beyond offset 0xF00 reading whatever the
+ * next page table entry happened to hold.  Also: PG_PCD alone selects
+ * PAT[2] = UC-, which inherits the firmware's MTRRs (see mm.h); a
+ * doorbell write that lands in the cache instead of on the bus is the
+ * classic way an HBA hangs, so ask for UC outright. */
+static volatile u8 *ahciMapBar(u64 abar)
+{
+    u64 abar0 = abar & ~4095UL;
+    vmm_map_kernel_page(DEV_VMA_BASE, abar0, PG_PCD | PG_PWT);
+    vmm_map_kernel_page(DEV_VMA_BASE + PAGE_SIZE, abar0 + PAGE_SIZE,
+                        PG_PCD | PG_PWT);
+    return (volatile u8 *)(DEV_VMA_BASE + (abar & 4095));
+}
+
+static void ahciHbaReset(volatile u8 *mmio)
+{
+    if (!(*(volatile u32 *)(mmio + AHCI_GHC) & GHC_HR)) return;
+    *(volatile u32 *)(mmio + AHCI_GHC) = GHC_HR;
+    for (int i = 0; i < 1000000; i++) {
+        if (!(*(volatile u32 *)(mmio + AHCI_GHC) & GHC_HR)) break;
+        __asm__ volatile("pause");
+    }
+}
+
+/* Wait for the link instead of sampling it once.  SATA link training is
+ * not instantaneous: PxSSTS.DET reads 1 (device detected, PHY not ready)
+ * while the device negotiates, and only becomes 3 once communication is
+ * established.  QEMU reports 3 immediately, so the old single sample
+ * passed every test while being able to silently drop a real disk that
+ * was still coming up -- and the symptom is indistinguishable from "no
+ * disk": nothing else probes this port and vfs gives up.  Only DET==1 is
+ * waited on; 0 (nothing attached) and 4 (PHY failure) are settled answers,
+ * so the empty ports that make up most of the 32 cost nothing.
+ *
+ * Says it for EVERY unattached port, not just DET==1: DET==0 (link down --
+ * needs a COMRESET this driver does not send) and DET==4 (PHY failure) used
+ * to be skipped in total silence, so on the real machine that first failed
+ * here "no disk" and "the disk's port never came up" produced
+ * byte-identical logs. */
+static u32 ahciWaitLink(volatile u8 *px, int p)
+{
+    u32 ssts = pxRd(px, P_SSTS);
+    if ((ssts & 0xF) == 1) {
+        u64 dl = deadlineMs(AHCI_LINK_TIMEOUT_MS);
+        for (;;) {
+            ssts = pxRd(px, P_SSTS);
+            if ((ssts & 0xF) != 1) break;
+            if (overdue(dl)) break;
+            __asm__ volatile("pause");
+        }
+    }
+    if ((ssts & 0xF) != 3)
+        kprintf("[ahci] port %d: no device (SSTS=%08x DET=%u)%s\n", p, ssts,
+                ssts & 0xF,
+                (ssts & 0xF) == 1 ? " -- link never established" : "");
+    return ssts;
+}
+
+/* Allocate the port's DMA structures before the port object: an
+ * allocation failure must skip *this* port, not take the machine with it
+ * (T-004 -- and AHCI is optional, IDE still boots).  These are DMA
+ * buffers, so they come from the buddy, not kmalloc(): the HBA's alignment
+ * rules (1 KiB / 256 B / 128 B) cannot be met by a block that starts 8
+ * bytes in. */
+static int ahciPortAlloc(struct ahci_port_res *r)
+{
+    r->clb = (CmdHdr *)dmaAlloc();
+    r->fis = dmaAlloc();
+    r->ct = (CmdTbl *)dmaAlloc();
+    if (!r->clb || !r->fis || !r->ct) {
+        kprintf("[ahci] port %d: out of memory, port skipped\n", r->p);
+        return -1;
+    }
+    /* The .cpp original used `new` here, which routed to kmalloc_or_panic
+     * -- i.e. it panicked on OOM, in a function whose own comment two
+     * paragraphs up says an allocation failure must skip *this* port and
+     * not take the machine with it (T-004).  kmalloc() + a NULL check
+     * makes the code do what that comment promises; the .cpp had the
+     * principle and the panic side by side. */
+    r->port = (struct AhciPort *)kmalloc(sizeof(*r->port));
+    if (!r->port) {
+        kprintf("[ahci] port %d: out of memory for port object, port skipped\n",
+                r->p);
+        return -1;
+    }
+    r->port->mmio = r->px;
+    r->port->clb = r->clb;
+    r->port->fis = r->fis;
+    r->port->ct = r->ct;
+    memset(r->port->clb, 0, 1024);
+    memset(r->port->fis, 0, 256);
+    memset(r->port->ct, 0, 4096);
+    /* these are the frames the HBA will fetch from -- make sure nothing
+     * of ours is still sitting in a cache line when the doorbell rings */
+    dmaCoherent(r->port->clb, 1024);
+    dmaCoherent(r->port->fis, 256);
+    dmaCoherent(r->port->ct, 4096);
+    return 0;
+}
+
+/* Stop the port, program its command list and FIS addresses, read them
+ * back, start it.  AHCI sequences the stop -- ST first, wait for CR, then
+ * FRE, wait for FR -- because PxCLB/PxFB may only be written while the port
+ * is stopped.  Clearing both bits at once and then ignoring the result
+ * (what this driver did) means a port whose FRE write has not taken yet
+ * gets its addresses changed underneath a running engine.  QEMU stores the
+ * CLB write unconditionally and clears CR/FR the instant the bits go, so
+ * the sloppy order is invisible there.  On a real HBA the write is
+ * dropped, the port keeps fetching command headers from the address the
+ * firmware left behind, and every doorbell is answered "command complete"
+ * with no data moved -- which is exactly how an 8 GB disk came up
+ * registered as 0xCCCCCCCCCCCCCCCC sectors. */
+static int ahciPortProgram(struct ahci_port_res *r)
+{
+    volatile u8 *px = r->px;
+    int p = r->p;
+
+    if (ahciPortStop(px)) {
+        kprintf("[ahci] port %d: engine would not stop (CMD=%08x), port skipped\n",
+                p, pxRd(px, P_CMD));
+        /* ours never became the command list the HBA fetches from (PxCLB is
+         * still whatever the firmware left there), so it is safe */
+        return -1;
+    }
+
+    /* PxSCTL may still hold whatever the firmware or an Option ROM left in
+     * it -- including a forced DET value, which would pin the PHY in a
+     * state the link wait above can neither clear nor explain.  Only the
+     * DET sub-field is a "write to change" control, and 0 means "no forced
+     * state", so this is safe while the port is stopped. */
+    pxWr(px, 0x2C /* PxSCTL */, 0);
+
+    u64 clbPa = VIRT_TO_PHYS((uptr)r->port->clb);
+    u64 fisPa = VIRT_TO_PHYS((uptr)r->port->fis);
+    pxWr(px, P_CLB, (u32)clbPa);
+    pxWr(px, P_CLBU, (u32)(clbPa >> 32));
+    pxWr(px, P_FB, (u32)fisPa);
+    pxWr(px, P_FBU, (u32)(fisPa >> 32));
+
+    /* Read the addresses back.  A write the HBA refused lands nowhere and
+     * reports nothing -- the doorbell still rings and the port still
+     * answers, against someone else's command list.  This is the one place
+     * where "did the setup actually happen" is knowable before trusting
+     * every later command to it. */
+    if (pxRd(px, P_CLB) != (u32)clbPa || pxRd(px, P_FB) != (u32)fisPa) {
+        kprintf("[ahci] port %d: PxCLB/PxFB readback mismatch "
+                "(got %08x/%08x want %08x/%08x), port skipped\n",
+                p, pxRd(px, P_CLB), pxRd(px, P_FB), (u32)clbPa, (u32)fisPa);
+        return -1;
+    }
+
+    if (portStart(px)) {
+        kprintf("[ahci] port %d: failed to start\n", p);
+        return -1;
+    }
+    r->started = true; /* from here on release must stop the engine first */
+    return 0;
+}
+
+/* IDENTIFY DEVICE -- reached only through ahciProbePort(), which has
+ * already proven the DMA and PIO paths with a real 512-byte transfer.
+ * A DMA allocation rather than a stack array: the destination address is
+ * the one value this driver must get right by construction, not by luck of
+ * where the stack happened to land, and pmm is the allocator that can
+ * promise where the physical page is.
+ *
+ * On success `model` and *sectors_out are filled; on failure the caller
+ * just releases -- ident is already recorded in the resource struct. */
+static int ahciPortIdentify(struct ahci_port_res *r, char model[41],
+                            u64 *sectors_out)
+{
+    volatile u8 *px = r->px;
+    int p = r->p;
+
+    r->ident = (u16 *)dmaAlloc();
+    if (!r->ident) {
+        kprintf("[ahci] port %d: no DMA memory for IDENTIFY\n", p);
+        return -1;
+    }
+    memset(r->ident, 0xCC, 512);
+
+    int verdict = ahciProbePort(px, r->port, p, r->ident);
+    if (verdict) {
+        /* -2: the port stopped answering, which says more than "no
+         * protocol worked" -- and it is the case that used to cost six
+         * full command timeouts in a row. */
+        kprintf("[ahci] port %d: %s, port skipped\n", p,
+                verdict == -2 ? "device does not respond"
+                              : "no usable ATA protocol");
+        return -1;
+    }
+
+    /* The port reported success and the buffer is still the 0xCC we seeded
+     * it with, byte for byte -- nothing was ever written to it.  This is
+     * not hypothetical: it is exactly what real hardware showed, an 8 GB
+     * disk registered as 14757395258967641292 sectors
+     * (0xCCCCCCCCCCCCCCCC, the prefill pattern) with an empty model,
+     * because CI cleared without a single byte of IDENTIFY data arriving.
+     * Refuse it here rather than hand a fabricated capacity to every
+     * bounds check downstream that trusts it -- and say so, since "the
+     * disk did not mount" is otherwise all the evidence there is. */
+    bool untouched = true;
+    for (u32 i = 0; i < 512; i++)
+        if (((const u8 *)r->ident)[i] != 0xCC) {
+            untouched = false;
+            break;
+        }
+    if (untouched) {
+        kprintf("[ahci] port %d: IDENTIFY completed but transferred no data\n", p);
+        ahciDumpPort(px, 0, "IDENTIFY returned nothing");
+        return -1;
+    }
+
+    /* Capacity comes from words 60-61 (28-bit), with words 100-103 as the
+     * 48-bit answer -- see ata_total_sectors().  The old code fell back to
+     * words 100-103 only when words 60-61 were *zero*, but ATA's marker
+     * for "use the 48-bit field" is FFFFFFFFh, so the one value that meant
+     * 2097151 on the console was exactly the one that never fell back. */
+    u64 sectors = ata_total_sectors(r->ident);
+    ata_model_string(r->ident, model);
+
+    if (!sectors) {
+        /* Do not register a device whose size we could not read: a made-up
+         * capacity is worse than no disk, because every bounds check
+         * downstream trusts it. */
+        kprintf("[ahci] port %d: %.40s, capacity unknown -- port skipped\n",
+                p, model);
+        return -1;
+    }
+    *sectors_out = sectors;
+    return 0;
+}
+
+/* Name it, fill it in, publish it.  Returns the registered device, or
+ * NULL with r->bd still set so the release frees it -- every refusal here
+ * is "nothing was published", which is exactly the state the resource
+ * struct encodes. */
+static struct blkdev *ahciPortPublish(struct ahci_port_res *r, u64 sectors)
+{
+    int p = r->p;
+
+    /* Same T-004 call as the port object: OOM here must not panic a
+     * machine whose disk is otherwise fine -- reclaim this port
+     * completely and register nothing (nothing leaks, nothing panics). */
+    struct blkdev *bd = (struct blkdev *)kmalloc(sizeof(*bd));
+    if (!bd) {
+        kprintf("[ahci] port %d: out of memory for blkdev, port skipped\n", p);
+        return NULL;
+    }
+    r->bd = bd; /* the release frees it until the registry takes it */
+
+    /* C51: every port that answers is a disk, not just the first one.  The
+     * old `return 1` after the first registration made "sda" the only name
+     * any AHCI port could ever have, so a second disk was invisible to
+     * diskinfo, to the mount probe and to every bound check downstream --
+     * and it stopped the probe from looking at the ports behind it.  Names
+     * are generated here because the registry stores the pointer (C28):
+     * they have to outlive the probe. */
+    if (sd_n >= (int)(sizeof(sd_names) / sizeof(sd_names[0]))) {
+        kprintf("[ahci] port %d: device-name table full, port skipped\n", p);
+        return NULL;
+    }
+    char *nm = sd_names[sd_n];
+    nm[0] = 's';
+    nm[1] = 'd';
+    nm[2] = (char)('a' + sd_n);
+    nm[3] = 0;
+
+    bd->name = nm;
+    bd->sector_size = 512;
+    bd->num_sectors = sectors;
+    bd->read = ahciBlkRead;
+    bd->write = ahciBlkWrite;
+    bd->drv = r->port;
+    /* C28: a refusal means nobody owns this object -- and the port with it,
+     * since it was never published either. */
+    if (blk_register(bd) != 0) {
+        kprintf("[ahci] port %d: block table full, %s not published\n", p, nm);
+        return NULL;
+    }
+    r->bd = NULL; /* the registry owns it now, not we */
+    sd_n++;
+
+    /* C49, last: arm this port's interrupts.  Done only now -- PxIM is what
+     * lets PxIS reach GHC.IE, and until the device is registered there is no
+     * handler side of it: an interrupt raised over an unarmed port would sit
+     * on a level-triggered line forever.  PxIS is cleared first so the
+     * arming itself cannot count as a completion. */
+    if (ahci_irq_line >= 0) {
+        pxWr(r->px, P_IS, ~0u);
+        pxWr(r->px, P_IM, 0xFFFFFFFFu);
+        irq_ports[irq_port_n++] = r->port;
+        if (!irq_bd) irq_bd = bd;
+    }
+    return bd;
+}
+
+/* One port, from link to registration, with a single exit. */
+static void ahciPortBringup(volatile u8 *mmio, int p)
+{
+    struct ahci_port_res r = {0};
+    char model[41] = {0};
+    u64 sectors = 0;
+    struct blkdev *bd = NULL;
+
+    r.px = mmio + 0x100 + p * 0x80;
+    r.p = p;
+
+    u32 ssts = ahciWaitLink(r.px, p);
+    if ((ssts & 0xF) != 3) goto out;
+    kprintf("[ahci] port %d: device present (SSTS=%08x)\n", p, ssts);
+
+    if (ahciPortAlloc(&r)) goto out;
+    if (ahciPortProgram(&r)) goto out;
+    if (ahciPortIdentify(&r, model, &sectors)) goto out;
+
+    bd = ahciPortPublish(&r, sectors);
+    if (!bd) goto out;
+    r.keep = true;
+
+    kprintf("[ahci] %s: %.40s, %llu sectors (%llu MiB)\n", bd->name, model,
+            sectors, sectors / 2048);
+out:
+    ahciPortRelease(&r);
+}
+
+static int ahciProbe(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid,
+                     u8 class_)
 {
     (void)ctx;
     if (class_ != 1) return 0;
@@ -900,31 +1274,11 @@ static int ahciProbe(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid, u8
     u32 bar5hi = pci_read(bus, dev, fn, 0x28);
     u64 abar = ((u64)bar5hi << 32) | (bar5lo & ~0xFUL);
 
-    /* ABAR's register set runs 0x0000..0x10FF: the 0x100-byte generic header
-     * followed by one 0x80-byte block per implemented port, up to 32 ports.
-     * That is 0x1100 bytes -- past the first page, so mapping a single 4 KiB
-     * page left every port register beyond offset 0xF00 reading whatever the
-     * next page table entry happened to hold.  Also: PG_PCD alone selects
-     * PAT[2] = UC-, which inherits the firmware's MTRRs (see mm.h); a
-     * doorbell write that lands in the cache instead of on the bus is the
-     * classic way an HBA hangs, so ask for UC outright. */
-    u64 abar0 = abar & ~4095UL;
-    vmm_map_kernel_page(DEV_VMA_BASE, abar0, PG_PCD | PG_PWT);
-    vmm_map_kernel_page(DEV_VMA_BASE + PAGE_SIZE, abar0 + PAGE_SIZE, PG_PCD | PG_PWT);
-    volatile u8 *mmio = (volatile u8 *)(DEV_VMA_BASE + (abar & 4095));
+    volatile u8 *mmio = ahciMapBar(abar);
+    kprintf("[ahci] controller %04x:%04x at %02x:%02x.%d abar=%#llx\n", vendor,
+            devid, bus, dev, fn, abar);
 
-    kprintf("[ahci] controller %04x:%04x at %02x:%02x.%d abar=%#llx\n", vendor, devid, bus, dev, fn,
-            abar);
-
-    /* Reset HBA if needed */
-    u32 ghc = *(volatile u32 *)(mmio + AHCI_GHC);
-    if (ghc & GHC_HR) {
-        *(volatile u32 *)(mmio + AHCI_GHC) = GHC_HR;
-        for (int i = 0; i < 1000000; i++) {
-            if (!(*(volatile u32 *)(mmio + AHCI_GHC) & GHC_HR)) break;
-            __asm__ volatile("pause");
-        }
-    }
+    ahciHbaReset(mmio);
 
     /* Enable AHCI mode; enable the HBA's global interrupt only when the
      * line above could actually be routed (C49).  With GHC.IE off, or on
@@ -940,279 +1294,8 @@ static int ahciProbe(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid, u8
         return 0;
     }
 
-    for (int p = 0; p < 32; p++) {
-        if (!((pi >> p) & 1)) continue;
-        volatile u8 *px = mmio + 0x100 + p * 0x80;
-
-        /* Wait for the link instead of sampling it once.  SATA link training
-         * is not instantaneous: PxSSTS.DET reads 1 (device detected, PHY not
-         * ready) while the device negotiates, and only becomes 3 once
-         * communication is established.  QEMU reports 3 immediately, so the
-         * old single sample passed every test while being able to silently
-         * drop a real disk that was still coming up -- and the symptom is
-         * indistinguishable from "no disk": nothing else probes this port
-         * and vfs gives up.  Only DET==1 is waited on; 0 (nothing attached)
-         * and 4 (PHY failure) are settled answers, so the empty ports that
-         * make up most of the 32 cost nothing. */
-        u32 ssts = pxRd(px, P_SSTS);
-        if ((ssts & 0xF) == 1) {
-            u64 dl = deadlineMs(AHCI_LINK_TIMEOUT_MS);
-            for (;;) {
-                ssts = pxRd(px, P_SSTS);
-                if ((ssts & 0xF) != 1) break;
-                if (overdue(dl)) break;
-                __asm__ volatile("pause");
-            }
-        }
-        if ((ssts & 0xF) != 3) {
-            /* Say it for EVERY unattached port, not just DET==1.  DET==0
-             * (link down -- needs a COMRESET this driver does not send) and
-             * DET==4 (PHY failure) used to be skipped in total silence, so on
-             * the real machine that first failed here "no disk" and "the
-             * disk's port never came up" produced byte-identical logs. */
-            kprintf("[ahci] port %d: no device (SSTS=%08x DET=%u)%s\n", p, ssts, ssts & 0xF,
-                    (ssts & 0xF) == 1 ? " -- link never established" : "");
-            continue;
-        }
-
-        kprintf("[ahci] port %d: device present (SSTS=%08x)\n", p, ssts);
-
-        /* Allocate the port's DMA structures before the port object: an
-         * allocation failure must skip *this* port, not take the machine
-         * with it (T-004 -- and AHCI is optional, IDE still boots).  These
-         * are DMA buffers, so they come from the buddy, not kmalloc(): the
-         * HBA's alignment rules (1 KiB / 256 B / 128 B) cannot be met by a
-         * block that starts 8 bytes in. */
-        CmdHdr *clb = (CmdHdr *)dmaAlloc();
-        void *fis = dmaAlloc();
-        CmdTbl *ct = (CmdTbl *)dmaAlloc();
-        if (!clb || !fis || !ct) {
-            kprintf("[ahci] port %d: out of memory, port skipped\n", p);
-            dmaFree(clb);
-            dmaFree(fis);
-            dmaFree(ct);
-            continue;
-        }
-        /* The .cpp original used `new` here, which routed to kmalloc_or_panic
-         * -- i.e. it panicked on OOM, in a function whose own comment two
-         * paragraphs up says an allocation failure must skip *this* port and
-         * not take the machine with it (T-004).  kmalloc() + a NULL check
-         * makes the code do what that comment promises; the .cpp had the
-         * principle and the panic side by side. */
-        struct AhciPort *port = (struct AhciPort *)kmalloc(sizeof(*port));
-        if (!port) {
-            kprintf("[ahci] port %d: out of memory for port object, port skipped\n", p);
-            dmaFree(clb);
-            dmaFree(fis);
-            dmaFree(ct);
-            continue;
-        }
-        port->mmio = px;
-        port->clb = clb;
-        port->fis = fis;
-        port->ct = ct;
-        memset(port->clb, 0, 1024);
-        memset(port->fis, 0, 256);
-        memset(port->ct, 0, 4096);
-        /* these are the frames the HBA will fetch from -- make sure nothing
-         * of ours is still sitting in a cache line when the doorbell rings */
-        dmaCoherent(port->clb, 1024);
-        dmaCoherent(port->fis, 256);
-        dmaCoherent(port->ct, 4096);
-
-        /* Stop the port before its command-list addresses change.  AHCI
-         * sequences this -- ST first, wait for CR, then FRE, wait for FR --
-         * because PxCLB/PxFB may only be written while the port is stopped.
-         * Clearing both bits at once and then ignoring the result (what this
-         * driver did) means a port whose FRE write has not taken yet gets its
-         * addresses changed underneath a running engine.  QEMU stores the CLB
-         * write unconditionally and clears CR/FR the instant the bits go, so
-         * the sloppy order is invisible there.  On a real HBA the write is
-         * dropped, the port keeps fetching command headers from the address
-         * the firmware left behind, and every doorbell is answered "command
-         * complete" with no data moved -- which is exactly how an 8 GB disk
-         * came up registered as 0xCCCCCCCCCCCCCCCC sectors. */
-        if (ahciPortStop(px)) {
-            kprintf("[ahci] port %d: engine would not stop (CMD=%08x), port skipped\n", p,
-                    pxRd(px, P_CMD));
-            /* ours never became the command list the HBA fetches from (PxCLB
-             * is still whatever the firmware left there), so it is safe */
-            ahciPortReclaim(px, port, p, false);
-            continue;
-        }
-
-        /* PxSCTL may still hold whatever the firmware or an Option ROM left
-         * in it -- including a forced DET value, which would pin the PHY in a
-         * state the link wait above can neither clear nor explain.  Only the
-         * DET sub-field is a "write to change" control, and 0 means "no
-         * forced state", so this is safe while the port is stopped. */
-        pxWr(px, 0x2C /* PxSCTL */, 0);
-
-        /* Set CLB and FIS physical addresses */
-        u64 clbPa = VIRT_TO_PHYS((uptr)port->clb);
-        u64 fisPa = VIRT_TO_PHYS((uptr)port->fis);
-        pxWr(px, P_CLB, (u32)clbPa);
-        pxWr(px, P_CLBU, (u32)(clbPa >> 32));
-        pxWr(px, P_FB, (u32)fisPa);
-        pxWr(px, P_FBU, (u32)(fisPa >> 32));
-
-        /* Read the addresses back.  A write the HBA refused lands nowhere and
-         * reports nothing -- the doorbell still rings and the port still
-         * answers, against someone else's command list.  This is the one
-         * place where "did the setup actually happen" is knowable before
-         * trusting every later command to it. */
-        if (pxRd(px, P_CLB) != (u32)clbPa || pxRd(px, P_FB) != (u32)fisPa) {
-            kprintf("[ahci] port %d: PxCLB/PxFB readback mismatch "
-                    "(got %08x/%08x want %08x/%08x), port skipped\n",
-                    p, pxRd(px, P_CLB), pxRd(px, P_FB), (u32)clbPa, (u32)fisPa);
-            ahciPortReclaim(px, port, p, false); /* stopped, never started */
-            continue;
-        }
-
-        /* Start port */
-        if (portStart(px)) {
-            kprintf("[ahci] port %d: failed to start\n", p);
-            ahciPortReclaim(px, port, p, false);
-            continue;
-        }
-
-        /* IDENTIFY DEVICE -- reached only through ahciProbePort(), which has
-         * already proven the DMA and PIO paths with a real 512-byte transfer.
-         * A DMA allocation rather than a stack array: the destination address
-         * is the one value this driver must get right by construction, not by
-         * luck of where the stack happened to land, and pmm is the allocator
-         * that can promise where the physical page is. */
-        u16 *ident = (u16 *)dmaAlloc();
-        if (!ident) {
-            kprintf("[ahci] port %d: no DMA memory for IDENTIFY\n", p);
-            ahciPortReclaim(px, port, p, true);
-            continue;
-        }
-        memset(ident, 0xCC, 512);
-
-        int verdict = ahciProbePort(px, port, p, ident);
-        if (verdict) {
-            /* -2: the port stopped answering, which says more than "no
-             * protocol worked" -- and it is the case that used to cost six
-             * full command timeouts in a row. */
-            kprintf("[ahci] port %d: %s, port skipped\n", p,
-                    verdict == -2 ? "device does not respond" : "no usable ATA protocol");
-            dmaFree(ident);
-            ahciPortReclaim(px, port, p, true);
-            continue;
-        }
-
-        /* The port reported success and the buffer is still the0xCC we seeded
-         * it with, byte for byte -- nothing was ever written to it.  This is
-         * not hypothetical: it is exactly what real hardware showed, an 8 GB
-         * disk registered as 14757395258967641292 sectors (0xCCCCCCCCCCCCCCCC,
-         * the prefill pattern) with an empty model, because CI cleared without
-         * a single byte of IDENTIFY data arriving.  Refuse it here rather than
-         * hand a fabricated capacity to every bounds check downstream that
-         * trusts it -- and say so, since "the disk did not mount" is otherwise
-         * all the evidence there is. */
-        bool untouched = true;
-        for (u32 i = 0; i < 512; i++)
-            if (((const u8 *)ident)[i] != 0xCC) {
-                untouched = false;
-                break;
-            }
-        if (untouched) {
-            kprintf("[ahci] port %d: IDENTIFY completed but transferred no data\n", p);
-            ahciDumpPort(px, 0, "IDENTIFY returned nothing");
-            dmaFree(ident);
-            ahciPortReclaim(px, port, p, true);
-            continue;
-        }
-
-        /* Capacity comes from words 60-61 (28-bit), with words 100-103 as the
-         * 48-bit answer -- see ata_total_sectors().  The old code fell back to
-         * words 100-103 only when words 60-61 were *zero*, but ATA's marker for
-         * "use the 48-bit field" is FFFFFFFFh, so the one value that meant
-         * 2097151 on the console was exactly the one that never fell back. */
-        u64 sectors = ata_total_sectors(ident);
-
-        char model[41];
-        for (int i = 0; i < 20; i++) {
-            model[i * 2] = (char)(ident[27 + i] >> 8);
-            model[i * 2 + 1] = (char)(ident[27 + i] & 0xFF);
-        }
-        model[40] = 0;
-
-        if (!sectors) {
-            /* Do not register a device whose size we could not read: a made-up
-             * capacity is worse than no disk, because every bounds check
-             * downstream trusts it. */
-            kprintf("[ahci] port %d: %.40s, capacity unknown -- port skipped\n", p, model);
-            dmaFree(ident);
-            ahciPortReclaim(px, port, p, true);
-            continue;
-        }
-
-        /* Same T-004 call as the port object: OOM here must not panic a
-         * machine whose disk is otherwise fine -- reclaim this port
-         * completely and register nothing (nothing leaks, nothing panics). */
-        struct blkdev *bd = (struct blkdev *)kmalloc(sizeof(*bd));
-        if (!bd) {
-            kprintf("[ahci] port %d: out of memory for blkdev, port skipped\n", p);
-            dmaFree(ident);
-            ahciPortReclaim(px, port, p, true);
-            continue;
-        }
-
-        /* C51: every port that answers is a disk, not just the first one.
-         * The old `return 1` after the first registration made "sda" the
-         * only name any AHCI port could ever have, so a second disk was
-         * invisible to diskinfo, to the mount probe and to every bound check
-         * downstream -- and it stopped the probe from looking at the ports
-         * behind it.  Names are generated here because the registry stores
-         * the pointer (C28): they have to outlive this function. */
-        if (sd_n >= (int)(sizeof(sd_names) / sizeof(sd_names[0]))) {
-            kprintf("[ahci] port %d: device-name table full, port skipped\n", p);
-            dmaFree(ident);
-            ahciPortReclaim(px, port, p, true);
-            kfree(bd);
-            continue;
-        }
-        char *nm = sd_names[sd_n];
-        nm[0] = 's';
-        nm[1] = 'd';
-        nm[2] = (char)('a' + sd_n);
-        nm[3] = 0;
-
-        bd->name = nm;
-        bd->sector_size = 512;
-        bd->num_sectors = sectors;
-        bd->read = ahciBlkRead;
-        bd->write = ahciBlkWrite;
-        bd->drv = port;
-        /* C28: a refusal means nobody owns this object -- and the port with
-         * it, since it was never published either. */
-        if (blk_register(bd) != 0) {
-            kprintf("[ahci] port %d: block table full, %s not published\n", p, nm);
-            dmaFree(ident);
-            ahciPortReclaim(px, port, p, true);
-            kfree(bd);
-            continue;
-        }
-        sd_n++;
-
-        /* C49, last: arm this port's interrupts.  Done only now -- PxIM is
-         * what lets PxIS reach GHC.IE, and until the device is registered
-         * there is no handler side of it: an interrupt raised over an
-         * unarmed port would sit on a level-triggered line forever.  PxIS is
-         * cleared first so the arming itself cannot count as a completion. */
-        if (ahci_irq_line >= 0) {
-            pxWr(px, P_IS, ~0u);
-            pxWr(px, P_IM, 0xFFFFFFFFu);
-            irq_ports[irq_port_n++] = port;
-            if (!irq_bd) irq_bd = bd;
-        }
-
-        kprintf("[ahci] %s: %.40s, %llu sectors (%llu MiB)\n", nm, model, sectors,
-                sectors / 2048);
-        dmaFree(ident);
-    }
+    for (int p = 0; p < 32; p++)
+        if ((pi >> p) & 1) ahciPortBringup(mmio, p);
     return 1;
 }
 

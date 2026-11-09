@@ -6,7 +6,6 @@
 #include <sys/ktest.h>
 #include <sys/spinlock.h>
 #include <sys/cpu.h>
-#include <console.h>
 
 /* declared in kernel/main.c, used by vfs.c to validate function pointers */
 extern bool kern_text_ptr(u64 p);

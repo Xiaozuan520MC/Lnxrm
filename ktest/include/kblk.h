@@ -7,7 +7,6 @@
 #define LNXRM_KBLK_H
 
 #include <sys/vfs.h>
-#include <abi/lnxrm_abi.h>
 #include <types.h>
 
 struct kblk {

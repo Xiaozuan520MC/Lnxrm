@@ -38,7 +38,6 @@ extern const u8 __initramfs_end[];
 
 #define S_IFMT  0170000
 #define S_IFDIR 0040000
-#define S_IFREG 0100000
 
 /* Published to vfs.c, which owns the mount table; declared here because
  * irfs_lookup() stamps it into every vnode it hands out. */
