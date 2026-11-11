@@ -158,6 +158,7 @@ struct fat_dirent {
     u32 filesize;
 } __attribute__((packed));
 
+#define ATTR_READONLY 0x01
 #define ATTR_VOLUME  0x08
 #define ATTR_DIR     0x10
 #define ATTR_ARCHIVE 0x20
@@ -415,6 +416,14 @@ struct resolve {
     struct fat_dirent de; /* valid if found */
     bool found;
 };
+/* Inode number: (containing cluster << 32) | offset inside that cluster.
+ * A FAT32 record lives in exactly one physical cluster at one offset, so
+ * the pair is unique across the volume and stable across reboots.  Shared
+ * by the directory scan (getdent) and fat_lookup_impl (stat) so both
+ * doors hand out the SAME number for the same record. */
+static inline u64 fat_ino(u32 dirclus, u32 off)
+{ return ((u64)dirclus << 32) | off; }
+
 /* Walk a directory chain, calling `cb` per live entry.
  * T-005: returns 1 when a callback stopped the walk (it matched), 0 when the
  * directory was walked to its end, or a negative LNXRM error when a sector

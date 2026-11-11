@@ -43,7 +43,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  44
+#define LNXRM_SYSCALL_LAST  46
 
 /* mmap() protection bits (same values as Linux PROT_*, shared here so the
  * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */
@@ -51,6 +51,21 @@ enum lnxrm_syscall_number {
 #define LNXRM_PROT_READ  1
 #define LNXRM_PROT_WRITE 2
 #define LNXRM_PROT_EXEC  4
+
+/* mmap() flags -- same values as Linux MAP_SHARED/MAP_PRIVATE, and the same
+ * rule about them: one of the two must be chosen, MAP_SHARED meaning every
+ * mapping of that file offset sees ONE frame (writes are the file's) and
+ * MAP_PRIVATE meaning each mapping gets its own copy (writes are the
+ * process's and are discarded on unmap, POSIX copy-on-write semantics).
+ *
+ * fd < 0 says "no file": the mapping is anonymous and flags only chooses
+ * between the two names, both of which behave exactly as anonymous always
+ * has.  flags == 0 is accepted and normalised to MAP_PRIVATE, which is
+ * what keeps a caller that only ever wanted anonymous memory down to the
+ * two-argument shape it had before file mappings existed. */
+#define LNXRM_MAP_SHARED  0x01
+#define LNXRM_MAP_PRIVATE 0x02
+#define LNXRM_MAP_FLAGS   (LNXRM_MAP_SHARED | LNXRM_MAP_PRIVATE)
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
@@ -143,6 +158,98 @@ struct lnxrm_timespec {
 };
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_timespec) == 16, "timespec ABI");
+
+/* ---- stat (45): one file's metadata, without opening it ----
+ *
+ * A deliberate SUBSET of Linux's struct stat, in Linux's field order for
+ * the fields it shares: enough for a `ls -l`, a type check before exec and
+ * a size check before read, and nothing this filesystem cannot actually
+ * answer (see the per-field notes).  The size is fixed by the static
+ * assert below, so growing it later means appending fields, never
+ * moving them.
+ *
+ *  - st_dev:  the mount slot the node resolved through, numbered from 1
+ *             so 0 stays meaningful: 0 means "no volume behind this node"
+ *             (the synthesised /dev nodes, a path resolved while nothing
+ *             is mounted).  Two paths sharing a st_dev share a volume.
+ *  - st_ino:  a number stable for this file across reboots on the same
+ *             volume -- FAT32 packs (containing cluster, byte offset of
+ *             its 8.3 record), initramfs its archive slot, 0 only where
+ *             the node is not backed by a record at all (a mount root,
+ *             a synthesised device).
+ *  - st_mode: LNXRM_S_IF* | permission bits.  FAT32 has no mode bits, so
+ *             the type is what the directory entry says and the
+ *             permissions are the FILE's read-only attribute widened to
+ *             the usual owner/group/other triple (0555 read-only, 0755
+ *             otherwise); a synthesised device node reports 0666.
+ *  - st_nlink: always 1 here -- neither FAT32 nor initramfs has hard
+ *             links, and reporting 0 would tell every caller the file is
+ *             already gone.
+ *  - st_uid/st_gid: always 0 for now: this kernel has no per-file owner
+ *             (see GAP_ANALYSIS 3.3), so every node reports root's.
+ *  - st_size: the size the filesystem reports RIGHT NOW (the same source
+ *             vfs_file_size_now() uses), never the open-time snapshot.
+ *  - st_blksize/st_blocks: the transfer unit the volume reads in (512,
+ *             one sector) and the file's size in those units, rounded up.
+ */
+struct lnxrm_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_size;
+    uint64_t st_blksize;
+    uint64_t st_blocks;
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_stat) == 56, "stat ABI");
+
+/* st_mode: the type mask and the nine permission bits, all at their Linux
+ * values so a program written against Linux spells them the same way. */
+#define LNXRM_S_IFMT  0170000
+#define LNXRM_S_IFREG 0100000
+#define LNXRM_S_IFDIR 0040000
+#define LNXRM_S_IFCHR 0020000
+
+#define LNXRM_S_IRUSR 0400
+#define LNXRM_S_IWUSR 0200
+#define LNXRM_S_IXUSR 0100
+#define LNXRM_S_IRGRP 0040
+#define LNXRM_S_IWGRP 0020
+#define LNXRM_S_IXGRP 0010
+#define LNXRM_S_IROTH 0004
+#define LNXRM_S_IWOTH 0002
+#define LNXRM_S_IXOTH 0001
+
+#define LNXRM_S_IRWXU 0700
+#define LNXRM_S_IRWXG 0070
+#define LNXRM_S_IRWXO 0007
+
+/* ---- gettimeofday (46): the wall clock, microsecond resolution ----
+ *
+ * Same shape as Linux's timeval: seconds since 1970-01-01 UTC plus
+ * microseconds in [0, 1000000).  The kernel samples the CMOS RTC once on
+ * the first call and advances that reading with the calibrated TSC
+ * afterwards, so a second call never costs a port access, never waits for
+ * an in-progress RTC update, and can never step backwards. */
+struct lnxrm_timeval {
+    int64_t tv_sec;
+    int64_t tv_usec;
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_timeval) == 16, "timeval ABI");
+
+/* gettimeofday's second argument (timezone).  Linux reads it for
+ * compatibility and always writes zeros -- the kernel does not do DST --
+ * and so does this one; passing NULL is the normal case. */
+struct lnxrm_timezone {
+    int32_t tz_minuteswest;
+    int32_t tz_dsttime;
+};
+
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_timezone) == 8, "timezone ABI");
 
 /* uname */
 struct lnxrm_utsname {

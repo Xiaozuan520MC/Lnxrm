@@ -34,6 +34,25 @@ static inline long sys_call3(long n, long a, long b, long c)
     return r;
 }
 
+/* Six arguments -- mmap's shape.  The first three land exactly where
+ * sys_call3 puts them (rdi, rsi, r10, the kernel's int 0x80 contract) and
+ * the last three go to rdx/rcx/r8, which is where the kernel's trap frame
+ * reads them (h_mmap).  rdx and rcx have constraint letters; r10 and r8 do
+ * not, so they are pinned with register variables -- the documented idiom
+ * for "this operand must be in that register", and the same one the libc
+ * syscall() wrappers use. */
+static inline long sys_call6(long n, long a, long b, long c, long d, long e, long f)
+{
+    long r;
+    register long arg3 asm("r10") = c;
+    register long arg6 asm("r8") = f;
+    __asm__ volatile("int $0x80"
+                     : "=a"(r)
+                     : "a"(n), "D"(a), "S"(b), "r"(arg3), "d"(d), "c"(e), "r"(arg6)
+                     : "r11", "memory");
+    return r;
+}
+
 static inline long kread(int fd, void *buf, size_t n)
 { return sys_call3(SYS_read, fd, (long)buf, n); }
 static inline long kwrite(int fd, const void *buf, size_t n)
@@ -81,14 +100,33 @@ static inline long ksigreturn(void)
 static inline long kbrk(long addr)
 { return sys_call3(SYS_brk, addr, 0, 0); }
 
-/* 42/43: anonymous mmap/munmap.  mmap takes addr=0 (the kernel picks a
- * page-aligned base top-down in [MMAP_LO, MMAP_TOP)) and a PROT mask; the
- * range is only RECORDED here -- each page is zeroed and mapped on first
- * touch, metered against the same 64 MiB quota as brk.  Returns the base,
- * or a negative errno (EINVAL for a non-zero addr / unaligned munmap, ENOMEM
- * when no gap fits).  munmap's len is rounded up to a page. */
+/* 42/43: mmap/munmap.  mmap takes addr=0 (the kernel picks a page-aligned
+ * base top-down in [MMAP_LO, MMAP_TOP)), a PROT mask, MAP_PRIVATE and
+ * fd = -1: an anonymous range, recorded only -- each page is zeroed and
+ * mapped on first touch, metered against the same 64 MiB quota as brk.
+ * Returns the base, or a negative errno (EINVAL for a non-zero addr /
+ * unaligned munmap, ENOMEM when no gap fits).  munmap's len is rounded up
+ * to a page. */
 static inline long kmmap(long len, int prot)
-{ return sys_call3(SYS_mmap, 0, len, prot); }
+{ return sys_call6(SYS_mmap, 0, len, prot, LNXRM_MAP_PRIVATE, -1, 0); }
+
+/* 42 with a file behind it.  `fd` must be a regular file opened for
+ * reading (O_RDWR as well if MAP_SHARED is combined with PROT_WRITE) and
+ * `offset` must be page-aligned; the mapping starts at the kernel-chosen
+ * base like every other mmap, and the file's byte at `offset` is what the
+ * first page holds.
+ *
+ *   MAP_SHARED  one frame per file page for the whole system: a store here
+ *               is the file's, visible to every other mapping of that page
+ *               and written back on munmap/exit/execve.
+ *   MAP_PRIVATE a frame of your own: a store is this process's and is
+ *               discarded with the mapping (POSIX copy-on-write).
+ *
+ * Returns the base, or EBADF (no such fd / not a file), EACCES (shared and
+ * writable but the descriptor is read-only), EINVAL (bad flags, unaligned
+ * offset, anonymous with a non-zero offset) or ENOMEM (no gap fits). */
+static inline long kmmap_file(long len, int prot, int flags, int fd, long offset)
+{ return sys_call6(SYS_mmap, 0, len, prot, flags, fd, offset); }
 static inline long kmunmap(long addr, long len)
 { return sys_call3(SYS_munmap, addr, len, 0); }
 /* 44: mprotect -- re-protect [addr, addr+len) (len rounds up to a page).
@@ -118,6 +156,19 @@ static inline long krmdir(const char *path)
 { return syscall1(SYS_rmdir, (long)path); }
 static inline long krename(const char *oldpath, const char *newpath)
 { return sys_call3(SYS_rename, (long)oldpath, (long)newpath, 0); }
+
+/* stat 45: a file's metadata without opening it -- st_mode tells type and
+ * (as far as this filesystem stores them) permissions, st_ino is stable
+ * for the file, st_size is the length it has RIGHT NOW (not the one an
+ * open had at the time).  Kernel struct, same bytes ring 0 fills. */
+static inline long kstat(const char *path, struct lnxrm_stat *st)
+{ return syscall2(SYS_stat, (long)path, (long)st); }
+
+/* gettimeofday 46: seconds since 1970-01-01 UTC plus microseconds.
+ * `tz` may be NULL (the normal case) -- the kernel writes zeros there
+ * either way, because it keeps no DST rule of its own. */
+static inline long kgettimeofday(struct lnxrm_timeval *tv, struct lnxrm_timezone *tz)
+{ return syscall2(SYS_gettimeofday, (long)tv, (long)tz); }
 
 /* C27: every cached dirty sector reaches its device before this answers. */
 static inline long ksync(void)

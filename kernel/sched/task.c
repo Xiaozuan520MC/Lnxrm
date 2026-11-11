@@ -153,6 +153,16 @@ int sys_fork(void)
         task_free_slot(ch);
         return LNXRM_EFAIL;
     }
+    /* T-FILE: undo the copy-on-write conversion for MAP_SHARED ranges.
+     * dup_user_aspace() write-protected every writable page it shared --
+     * which is right for anonymous and private memory and wrong for a
+     * shared file page, where the whole point is that both sides keep
+     * writing ONE frame (and through it, the file).  Runs after both the
+     * page-table dup and the VMA dup, because it needs the child's tables
+     * to exist and the parent's list to say which ranges are shared.  It
+     * cannot fail: it only rewrites flags on frames the dup already
+     * reference-counted. */
+    vma_fork_shared(current, current->pml4, ch->pml4);
 
     /* clone fd table */
     memcpy(ch->fds, current->fds, sizeof(ch->fds));
@@ -333,6 +343,16 @@ static long exec_read_image(const char *path, void **img_out, size_t *sz_out)
 static void exec_commit(const struct exec_args *a, u64 old_pml4, u64 new_pml4,
                         u64 brk_end)
 {
+    /* MAP_SHARED pages the old image dirtied belong to their files, so they
+     * are written back while the old root -- and therefore the frames --
+     * still exist.  This is deliberately the FIRST thing here: everything
+     * below it either destroys that root or drops the VMA list that names
+     * the files, and both would take the write-back's evidence with them.
+     * It runs only on the success path, so a failed execve leaves the
+     * caller's shared pages exactly where they were (still dirty, still
+     * the caller's to write back at its own exit). */
+    vma_writeback(current, old_pml4, 0, MMAP_TOP);
+
     /* The point of no return, in two adjacent steps: load the new root,
      * then publish it.  Nothing between them can schedule (this is ring 0
      * and the task is not idle), and switch_to() re-checks the live CR3, so
@@ -510,6 +530,17 @@ void sys_exit(int code)
      * sys_exit, and pids are handed out by a counter that never reuses
      * them. */
     fb_disown(current->pid);
+
+    /* MAP_SHARED pages this process dirtied are the FILE's bytes: put them
+     * back before anything they need can go away.  The order below is what
+     * makes that possible -- the file descriptors are closed next (a last
+     * close drops the cached shared frames), and the address space itself
+     * is only destroyed when this zombie is reaped, so writing back HERE
+     * is the only point where both the frames and the open file are still
+     * reachable.  Every other way a process dies -- a signal, a fault with
+     * no handler, SIGKILL -- ends in this function, so this one line covers
+     * them all. */
+    vma_writeback(current, current->pml4, 0, MMAP_TOP);
 
     for (int i = 0; i < NR_FDS; i++)
         if (current->fds[i]) sys_close(i);

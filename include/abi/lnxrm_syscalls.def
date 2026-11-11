@@ -26,6 +26,19 @@
  * input_wait took 41 as the blocking variant: empty queue parks the caller on
  * an evq_lock-protected wait list, events wake one waiter, signals cut the
  * wait short (EINTR), ms deadline caps it (2026-10-31).
+ * stat took 45 and gettimeofday 46 (2026-11-11): the first metadata door
+ * that hands out no descriptor, and the first clock a program can read.
+ * Both are two-argument calls -- stat(path, struct lnxrm_stat *) and
+ * gettimeofday(struct lnxrm_timeval *, void *) -- so the entry plumbing
+ * they use is the one every other call already had.
+ *
+ * Numbers are not the whole ABI: the ARITY of a call is too.  mmap (42)
+ * grew from mmap(addr, len, prot) to the six-argument Linux shape
+ * mmap(addr, len, prot, flags, fd, offset) when file mappings landed
+ * (2026-11-09).  The number did not move -- nothing here is renumbered --
+ * but a pre-rebuild binary calling the three-argument form reads whatever
+ * rdx/rcx/r8 happened to hold, so userland and the kernel are rebuilt
+ * together; that is what `make user` and the disk image rule already do.
  */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
@@ -72,3 +85,5 @@ LNXRM_SYS(input_wait, 41)
 LNXRM_SYS(mmap, 42)
 LNXRM_SYS(munmap, 43)
 LNXRM_SYS(mprotect, 44)
+LNXRM_SYS(stat, 45)
+LNXRM_SYS(gettimeofday, 46)

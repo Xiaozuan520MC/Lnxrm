@@ -124,6 +124,17 @@ u64 vmm_count_user_pages(u64 root);
 #define PG_U   0x004
 #define PG_PWT 0x008
 #define PG_PCD 0x010
+/* Hardware-set, not software: the CPU raises Accessed (bit 5) on any
+ * translation through this entry and Dirty (bit 6) on a WRITE through it,
+ * and only a write to the PTE clears them again.  Nothing in this kernel
+ * reads PG_A; PG_D is the whole dirty story for MAP_SHARED file mappings --
+ * a shared page is written back to its file only when bit 6 says somebody
+ * actually stored to it since the mapping (or the last writeback) was made,
+ * so an untouched or merely-read page costs no I/O on unmap/exit.  They
+ * live here next to the other PTE bits because pgtables are the only place
+ * their value is meaningful. */
+#define PG_A   0x020
+#define PG_D   0x040
 #define PG_PS  0x080
 /* Software bit 9 of a 4 KiB PTE: this page is Copy-On-Write (PTE bits 9..11
  * are ignored by the CPU, so bit 9 is free for the OS).  Set ONLY alongside

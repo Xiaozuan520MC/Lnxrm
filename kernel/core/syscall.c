@@ -4,6 +4,7 @@
 #include <sys/cpu.h>
 #include <sys/input.h>
 #include <sys/protect.h>
+#include <sys/rtc.h>
 #include <console.h>
 #include <mm/mm.h>
 #include <mm/vma.h>
@@ -75,29 +76,71 @@ static long sys_brk(u64 newbrk)
     return (long)current->brk_cur;
 }
 
-/* ---- anonymous mmap / munmap (T-MMAP) ----
+/* ---- mmap / munmap (T-MMAP, then file mappings) ----
  *
- * The int 0x80 ABI passes three arguments (rdi, rsi, r10), so mmap is
- * mmap(addr, len, prot) with no room for a flags word: `addr` must be 0
- * (the kernel picks the address) and anything else answers EINVAL rather
- * than pretending to honour a hint it would then ignore.  prot is the
- * LNXRM_PROT_* mask; unknown bits are masked off so a later flag stays
- * forward-compatible instead of breaking old callers.
+ * mmap is the six-argument Linux shape: mmap(addr, len, prot, flags, fd,
+ * offset).  The int 0x80 ABI hands the dispatcher three of them (rdi, rsi,
+ * r10, exactly as every other call has them) and the frame carries the rest
+ * in rdx/rcx/r8 -- h_mmap reads them straight out, so no new register
+ * plumbing was needed.  `addr` must still be 0: the kernel picks the
+ * address top-down in [MMAP_LO, MMAP_TOP) and answering EINVAL for
+ * anything else is honest where honouring a hint it would then ignore is
+ * not.  prot is the LNXRM_PROT_* mask; unknown bits are masked off so a
+ * later flag stays forward-compatible instead of breaking old callers.
+ *
+ * fd < 0 means "no file": an anonymous mapping, whose flags word is
+ * normalised to MAP_PRIVATE (both names mean the same thing for a range
+ * with no file behind it).  fd >= 0 must name a regular file opened for
+ * reading, and a MAP_SHARED range that will be written must additionally
+ * have been opened for writing -- otherwise the write-back at unmap would
+ * be refused by the very descriptor it is writing through.
  *
  * Nothing is mapped here.  sys_mmap records one VMA (mm/vma.c) and the
  * first touch of each page goes through the #PF dispatch
  * (page_fault.c demand_page), which meters the frame against
- * cred_mem_quota().  An untouched range therefore costs one kmalloc node
- * -- which is what lets the window be 64 GiB without pretending to own
- * 16 million frames it will never get. */
-static long sys_mmap(u64 addr, u64 len, u64 prot)
+ * cred_mem_quota() -- a file-backed page exactly like an anonymous one, so
+ * mapping a 100 MiB file costs nothing until it is read and cannot be used
+ * to sidestep the 64 MiB cap.  An untouched range therefore costs one
+ * kmalloc node -- which is what lets the window be 64 GiB without
+ * pretending to own 16 million frames it will never get. */
+static long sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, long fd, u64 offset)
 {
     if (addr != 0) return LNXRM_EINVAL; /* kernel-chosen address only */
     if (!len) return LNXRM_EINVAL;
     if (len > MMAP_TOP - MMAP_LO) return LNXRM_ENOMEM;
 
+    if (flags & ~(u64)LNXRM_MAP_FLAGS) return LNXRM_EINVAL;
+    if ((flags & LNXRM_MAP_SHARED) && (flags & LNXRM_MAP_PRIVATE))
+        return LNXRM_EINVAL; /* pick one: they mean opposite things */
+    if (!flags) flags = LNXRM_MAP_PRIVATE;  /* no opinion == private */
+    if (offset & (PAGE_SIZE - 1)) return LNXRM_EINVAL;
+    if (offset + len < offset) return LNXRM_EINVAL; /* offset + len wraps */
+    if (fd < 0 && offset) return LNXRM_EINVAL;      /* nothing to be at an offset of */
+
     u64 size = ALIGN_UP(len, PAGE_SIZE);
     if (size > MMAP_TOP - MMAP_LO) return LNXRM_ENOMEM;
+
+    /* The file half, checked BEFORE an address is chosen: every reason to
+     * say no is knowable from the descriptor alone, and a refusal must not
+     * have cost a VMA node. */
+    struct file *ff = NULL;
+    if (fd >= 0) {
+        if (fd >= NR_FDS || !current->fds[fd]) return LNXRM_EBADF;
+        ff = current->fds[fd];
+        if (ff->is_dir || !ff->priv) return LNXRM_EINVAL;
+        struct vnode *vn = ff->priv;
+        if (vn->type != V_REG) return LNXRM_EINVAL; /* no device, no directory */
+        int mode = ff->flags & (O_RDONLY | O_WRONLY | O_RDWR);
+        /* Every mapping READS its file -- that is what fills a page -- so
+         * O_WRONLY is not enough, exactly as read() on it would fail. */
+        if (mode != O_RDONLY && mode != O_RDWR) return LNXRM_EBADF;
+        /* ...and a shared range with PROT_WRITE will be written back
+         * through this same descriptor, so it must be open for writing. */
+        if ((flags & LNXRM_MAP_SHARED) && (prot & LNXRM_PROT_WRITE) &&
+            mode != O_RDWR)
+            return LNXRM_EACCES;
+        __sync_fetch_and_add(&ff->refcnt, 1); /* owned by the VMA from here */
+    }
 
     /* Top-down placement: scan every gap in [MMAP_LO, MMAP_TOP) and take
      * the HIGHEST one that fits (mmap habit: grow down from the top, so
@@ -116,11 +159,18 @@ static long sys_mmap(u64 addr, u64 len, u64 prot)
         if (MMAP_TOP > lo && MMAP_TOP - lo >= size && MMAP_TOP > best_hi)
             best_hi = MMAP_TOP;
     }
-    if (!best_hi) return LNXRM_ENOMEM; /* no gap fits: address space full */
+    if (!best_hi) {
+        if (ff) vfs_close_file(ff); /* the mapping never happened */
+        return LNXRM_ENOMEM;        /* no gap fits: address space full */
+    }
 
     u64 start = best_hi - size;
-    int rc = vma_insert(current, start, start + size, (u32)(prot & 0x7));
-    if (rc < 0) return rc;
+    int rc = vma_insert(current, start, start + size, (u32)(prot & 0x7),
+                        (u32)flags, offset, ff);
+    if (rc < 0) {
+        if (ff) vfs_close_file(ff); /* the insert never took the reference */
+        return rc;
+    }
     return (long)start;
 }
 
@@ -140,6 +190,14 @@ static long sys_munmap(u64 addr, u64 len)
     u64 size = ALIGN_UP(len, PAGE_SIZE);
     if (size == 0 || addr + size < addr) return LNXRM_EINVAL; /* overflow */
     u64 end = addr + size > MMAP_TOP ? MMAP_TOP : addr + size;
+
+    /* Shared pages in this range belong to the FILE, so they have to reach
+     * it before the mapping -- and with it the VMA's file reference -- goes
+     * away.  Runs first on purpose: if vma_erase() then answers EINVAL
+     * (nothing intersects), no page was touched and no byte was written,
+     * and if it answers ENOMEM the write-back that already happened was
+     * merely early, never wrong (it only ever copies a page onto itself). */
+    vma_writeback(current, current->pml4, addr, end);
 
     /* Range first: if nothing intersects, no page may be unmapped either.
      * vma_erase also guarantees it changed nothing when the split node
@@ -226,8 +284,21 @@ static long sys_mprotect(u64 addr, u64 len, u64 prot)
         if (want_x) fresh &= ~PG_NX;
         else fresh |= PG_NX;
 
+        /* A MAP_SHARED file page is THE frame every mapping of that file
+         * offset uses, so the reference count above is not a reason to hold
+         * write back from it: pmm_refcount() > 1 here means "somebody else
+         * maps this same file page", which is precisely the case where
+         * making it copy-on-write would be wrong (this process would then
+         * write a private copy that neither the other mapping nor the file
+         * ever sees).  It gets W outright, and never PG_COW -- so nothing
+         * later can mistake it for a page owed a private copy. */
+        struct vma *v = vma_find(current, pg);
+        bool shared = v && v->file && (v->flags & LNXRM_MAP_SHARED);
+
         if (want_w) {
-            if (fresh & PG_W) {
+            if (shared) {
+                fresh = (fresh | PG_W) & ~PG_COW;
+            } else if (fresh & PG_W) {
                 /* W with another owner should be impossible -- fork clears
                  * it on both sides -- but if it ever appears, demote to COW
                  * rather than leave two spaces writing one frame. */
@@ -396,6 +467,83 @@ long sys_uname(struct lnxrm_utsname *u)
     strncpy(k.version, "Lnxrm v0.09 " __DATE__ " " __TIME__, sizeof(k.version) - 1);
     strncpy(k.machine, "x86-64", sizeof(k.machine) - 1);
     if (copy_to_user(u, &k, sizeof(k)) < 0) return LNXRM_EFAULT;
+    return 0;
+}
+
+/* ---- stat(45): one file's metadata, no descriptor involved ----
+ *
+ * The path arrives already copied (h_stat runs copy_user_str, the same
+ * door every path syscall uses), and the result leaves through
+ * copy_to_user -- so a bad buffer answers EFAULT exactly like a bad path
+ * does, and neither can leave a half-filled struct behind (the kernel
+ * builds a whole lnxrm_stat first, then moves it in one copy).
+ *
+ * `sys_stat` takes a KERNEL path on purpose, like sys_unlink and
+ * sys_rename: the string gate belongs to the dispatcher, and the self-test
+ * calls this directly against paths it built itself.  Everything about the
+ * node itself comes from vfs_attr -- the translation below is only
+ * "filesystem vocabulary -> st_mode bits", and it is deliberately total:
+ * every vnode_type has an arm, so a new type cannot fall through to
+ * "regular file" by accident. */
+long sys_stat(const char *path, struct lnxrm_stat *buf)
+{
+    struct vfs_attr a;
+    struct lnxrm_stat st;
+
+    if (!path || !buf) return LNXRM_EFAULT;
+    long err = vfs_stat_path(path, &a);
+    if (err < 0) return err;
+
+    memset(&st, 0, sizeof(st));
+    st.st_dev = a.dev;
+    st.st_ino = a.ino;
+    st.st_size = a.size;
+    st.st_blksize = 512;                    /* one sector, what the fs reads */
+    st.st_blocks = (a.size + 511) / 512;    /* rounded up, like every df */
+    st.st_nlink = 1;                        /* neither FAT32 nor initramfs
+                                             * has hard links (see abi.h) */
+    st.st_uid = 0;                          /* no per-file owner yet: root */
+    st.st_gid = 0;
+
+    switch (a.type) {
+    case V_DIR:
+        st.st_mode = LNXRM_S_IFDIR | (a.ro ? 0555 : 0755);
+        break;
+    case V_CHR:
+        st.st_mode = LNXRM_S_IFCHR | 0666; /* /dev/console is everyone's */
+        break;
+    case V_REG:
+        st.st_mode = LNXRM_S_IFREG | (a.ro ? 0444 : 0644);
+        break;
+    }
+    if (copy_to_user(buf, &st, sizeof(st)) < 0) return LNXRM_EFAULT;
+    return 0;
+}
+
+/* ---- gettimeofday(46): the wall clock ----
+ *
+ * Two arguments, exactly as Linux has them, with Linux's answer to the
+ * second one: the timezone struct is written as zeros (this kernel has no
+ * DST rule and the RTC reads as UTC -- see kernel/core/rtc.c).  Either
+ * pointer may be NULL; both NULL is EINVAL, because a call that asks for
+ * nothing is a mistake rather than a request to be satisfied.  The clock
+ * itself is wall_clock()'s: an RTC sample advanced by the calibrated TSC,
+ * so it never waits after the first call and never steps backwards. */
+long sys_gettimeofday(struct lnxrm_timeval *tv, struct lnxrm_timezone *tz)
+{
+    if (!tv && !tz) return LNXRM_EINVAL;
+
+    if (tz) {
+        struct lnxrm_timezone z = {0, 0};
+        if (copy_to_user(tz, &z, sizeof(z)) < 0) return LNXRM_EFAULT;
+    }
+    if (tv) {
+        i64 sec = 0, usec = 0;
+        int rc = wall_clock(&sec, &usec);
+        if (rc < 0) return rc;
+        struct lnxrm_timeval v = {sec, usec};
+        if (copy_to_user(tv, &v, sizeof(v)) < 0) return LNXRM_EFAULT;
+    }
     return 0;
 }
 
@@ -650,7 +798,15 @@ static long h_lseek(struct intr_frame *f, u64 a3)
     return sys_lseek((int)f->rdi, (long)f->rsi, (int)a3);
 }
 static long h_brk(struct intr_frame *f, u64 a3) { return sys_brk(f->rdi); }
-static long h_mmap(struct intr_frame *f, u64 a3) { return sys_mmap(f->rdi, f->rsi, a3); }
+/* mmap is the one row wider than the dispatcher's three arguments: rdi,
+ * rsi and a3 (=r10) are the first three exactly as every other call has
+ * them, and flags/fd/offset ride in the next three registers the int 0x80
+ * stub already pushed into the frame.  Nothing new is plumbed -- the frame
+ * has always carried them. */
+static long h_mmap(struct intr_frame *f, u64 a3)
+{
+    return sys_mmap(f->rdi, f->rsi, a3, f->rdx, (long)f->rcx, f->r8);
+}
 static long h_munmap(struct intr_frame *f, u64 a3) { return sys_munmap(f->rdi, f->rsi); }
 static long h_mprotect(struct intr_frame *f, u64 a3) { return sys_mprotect(f->rdi, f->rsi, a3); }
 static long h_getdent(struct intr_frame *f, u64 a3)
@@ -728,6 +884,20 @@ static long h_rmdir(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, 
 static long h_rename(struct intr_frame *f, u64 a3)
 {
     return path2_syscall(f->rdi, f->rsi, sys_rename);
+}
+/* stat carries a path AND a buffer: the string gate runs here (it cannot
+ * be path_syscall, whose whole job is calling a one-argument function)
+ * and the buffer is checked by the copy at the end of sys_stat. */
+static long h_stat(struct intr_frame *f, u64 a3)
+{
+    char path[128];
+    if (copy_user_str(path, f->rdi, sizeof(path)) != 0) return LNXRM_EFAULT;
+    return sys_stat(path, (struct lnxrm_stat *)f->rsi);
+}
+static long h_gettimeofday(struct intr_frame *f, u64 a3)
+{
+    return sys_gettimeofday((struct lnxrm_timeval *)f->rdi,
+                            (struct lnxrm_timezone *)f->rsi);
 }
 static long h_setuid(struct intr_frame *f, u64 a3) { return sys_setuid((u32)f->rdi); }
 /* C27: flush staged bytes to every device */
@@ -811,6 +981,8 @@ static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
     [SYS_mmap]      = { h_mmap, 0, NULL },
     [SYS_munmap]    = { h_munmap, 0, NULL },
     [SYS_mprotect]  = { h_mprotect, 0, NULL },
+    [SYS_stat]      = { h_stat, 0, NULL },
+    [SYS_gettimeofday] = { h_gettimeofday, 0, NULL },
 };
 
 /* Look the row up, refuse what the gates refuse, then run it.  Register
@@ -873,6 +1045,17 @@ void syscall_entry(struct intr_frame *f)
  * CONFIG_KTEST is defined. (2026-10-20) */
 long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3)
 {
+    /* The three-argument shape every existing call uses.  mmap is wider
+     * than this now, so its last three arguments default to "no file, no
+     * flags, no offset" -- which is exactly what an anonymous mapping is --
+     * and a test that wants a real descriptor goes through
+     * syscall_probe6().  Zeroing them rather than reading a fresh frame
+     * is what keeps the two-argument callers of SYS_mmap honest. */
+    return syscall_probe6(nr, a1, a2, a3, 0, (u64)-1, 0);
+}
+
+long syscall_probe6(u64 nr, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6)
+{
     struct intr_frame f;
 
     memset(&f, 0, sizeof(f));
@@ -880,6 +1063,9 @@ long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3)
     f.rdi = a1;
     f.rsi = a2;
     f.r10 = a3;
+    f.rdx = a4; /* mmap's flags */
+    f.rcx = a5; /* ... its fd   */
+    f.r8 = a6;  /* ... and its offset */
     return syscall_do(&f, nr, a3);
 }
 #endif

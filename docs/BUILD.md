@@ -97,7 +97,7 @@ qemu-system-x86_64 [--enable-kvm] -machine q35 -m 256 -smp 2 \
 | 6 forged FAT | 副本镜像伪造某文件的 FAT 链，必须报 `chain loop`/`corrupt FAT entry` 且 shell 仍返回 |
 
 ```sh
-make smoke                          # 205/205 checks
+make smoke                          # 270/270 checks
 make smoke SMOKE_FLAGS="--smp 1"    # 单 CPU 必须用这个，不用 --qemu-args
 make smoke SMOKE_FLAGS="--no-build" # 复用现有 build/
 ```

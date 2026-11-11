@@ -152,6 +152,10 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]);
 void sys_exit(int code) __attribute__((noreturn));
 int sys_waitpid(int pid, int *status, int opts);
 long sys_nanosleep(u64 ns, struct lnxrm_timespec *urem);
+/* gettimeofday(46): wall clock into *tv (NULL allowed) and/or a
+ * timezone struct that always comes back zeroed (NULL allowed; both NULL
+ * is EINVAL).  The clock itself lives in kernel/core/rtc.c. */
+long sys_gettimeofday(struct lnxrm_timeval *tv, struct lnxrm_timezone *tz);
 long sys_ps(struct lnxrm_ps_entry *ubuf, int max);
 long sys_sigaction(int sig, const struct lnxrm_sigaction *uact,
                    struct lnxrm_sigaction *uold);

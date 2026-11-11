@@ -11,6 +11,8 @@ int fat_lookup_impl(void *mnt, const char *path, struct vnode *out)
         /* mount root directory */
         out->type = V_DIR;
         out->size = 0;
+        out->ino = 0; /* no directory record backs a mount root */
+        out->ro = false;
         out->ops = &fat32_ops;
         out->mnt_data = mnt; /* C39: the mount, not a placeholder */
         out->fs_data = kmalloc(sizeof(struct resolve));
@@ -30,6 +32,13 @@ int fat_lookup_impl(void *mnt, const char *path, struct vnode *out)
     memcpy(out->fs_data, &r, sizeof(r));
     out->ops = &fat32_ops;
     out->mnt_data = (void *)1;
+    /* stat's identity, straight off the record the lookup already
+     * resolved: where it physically sits (the same pair fat_getdent()
+     * reports for this file, so stat and readdir agree) and whether the
+     * FILE attribute says read-only -- the only permission bit FAT32
+     * stores, and what st_mode's owner/group/other bits derive from. */
+    out->ino = fat_ino(r.ent_clus, r.ent_off);
+    out->ro = (r.de.attr & ATTR_READONLY) != 0;
     if (r.de.attr & ATTR_DIR) {
         out->type = V_DIR;
         out->size = 0;

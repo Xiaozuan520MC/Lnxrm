@@ -1049,6 +1049,172 @@ static void t_mmap_surface(void)
     say("fb.flip", kfb_flip()); /* 32: this pid holds the surface -> 0 */
 }
 
+/* ---- 42 with a file behind it: private stays private, shared reaches the
+ * file, and a fork keeps both address spaces on ONE frame ----
+ * ktest drives these same doors from ring 0, but it cannot fork a process
+ * and cannot ring-3 a store, so the claims only user space can make live
+ * here: a MAP_SHARED store survives its munmap into the file while a
+ * MAP_PRIVATE one is discarded with the mapping, a write-back clamps to the
+ * file's own size instead of growing it to a whole page, and a child
+ * writing the shared mapping it inherited changes what the parent reads --
+ * the whole point of MAP_SHARED, and exactly what would break if fork left
+ * those pages copy-on-write (the child would then own a private copy that
+ * neither the parent nor the file ever sees). */
+static void t_mmap_file(void)
+{
+    long fd = kopen("/MF.T", 0100 | 2 | 01000); /* O_CREAT|O_RDWR|O_TRUNC */
+    say("mmapf.open", fd >= 0);
+    if (fd < 0) return;
+    say("mmapf.seed", kwrite(fd, "FILEMAP!", 8)); /* 8 == the file's size */
+
+    /* every refusal, before anything is mapped: none of these may leave a
+     * VMA, a frame or a cache entry behind */
+    say("mmapf.badfd", kmmap_file(0x1000, LNXRM_PROT_READ, LNXRM_MAP_PRIVATE, 99, 0));
+    say("mmapf.unaligned",
+        kmmap_file(0x1000, LNXRM_PROT_READ, LNXRM_MAP_PRIVATE, fd, 0x100));
+    say("mmapf.both", kmmap_file(0x1000, LNXRM_PROT_READ,
+                                 LNXRM_MAP_SHARED | LNXRM_MAP_PRIVATE, fd, 0));
+    long ro = kopen("/MF.T", 0); /* O_RDONLY: a writable shared mapping could
+                                  * never be written back through it, so the
+                                  * mapping itself is refused (-13 EACCES) */
+    say("mmapf.ro", ro >= 0 ? kmmap_file(0x1000, LNXRM_PROT_READ | LNXRM_PROT_WRITE,
+                                         LNXRM_MAP_SHARED, ro, 0)
+                            : -9);
+    if (ro >= 0) kclose(ro);
+
+    /* MAP_PRIVATE: the file's bytes on first touch, this process's after */
+    long pv = kmmap_file(0x1000, LNXRM_PROT_READ | LNXRM_PROT_WRITE,
+                         LNXRM_MAP_PRIVATE, fd, 0);
+    say("mmapf.priv.base", pv);
+    if (pv >= 0) {
+        say("mmapf.priv.read", *(volatile unsigned char *)pv); /* 70 = 'F' */
+        *(volatile unsigned char *)pv = 'X';
+        say("mmapf.priv.own", *(volatile unsigned char *)pv); /* 88 = 'X' */
+    }
+
+    /* MAP_SHARED: one frame for this file page, written back at unmap */
+    long sv = kmmap_file(0x1000, LNXRM_PROT_READ | LNXRM_PROT_WRITE,
+                         LNXRM_MAP_SHARED, fd, 0);
+    say("mmapf.shared.base", sv);
+    if (sv >= 0) {
+        say("mmapf.shared.read", *(volatile unsigned char *)sv); /* 70: the file's */
+        *(volatile unsigned char *)sv = 'S';
+        say("mmapf.shared.own", *(volatile unsigned char *)sv); /* 83 = 'S' */
+    }
+    if (pv >= 0) say("mmapf.priv.unmap", kmunmap(pv, 0x1000));    /* discards 'X' */
+    if (sv >= 0) say("mmapf.shared.unmap", kmunmap(sv, 0x1000));  /* writes 'S' */
+
+    /* back at offset 0: exactly EIGHT bytes proves the write-back clamped to
+     * the file's size instead of extending it to a page, and the byte in
+     * them proves the shared store landed while the private one did not */
+    say("mmapf.seek", klseek(fd, 0, LNXRM_SEEK_SET));
+    char buf[16];
+    long got = kread(fd, buf, sizeof(buf));
+    say("mmapf.got", got);                      /* 8 */
+    say("mmapf.byte", got > 0 ? buf[0] : -1);   /* 83 = 'S' */
+
+    /* fork: the child writes the mapping it inherited and the parent must
+     * read that store back -- one frame, two address spaces, still one file */
+    long sv2 = kmmap_file(0x1000, LNXRM_PROT_READ | LNXRM_PROT_WRITE,
+                          LNXRM_MAP_SHARED, fd, 0);
+    say("mmapf.fork.base", sv2);
+    if (sv2 >= 0) {
+        *(volatile unsigned char *)sv2 = 'P';
+        long pid = kfork();
+        if (pid == 0) {
+            *(volatile unsigned char *)sv2 = 'C'; /* the very same frame */
+            kexit(0);
+        }
+        int st = 0;
+        long w = pid > 0 ? kwaitpid((int)pid, &st, 0) : -1;
+        say("mmapf.fork.wait", w == pid ? 1 : 0); /* reaped */
+        say("mmapf.fork.see", *(volatile unsigned char *)sv2); /* 67 = 'C' */
+        say("mmapf.fork.unmap", kmunmap(sv2, 0x1000)); /* its own write-back */
+        say("mmapf.fork.status", st);                  /* 0: the child's code */
+    }
+
+    say("mmapf.close", kclose(fd));
+    say("mmapf.unlink", kunlink("/MF.T")); /* leave the volume as found */
+}
+
+/* ---- 45/46: a file's metadata without opening it, and a clock ----
+ * The kernel half of both lives in ktest (VFS semantics, the string and
+ * copy-out gates); what only ring 3 can show is that the CALL reaches the
+ * dispatcher intact -- the path argument is a user pointer, the result
+ * lands in this process's own stack, and the errors a real program would
+ * hit (ENOENT, a NULL receiver, asking for nothing) come back as the
+ * numbers it expects.  Everything here reports a condition rather than a
+ * raw number where the number could vary by volume: whether README.md is
+ * 0644 or read-only depends on one attribute bit of the on-disk entry,
+ * while "it IS a regular file" and "its size IS its size" hold on every
+ * filesystem this kernel can mount.
+ *
+ * The clock is checked as a clock: a plausible date for this machine
+ * (2020..2100, which is what a wrong century decode cannot produce), a
+ * legal fraction, a second call that never reports an earlier time, and a
+ * timezone struct that comes back zero -- the kernel has no DST rule and
+ * says so.  time.epoch is printed raw so a human can compare it against
+ * the host's date at a glance. */
+static void t_stat_time(void)
+{
+    struct lnxrm_stat st;
+
+    /* a file the volume is known to carry */
+    say("stat.ret", kstat("/README.md", &st));
+    say("stat.reg", (st.st_mode & LNXRM_S_IFMT) == LNXRM_S_IFREG);
+    say("stat.readable", (st.st_mode & 0400) != 0);
+    say("stat.nlink", st.st_nlink);
+    say("stat.uid", st.st_uid);
+    say("stat.size.gte", st.st_size > 0);
+    say("stat.ino.nz", st.st_ino != 0);
+    say("stat.blksize", st.st_blksize);
+    say("stat.blocks.ok", st.st_blocks == (st.st_size + 511) / 512);
+
+    /* type of the two shapes that are not a plain file */
+    say("stat.dir", kstat("/", &st) == 0 &&
+                        (st.st_mode & LNXRM_S_IFMT) == LNXRM_S_IFDIR);
+    say("stat.dir.size0", st.st_size == 0);
+    say("stat.chr", kstat("/dev/console", &st) == 0 &&
+                        (st.st_mode & LNXRM_S_IFMT) == LNXRM_S_IFCHR);
+    say("stat.chr.ino", st.st_ino);
+
+    /* refusals, and the promise that asking creates nothing */
+    say("stat.enoent", kstat("/NOSUCH.T", &st));
+    say("stat.null", kstat("/README.md", 0));
+    say("stat.badpath", kstat(0, &st));
+    say("stat.nocreate", kstat("/TXSTAT.T", &st));
+    say("stat.nocreate2", kstat("/TXSTAT.T", &st));
+
+    /* the size answer must be the size the volume has NOW: write ten
+     * bytes, close, and stat reports ten -- not the 0 the open's lookup
+     * snapshotted, and not a page-rounded 4096 either */
+    long fd = kopen("/TXSTAT.T", 0100 | 2 | 01000); /* O_CREAT|O_RDWR|O_TRUNC */
+    say("stat.write", fd >= 0 ? kwrite(fd, "0123456789", 10) : -1);
+    if (fd >= 0) kclose(fd);
+    say("stat.size", kstat("/TXSTAT.T", &st) == 0 && st.st_size == 10);
+    say("stat.unlink", kunlink("/TXSTAT.T")); /* volume as found */
+
+    /* the clock */
+    struct lnxrm_timeval tv, tv2;
+    struct lnxrm_timezone tz;
+    say("time.ret", kgettimeofday(&tv, 0));
+    say("time.epoch", tv.tv_sec);
+    say("time.epoch.gte", tv.tv_sec >= 1577836800LL);
+    say("time.epoch.lt", tv.tv_sec < 4102444800LL);
+    say("time.usec.range", tv.tv_usec >= 0 && tv.tv_usec < 1000000);
+
+    kgettimeofday(&tv2, 0);
+    say("time.mono", tv2.tv_sec > tv.tv_sec ||
+                         (tv2.tv_sec == tv.tv_sec && tv2.tv_usec >= tv.tv_usec));
+
+    tz.tz_minuteswest = -1;
+    tz.tz_dsttime = -1;
+    say("time.tz", kgettimeofday(&tv, &tz) == 0 && tz.tz_minuteswest == 0 &&
+                       tz.tz_dsttime == 0);
+    say("time.tvnull", kgettimeofday(0, &tz)); /* zone alone is a real ask */
+    say("time.bothnull", kgettimeofday(0, 0)); /* nothing asked: -22 */
+}
+
 /* ---- true-colour card: one swatch per named FB_CLR_* colour plus an
  * RGB gradient.  Colours are 0x00RRGGBB (never palette indices), so a
  * screendump of this band must match the table byte for byte. ---- */
@@ -1127,6 +1293,8 @@ int main(int argc, char **argv)
     t_mouse();
     t_input();
     t_mmap_surface();
+    t_mmap_file();
+    t_stat_time();
 
     say("systest.done", 1);
     t_fb_swatch();

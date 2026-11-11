@@ -353,11 +353,8 @@ struct iter_ctx {
     bool hit;
 };
 
-/* Inode number: (containing cluster << 32) | offset inside that cluster.
- * A FAT32 record lives in exactly one physical cluster at one offset, so
- * the pair is unique across the volume and stable across reboots. */
-static u64 fat_ino(u32 dirclus, u32 off)
-{ return ((u64)dirclus << 32) | off; }
+/* Inode number lives in fat32.h (fat_ino): shared with fat_lookup_impl so
+ * stat and getdent agree on the number they give the same record. */
 
 static int scan_iter_cb(const char *name, const struct fat_dirent *e, u32 dirclus, u32 off,
                         void *v)

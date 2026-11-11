@@ -28,15 +28,15 @@ arch/                  架构：setup.asm(实模式 E820/VBE/长模式) entry64.
 include/               全部头文件（无实现）：abi/(lnxrm_abi.h + lnxrm_syscalls.def) sys/ mm/ 其余
 kernel/
   main.c               start_kernel 编排
-  core/                syscall.c(分发/门) print.c percpu.c smp.c protect.c selftest.c
+  core/                syscall.c(分发/门) print.c percpu.c smp.c protect.c selftest.c rtc.c(CMOS 采样时钟 + 演进, gettimeofday 的时间源)
   sched/               task.c(生命周期/fork/execve/exit/wait4) sched.c(RR/锁) elf.c signal.c
   irq/                 isr.c(分发/异常/IPI) apic.c acpi.c
-  mm/                  pmm.c(kheap 之上: buddy, order-0 帧引用计数) kheap.c vmm.c vma.c(匿名 VMA 列表) pagefault.c(缺页分发: demand/stack/COW)
+  mm/                  pmm.c(kheap 之上: buddy, order-0 帧引用计数) kheap.c vmm.c vma.c(匿名 VMA 列表) pagefault.c(缺页分发: demand/stack/COW) filepage.c(文件映射共享页缓存)
   fs/                  vfs.c blk_cache.c mbr.c initramfs.c
   fs/fat32/            fat32.c(挂载/链) fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
   drivers/             pci.c ide.c ahci.c uart.c ps2mouse.c framebuffer.c input_event.c
   lib/string.c
-ktest/                 启动自测：ktest.c 框架 + 27 个 t_*.c（在仓库根，不在 kernel/ 下）
+ktest/                 启动自测：ktest.c 框架 + 28 个 t_*.c（在仓库根，不在 kernel/ 下）
   include/             ktest 私有头（-Iktest/include）
 userland/              Makefile + bin/ 16 个程序 .c（自动发现）+ lib/(crt0.S + ulib.c 运行库)
 scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_test.py
@@ -51,7 +51,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | `MAX_CPUS` / `NR_TASKS` / `NR_FDS` | 8 / 64 / 16 | `include/types.h` |
 | `KSTACK_SIZE` | 32768 | `include/sys/sched.h` |
 | `LNXRM_NR_SIGNALS` | 14（编号 1..13） | `include/abi/lnxrm_abi.h` |
-| `LNXRM_SYSCALL_LAST` | 44（编号 0–44 共 45 个） | `include/abi/lnxrm_abi.h` |
+| `LNXRM_SYSCALL_LAST` | 46（编号 0–46 共 47 个） | `include/abi/lnxrm_abi.h` |
 | `CACHE_ENTRIES` | 64 | `include/disk.h` |
 | `MAX_MOUNTS` | 4 | `kernel/fs/vfs.c` |
 | `HZ` | 100 | `include/sys/cpu.h` |
@@ -161,7 +161,8 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 ### 3.6 `brk`、匿名 `mmap` 与配额
 
 - `brk` 合法区间 `[brk_base, MMAP_LO)`，先算术拒绝再取帧；`MMAP_LO` 是 mmap 窗下沿（2026-11-07 从 `USER_STACK_TOP - 1 MiB` 移来——旧上限落在 mmap 窗**内**，堆与 mmap 能争同一页面）。
-- 匿名 `mmap`（42/43，`kernel/mm/vma.c` + `sys_mmap/sys_munmap`）：`addr` 必须为 0，top-down 扫 `[MMAP_LO, MMAP_TOP)` 空隙（`MMAP_TOP` = 栈增长地板 − `STACK_GUARD`），**只登记 VMA 不映射**；首触由 demand fixer 补帧（配额同 brk）。`munmap` 摘 VMA（中段挖洞拆分、零相交 `EINVAL`）→ 逐页 unmap → `vmm_reclaim_empty_tables` 回收空 PT/PD/PDPT。VMA 列表挂 `struct task.vmas`，fork 深拷（`vma_dup`）、execve 与 `task_free_slot` 释放。
+- `mmap`（42/43，`kernel/mm/vma.c` + `sys_mmap/sys_munmap`）：**六参 `addr,len,prot,flags,fd,offset`**（`addr` 必须为 0、`flags==0` 归一 `MAP_PRIVATE`），top-down 扫 `[MMAP_LO, MMAP_TOP)` 空隙（`MMAP_TOP` = 栈增长地板 − `STACK_GUARD`），**只登记 VMA 不映射**；首触由 demand fixer 补帧（配额同 brk）。`munmap` 摘 VMA（中段挖洞拆分、零相交 `EINVAL`）→ 逐页 unmap → `vmm_reclaim_empty_tables` 回收空 PT/PD/PDPT。VMA 列表挂 `struct task.vmas`，fork 深拷（`vma_dup`）、execve 与 `task_free_slot` 释放。
+- **文件映射（2026-11-09，`kernel/mm/filepage.c` + `include/mm/filepage.h`）**：`fd<0` 即匿名；`fd>=0` 必须是非常规、至少可读的常规文件（`EBADF`/`EINVAL`），`MAP_SHARED+PROT_WRITE` 还必须 `O_RDWR`（否则 `EACCES`——写回要用的就是这个描述符），所有拒绝都发生在选址之前（零副作用）。**`MAP_SHARED` 同一 `(file,offset)` 全系统一个帧**：`fp_lock` + 64 桶哈希、**锁外读盘**（未命中→解锁 `pmm_alloc`+`vfs_pread`→抢锁二次查表，输掉竞态就丢弃自己的帧），缓存持一帧引用、`filepage_get()` 另给调用方一个交给 PTE；`vfs_close_file()` 最后一次引用时 `filepage_drop_file()`，而 **VMA 持 file 引用 ⇒ 映射在，文件不会关 ⇒ 缓存不会在还有 PTE 指着时被丢**。`MAP_PRIVATE` 自有帧、不进缓存、永不回写。`demand_page` 按 **VMA 而非 fault** 分流（shared→`filepage_get`，private→取帧 + `vfs_pread`，短读正常、负值才判不可修复）。**写回只在三处**：`sys_munmap`（先于 `vma_erase`）、`exec_commit`（第一行，显式传 `old_pml4`）、`sys_exit`（`fb_disown` 之后、关 fd 之前）；脏页由硬件 `PG_D` 认定（`include/mm/mm.h` 补 `PG_A`/`PG_D`），写回量 clamp 到 `vfs_file_size_now()`（`vfs_file_size()` 是 open 时快照，会把刚建的文件当 0 长）。fork 后 `vma_fork_shared()` 把共享页两侧恢复 `PG_W`、清 `PG_COW` **且不再 `pmm_ref`**（dup 已加）；`sys_mprotect` consult VMA，共享页直接给 W（`refcount>1` 对共享页是常态）。VFS 另补 `vfs_pread`/`vfs_pwrite`（绕开 `f->pos`，`!buf` 拒绝以防 fat `NULL+0`=truncate）。**已知限制**：无 `msync`（写回只在上述三处），且共享页缓存与 `write()` 两条路互不知晓——映射期间别并行 `write()` 同一文件（详见 `filepage.h` 头注释）。
 - **`mprotect`（44，`sys_mprotect` + `vma_protect`）**：`[addr, ALIGN_UP(len))` 作用于**任意用户范围**（不只 mmap 段——翻 JIT、改 .text、封栈缓冲），未对齐/零长/回滚/出用户空间 `EINVAL`；范围内存在「既不在场又无 VMA」的页回 `ENOMEM`，**先查全再改动**（跨 VMA 按步长快走，落进 VMA 就跳到它的尾）。**先 `vma_protect` 原子改列表、再改 PTE**（后者只重写刚读过的叶，不可能失败）：`vma_protect` 先数节点（全覆盖 0、切头/切尾 1、中间打洞 2）→ 预分配池 → 才写 prot，`ENOMEM` = 列表零改动（与 `vma_erase` 的拆分同规）。授予 W **永不分配**：独占帧直接 `PG_W`，共享帧（`pmm_refcount > 1` 或已 `PG_COW`）只标 `PG_COW`、复制推迟到下一次写故障——与 Linux `can_change_private_pte_writable()` 同规则（只在 `PageAnonExclusive` 时才改可写）；**撤销写必须同时清 `PG_W | PG_COW`**，否则下一次 COW 缺页会把只读悄悄改回可写。NX 随 `PROT_EXEC` 翻转；`PG_W` 却 `refcount > 1` 的不可能态防御性降级为 COW。
 - 判据是**页表行走** `vmm_count_user_pages()`，配额只来自 `cred_mem_quota()`（0 = 无上限，root/kxld）；`have + delta > quota` 回 `ENOMEM`；shrink 永不拒绝；部分失败回滚。
 - 配额**只来自 `cred_mem_quota()`** —— `struct task` 没有配额字段，`setuid` 改 tier，两套记账必然打架。
@@ -235,7 +236,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 - 门也是表里的数据（`GATE_ADMIN` 7 个 / `GATE_FB` 5 个），**门与入口同一行**：新增一个受限调用不可能只加调用忘了加门。参数拆包在 `h_*` 包装里（帧字段 → C 类型），与旧行为逐条等价。
 - 未知编号（`nr > LNXRM_SYSCALL_LAST` 或该行 `fn == NULL`）打 `[sys] unknown syscall …` 回 `-38`，且**不先过门**——没实现的调用不该先问它从没资格拿的能力。
 
-### 5.2 45 项总表（编号 0–44，连续无空洞）
+### 5.2 47 项总表（编号 0–46，连续无空洞）
 
 | # | 名字 | 用途 | 实现文件 |
 |---|---|---|---|
@@ -278,9 +279,11 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | 39 | `input_pop` | 统一输入队列出一个 24 字节事件（成功回 1，空回 `EAGAIN`）；`CAP_SYS_ADMIN` | `kernel/drivers/input_event.c` |
 | 40 | `input_info` | 统一队列计数快照（32 字节，分类型和恒等 `pushed_total`） | `kernel/drivers/input_event.c` |
 | 41 | `input_wait` | 阻塞弹出：空则睡 wait list，事件到达唤醒一个，信号打断 `EINTR`，ms 超时（0=非阻塞、-1=永等），成功 1 / 超时 0；`CAP_SYS_ADMIN` | `kernel/drivers/input_event.c` |
-| 42 | `mmap` | 匿名映射：`addr` 必须 0、top-down 选址 `[MMAP_LO, MMAP_TOP)`、只登记 VMA（需求分页），`prot` 为 `LNXRM_PROT_*` | `kernel/core/syscall.c` + `kernel/mm/vma.c` |
+| 42 | `mmap` | **六参** `addr,len,prot,flags,fd,offset`（Linux 顺序；第 4–6 参读 trap frame 的 `rdx/rcx/r8`）：`addr` 必须 0、top-down 选址 `[MMAP_LO, MMAP_TOP)`、只登记 VMA（需求分页）；`fd<0` 匿名，`fd>=0` 走文件映射（`MAP_SHARED` 共享页缓存 / `MAP_PRIVATE` 自有帧），`flags==0` 归一 `MAP_PRIVATE` | `kernel/core/syscall.c` + `kernel/mm/vma.c` + `kernel/mm/filepage.c` |
 | 43 | `munmap` | 摘除 `[addr, ALIGN_UP(len))`：VMA 挖洞拆分、逐页 unmap、空页表回收；零相交/未对齐 `EINVAL` | `kernel/core/syscall.c` + `kernel/mm/vma.c` |
 | 44 | `mprotect` | 把 `[addr, ALIGN_UP(len))` 改成 `prot`，**任意用户范围**（不只 mmap 段）：在场页立即翻 W/NX，未触碰的改 VMA 交给需求分页；范围里有洞 `ENOMEM`、未对齐/零长/出用户空间 `EINVAL`；授予 W 不分配（共享帧标 `PG_COW` 推迟复制） | `kernel/core/syscall.c` + `kernel/mm/vma.c` |
+| 45 | `stat` | `stat(path, struct lnxrm_stat *)`，56 字节 Linux 子集（`dev/ino/mode/nlink/uid/gid/size/blksize/blocks`）：**不发描述符**的一次 `vfs_stat_path(flags=0)`——不 create 不 truncate、节点走 `close_node` 归还、size 取 `fs_ops.size` 实时值；`st_mode` 是 `LNXRM_S_IF*`+九权限位，`st_dev` 挂载槽**从 1 起**（0=无卷），`ino` 与 `getdent` 同号（FAT `fat_ino`/irfs 槽号/`/dev/console`=1），`nlink=1`、`uid/gid=0`、`blksize=512`；坏路径/坏缓冲 `-14`，缺失 `-2` | `kernel/core/syscall.c` + `kernel/fs/vfs.c` + 各 fs 的 lookup |
+| 46 | `gettimeofday` | `gettimeofday(tv, tz)`：`tv` 16 字节（`tv_sec`/`tv_usec`，1970-01-01 UTC 起），`tz` 8 字节**恒写 0**（无 DST，与 Linux 一致）；`kernel/core/rtc.c` 三层——CMOS 读一次（UIP 轮询上限 100000 + BCD/24h/世纪解码）→ 之后按标定 TSC 演进（未标定退 `jiffies`）+ CAS 单调下限，从不回退、从不再读端口；两 NULL `-22`，单 NULL 合法 | `kernel/core/syscall.c` + `kernel/core/rtc.c` |
 
 图形 6 个（23–27 + 32）。统一输入队列（39/40/41）把两个生产者的**已解码结果**合成一条流：`KEY` 只出自 IRQ1 扫描码解码（`kbd_inject(35)` 是合成终端输入，**不进队列**），`REL/BTN/WHEEL` 出自 aux 包尾——34–38 的环、语义、门原样保留（叠加，不改道）。
 
@@ -305,7 +308,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | `lnxrm_timespec / utsname / ps_entry / dirent` | 16 / 320 / 48（含 `kind/uid/mem_kib/peak_kib`）/ 72 字节 |
 | `lnxrm_fb_info / fb_rect / fb_char / fb_str` | 16 / 20 / 20 / 24 字节，`_Static_assert` 锁布局 |
 
-⚠️ **ABI 结构体一改，引用它的用户态程序必须全量重编**（否则按旧步长读错位字段）。用户态入口是 `ulib.h` 的 `int 0x80` 内联包装（第三参数手动搬 `r10`，clobber 必含 `r10`），45 个全覆盖；`crt0.S` 从栈取 argc/argv 调 `main`。
+⚠️ **ABI 结构体一改，引用它的用户态程序必须全量重编**（否则按旧步长读错位字段）。用户态入口是 `ulib.h` 的 `int 0x80` 内联包装（第三参数手动搬 `r10`，clobber 必含 `r10`），47 个全覆盖；`crt0.S` 从栈取 argc/argv 调 `main`。
 
 ## 6. 文件系统
 
@@ -325,7 +328,7 @@ kernel/fs/
 
 | 对象 | 内容 | 生命周期 |
 |---|---|---|
-| `struct vnode` | `{type, size, fs_data, ops, mnt_data}` | **每次 open 在栈上创建并拷贝**，非持久 inode——两个 fd 的 `pos` 各自独立，无 link count |
+| `struct vnode` | `{type, size, fs_data, ops, mnt_data, ino, dev, ro}` | **每次 open 在栈上创建并拷贝**，非持久 inode——两个 fd 的 `pos` 各自独立，无 link count；后三个字段是 `stat`(45) 的身份与权限来源（`ino` 与 `getdent` 同号、`dev` 挂载槽从 1 起、`ro` 是 FILE 只读属性），由 lookup 一并填 |
 | `struct file` | `{ops, pos, priv, is_dir, flags, refcnt}` | `kmalloc`，引用计数：`vfs_close_file` 用 CAS 循环只减调用者真有的那份，refcnt ≤ 0 的多余 close 打日志并忽略（**计数永不回绕、对象不二次 free**） |
 | `struct dir_iter` | `{node, ops, cookie, mnt_data, err}` | `V_DIR` 的 `file->priv`；`err` 记住扫描已因 I/O 错误终止，下次 `getdent` 继续报错而不是"到头了" |
 | `struct fs_ops` | 12 钩子：lookup/getdent/read/write/**size/close_node**/create/mkdir/unlink/rmdir/rename/freespace | `size` 给 `O_APPEND` 取**实时**大小；`close_node` 由 fs 决定节点释放方式（FAT `kfree` resolve，initramfs 空操作） |
@@ -543,36 +546,36 @@ smp_init():
 
 ### 9.1 内核自测（`ktest/`）
 
-框架与用例分离：`ktest/ktest.c` + **27 个 `t_*.c`**；`KTEST(suite, stage, fn)` 注册进 `.ktest` 段，按 `EARLY/MM/LATE` 三阶段在 `start_kernel` 里跑。编译开关 `KTEST=1`；`make smoke` 强制 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
+框架与用例分离：`ktest/ktest.c` + **28 个 `t_*.c`**；`KTEST(suite, stage, fn)` 注册进 `.ktest` 段，按 `EARLY/MM/LATE` 三阶段在 `start_kernel` 里跑。编译开关 `KTEST=1`；`make smoke` 强制 `KTEST=1`，**直跑 `python3 scripts/smoke_test.py` 会绕过它**，把内核建成无自测版本。
 
-当前判据（2026-11-07 q35 boot 日志，加用例先改这里）：
+当前判据（2026-11-11 q35 boot 日志，加用例先改这里）：
 
 | 阶段 | cases | checks | failed |
 |---|---|---|---|
-| early | 25 | 404 | 0 |
+| early | 25 | 408 | 0 |
 | mm | 17 | 437 | 0 |
-| late | 95 | 3467 | 0 |
-| 合计 | 137 | 4308 | 0（`[2 skipped]`、`[1 warn]`） |
+| late | 99 | 3615 | 0 |
+| 合计 | 141 | 4460 | 0（`[2 skipped]`、`[1 warn]`） |
 
-汇总行 `[ktest] selftest PASS (137 cases, 4308 checks) [2 skipped]` 与 `[selftest] 4308/4308 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**（`WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 任何模式都停机）。`MACHINE=pc` 下同判据 0 failed（`ahci` 整例 skip + early 少 21 checks，均为机器差异，未在此钉具体数字）。
+汇总行 `[ktest] selftest PASS (141 cases, 4460 checks) [2 skipped]` 与 `[selftest] 4460/4460 pass [1 warn]`；那个 warn 是用例自己打的**故意告警**（`WARN` 只计数永不判负，`ASSERT` 失败计失败，`BUG_ON` 任何模式都停机）。`MACHINE=pc` 下同判据 0 failed（`ahci` 整例 skip + early 少 21 checks，均为机器差异，未在此钉具体数字）。
 
-32 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mmap mouse oom pmm prop syscall task usercopy vfs vmm`，覆盖 ABI 布局与编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、系统调用指针门、信号与任务、VFS/FAT32（含多盘挂载分流）、块注册表（分区与满槽）、AHCI 中断路由与首命令中断完成（无 AHCI 设备即 skip）、键盘/鼠标/统一输入队列、mmap 分发与需求分页/COW fork/`mprotect` 授受与共享帧、栈守护与 RSP 邻近、#PF 错误码逐位判别、拷贝门补页（`t_mmap.c` 十例）。
+33 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap ktest lib lock mbr mmap mouse oom pmm prop stat syscall task usercopy vfs vmm`，覆盖 ABI 布局与编号连续性、E820/命令行、锁与 TSC、CR0/CR4 保护位、凭据与能力、绘制与帧缓冲、ELF 拒绝野入口、分箱堆与 OOM 注入、块缓存 LRU、I/O 错误注入、journal 先写日志后落盘、系统调用指针门、信号与任务、VFS/FAT32（含多盘挂载分流）、块注册表（分区与满槽）、AHCI 中断路由与首命令中断完成（无 AHCI 设备即 skip）、键盘/鼠标/统一输入队列、mmap 分发与需求分页/COW fork/`mprotect` 授受与共享帧、栈守护与 RSP 邻近、#PF 错误码逐位判别、拷贝门补页（`t_mmap.c` **十一例**，含文件映射 `test_mmap_file`）、`stat`/时钟（`t_stat.c` **三例**：路径语义、分发门、`rtc_days_from_civil`/格式化/单调性）。
 
 ### 9.2 端到端冒烟（`scripts/smoke_test.py`，`make smoke`）
 
 六阶段全过才退出 0：`toolchain` → `build` → `artifacts` → `boot`（无头 QEMU，**21 条有序 marker**）→ `shell`（串口驱动 `/bin/sh`：ls、cat、systest）→ `forged FAT`（篡改簇链的镜像，要求驱动**报告**且不跟随）。
 
 - 有序 marker 按游标顺序匹配；`--smp N` 只替换两条 SMP 相关 marker，另加一条负向断言（`-smp 1` 时不得出现 AP marker）。
-- 用户态判据 `SYSTEST_TAGS` **120 条**正则（`uname.ret=0`、`unknown.99=-38`、`kill.init.term=-13`、`input.pop.empty=-11`、`mmap.hole=-12`…，含 `systest.done=1`）；键盘/鼠标自检在 systest 进程内完成。**信号与 ABI 常量的号码从 `lnxrm_abi.h` 现读**（`abi_define()`，含 `LNXRM_SYSCALL_LAST`；`past.42/past.43` 据此现算为 `SYSCALL_LAST+1..+3`），不写死。判据一律 `br""` 字节串正则（region 是 `bytes`），列表后有启动期 `_str_tags` 断言防混入 `str`。
+- 用户态判据 `SYSTEST_TAGS` **173 条**正则（`uname.ret=0`、`unknown.99=-38`、`kill.init.term=-13`、`input.pop.empty=-11`、`mmap.hole=-12`、`mmapf.fork.see=67`、`stat.ret=0`、`time.bothnull=-22`…，含 `systest.done=1`）；键盘/鼠标自检在 systest 进程内完成。**信号与 ABI 常量的号码从 `lnxrm_abi.h` 现读**（`abi_define()`，含 `LNXRM_SYSCALL_LAST`；`past.42/past.43` 据此现算为 `SYSCALL_LAST+1..+3`），不写死。判据一律 `br""` 字节串正则（region 是 `bytes`），列表后有启动期 `_str_tags` 断言防混入 `str`。
 - LATE 阶段另搜 6 条报告行（块缓存 LRU、写后读一致、FAT 区不缓存、journal 先写日志+重放），因为 `.ktest` 段内先后是编译器的事。
 - 负面判据：日志不得出现 `WARN(`、`2097151`、`4294967295`、`[PANIC]`。
-- 当前 `make smoke` **205/205**；transcript 写 `build/smoke/serial.log`（非默认 smp 档写 `serial-smpN.log`）。日志里的 `[fat32] I/O error` 是错误注入用例**故意**打的，不是回归。
+- 当前 `make smoke` **270/270**；transcript 写 `build/smoke/serial.log`（非默认 smp 档写 `serial-smpN.log`）。日志里的 `[fat32] I/O error` 是错误注入用例**故意**打的，不是回归。
 
 ### 9.3 用户态自检（`userland/systest.c`）
 
-按系统调用编号分节的全量自检：错误码路径、信号与等待（含 WNOHANG）、`fb_*` 图形、故意段错误隔离、降权子进程段（`setuid(1000)` 后逐个撞权限检查点）、超长路径段、内存记账与配额段、画屏归属段（三层 fork：抢屏 → 撞墙 → 持有者退出）、键盘段（空环快照 + `EAGAIN` + 注入 `kbd0` 读回 + 降权拒绝）、鼠标段（空环快照 + 只读探针 + 降权拒绝，真实指针在环里时打 `mouse.skip`）、统一队列段（`capacity=63`/`sane`/`sum` 恒等 + 空队 `EAGAIN` + 降权拒绝），末尾打 `systest.done=1`。由 smoke 的 `shell` 阶段在串口上驱动。
+按系统调用编号分节的全量自检：错误码路径、信号与等待（含 WNOHANG）、`fb_*` 图形、故意段错误隔离、降权子进程段（`setuid(1000)` 后逐个撞权限检查点）、超长路径段、内存记账与配额段、画屏归属段（三层 fork：抢屏 → 撞墙 → 持有者退出）、键盘段（空环快照 + `EAGAIN` + 注入 `kbd0` 读回 + 降权拒绝）、鼠标段（空环快照 + 只读探针 + 降权拒绝，真实指针在环里时打 `mouse.skip`）、统一队列段（`capacity=63`/`sane`/`sum` 恒等 + 空队 `EAGAIN` + 降权拒绝）、`stat`/时间段（类型与权限条件、`ino`/`blksize`/`blocks`、问两次不创建、写 10 字节后 `size=10`、`epoch=1[78]\d{8}`、usec 合法、不回退、timezone 清零、两 NULL `-22`），末尾打 `systest.done=1`。由 smoke 的 `shell` 阶段在串口上驱动。
 
-**结构**：每一段是一个 `static void t_*(void)`（36 个，段注释原地变成函数头上的文档），`main` 只剩 47 行——`env` 子进程早退、按原顺序的 36 次调用、`systest.done=1`、末尾色卡。**输出一字不变**（新增的 `t_mmap_surface` 是追加，原有段落未动），120 条 `SYSTEST_TAGS` 判据不涉及。
+**结构**：每一段是一个 `static void t_*(void)`（38 个，段注释原地变成函数头上的文档），`main` 只剩 54 行（含签名与收尾 `}`）——`env` 子进程早退、按原顺序的 38 次调用、`systest.done=1`、末尾色卡。**已有段落的输出一字未动**（`t_mmap_surface` 与 `t_mmap_file` 都是追加在末尾，各自打自己的 `mmap.*`/`mmapf.*` 标签），173 条 `SYSTEST_TAGS` 判据里前 143 条因此照旧命中。
 
 ## 10. 关键不变式
 

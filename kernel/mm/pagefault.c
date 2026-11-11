@@ -11,17 +11,20 @@
  * The dispatch is the seam fixers plug into.  Each inspects (cr2, err) and
  * claims the fault if it can resolve it; the first claim wins and the safe
  * default (kill) is kept for everything else.  Today three mount here, in
- * order: demand_page (not-present inside an mmap VMA), stack_grow
- * (not-present inside the stack growth window), cow_fault (write-protect
- * fault on a PG_COW page).  A write-protect fault on a page that is neither
- * writable nor COW is a genuine read-only violation and deliberately falls
- * through to SIGSEGV.  A file-backed fixer or swap-in would join here the
- * same way.
+ * order: demand_page (not-present inside an mmap VMA -- anonymous AND
+ * file-backed: it is one fixer because the VMA, not the fault, decides
+ * which), stack_grow (not-present inside the stack growth window),
+ * cow_fault (write-protect fault on a PG_COW page).  A write-protect fault
+ * on a page that is neither writable nor COW is a genuine read-only
+ * violation and deliberately falls through to SIGSEGV.  A swap-in would
+ * join here the same way demand_page did.
  */
 #include <sys/sched.h>
 #include <mm/mm.h>
 #include <mm/vma.h>
+#include <mm/filepage.h>
 #include <mm/pagefault.h>
+#include <sys/vfs.h>
 #include <console.h>
 
 /* How far the stack may grow below its initial mapping.  The initial stack
@@ -138,15 +141,20 @@ static bool stack_grow(struct intr_frame *f, u64 cr2)
     return true;
 }
 
-/* ---- fixer: demand paging for mmap'd ranges (T-MMAP) ----
+/* ---- fixer: demand paging for mmap'd ranges (T-MMAP, T-FILE) ----
  *
  * mmap() only records a VMA (mm/vma.c); the frame arrives here, on first
- * touch.  Zeroed on allocation (an anonymous page starts as zeros, never a
- * previous occupant's bytes), mapped with the VMA's protection, and metered
- * through the same cred_mem_quota() ceiling brk and stack growth honour --
- * without that, mmap would turn the 64 MiB cap into a suggestion.  A range
- * nobody touches costs nothing but one VMA node, which is the whole point
- * of the window being 64 GiB wide. */
+ * touch.  What fills it is the VMA's own business: zeros for an anonymous
+ * range (a fresh page never starts as a previous occupant's bytes), the
+ * file's bytes for a file-backed one, and the SHARED frame of that file
+ * page when the range says MAP_SHARED -- so two processes mapping the same
+ * file at the same offset are handed the same physical page.  Whichever
+ * kind it is, it is mapped with the VMA's protection and metered through
+ * the same cred_mem_quota() ceiling brk and stack growth honour -- without
+ * that, mmap would turn the 64 MiB cap into a suggestion and mapping a
+ * large file would become a way to spend frames nobody accounts for.  A
+ * range nobody touches costs nothing but one VMA node, which is the whole
+ * point of the window being 64 GiB wide. */
 static bool demand_page(struct intr_frame *f, u64 cr2)
 {
     if (f->err & 1) return false; /* present fault: not a missing page */
@@ -186,12 +194,47 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
     u64 quota = cred_mem_quota(&t->cred);
     if (quota && t->mem_pages + 1 > quota) return false;
 
-    u64 pa = pmm_alloc();
-    if (!pa) return false;
-    memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
+    u64 pa;
+    if (v->file) {
+        /* File-backed: the bytes come from the file at the offset this VMA
+         * names for this page, not from the zero page.  MAP_SHARED asks the
+         * cache for THE frame of that (file, offset) -- one frame per file
+         * page for the whole system, which is what makes one process's
+         * store visible to the next mapping and, at write-back, to the
+         * file.  MAP_PRIVATE gets a frame of its own instead: a private
+         * mapping's bytes belong to the process, so sharing them would let
+         * one writer see another's store, and the frame must be private
+         * for fork's copy-on-write to have something to copy. */
+        u64 off = v->file_off + (page - v->start);
+        if (v->flags & LNXRM_MAP_SHARED) {
+            pa = filepage_get(v->file, off);
+            if (!pa) return false;
+        } else {
+            pa = pmm_alloc();
+            if (!pa) return false;
+            memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
+            /* A SHORT read is normal: the file's last page is usually
+             * partial and the frame was zeroed first, so the tail reads as
+             * zeros exactly as the file's own bytes past EOF do.  A failed
+             * read (negative) is not a page -- hand the frame back and
+             * leave the fault unfixed rather than map zeros that pretend
+             * to be the file's contents. */
+            if (vfs_pread(v->file, (void *)PHYS_TO_VIRT(pa), PAGE_SIZE, off) < 0) {
+                pmm_free(pa);
+                return false;
+            }
+        }
+    } else {
+        pa = pmm_alloc();
+        if (!pa) return false;
+        memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
+    }
     /* PROT_READ is implicit (every present page is readable -- x86 has no
      * read-disable without PKU), PROT_NONE therefore degrades to read-only;
-     * W and NX are exactly what the VMA asked for. */
+     * W and NX are exactly what the VMA asked for.  A shared file page gets
+     * W straight from here too: it is not a candidate for copy-on-write
+     * (vma_fork_shared keeps it writable across fork, and mprotect grants
+     * it W without marking PG_COW), so the next write must not trap. */
     if (vmm_map_user(t->pml4, page, pa, (v->prot & LNXRM_PROT_WRITE) != 0, true,
                      (v->prot & LNXRM_PROT_EXEC) != 0) < 0) {
         pmm_free(pa);

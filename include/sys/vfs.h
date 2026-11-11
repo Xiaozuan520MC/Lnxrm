@@ -15,6 +15,17 @@ struct vnode {
     void *fs_data; /* fs-private node */
     struct fs_ops *ops;
     void *mnt_data; /* fs-private mount data (fs_ops.mnt) */
+    /* Identity for stat(2), filled by the same lookup that fills the rest
+     * (0 = the node stands for something with no on-disk record: a mount
+     * root, a synthesised /dev node).  `dev` is the mount slot the node
+     * resolved through -- how a caller tells "/README.md" on the boot
+     * volume from the same name below /mnt.  `ro` is the FILE's read-only
+     * attribute translated to "this node cannot be written", which is what
+     * stat's permission bits are derived from -- this filesystem has no
+     * mode bits of its own. */
+    u64 ino;
+    u64 dev;
+    bool ro;
 };
 
 struct dirent_out {
@@ -83,6 +94,9 @@ struct intr_frame;
 void syscall_entry(struct intr_frame *f);
 #ifdef CONFIG_KTEST
 long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3); /* ktest only: dispatch, no user-entry */
+/* The same, for a call wider than three arguments: mmap's flags/fd/offset
+ * reach the kernel in rdx/rcx/r8, which is where this puts them. */
+long syscall_probe6(u64 nr, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6);
 #endif
 long sys_open(const char *path, int flags);
 
@@ -123,8 +137,41 @@ bool vfs_root_is_fat(void);   /* ...and it is the on-disk FAT32 volume (ENOSPC t
 const char *vfs_abs_path(const char *path, char *buf, size_t bufsz);
 long vfs_open_file(const char *path, int flags, struct file **out);
 size_t vfs_file_size(struct file *f);
+/* The size the filesystem reports RIGHT NOW, not the snapshot the lookup
+ * took: vfs_file_size() reads `vn->size`, which a write through this very
+ * descriptor has already left behind (a file created by open(O_CREAT) * starts at 0 and never updates it).  MAP_SHARED write-back decides from
+ * this whether a page still fits the file, so a stale 0 would silently
+ * discard every page of a file that has since grown. */
+u64 vfs_file_size_now(struct file *f);
 long vfs_read_file(struct file *f, void *buf, size_t n);
+/* Positional I/O at an absolute offset, leaving the descriptor's own
+ * cursor (f->pos) exactly where lseek() last put it.  Page-granular file
+ * I/O needs this: the demand pager fills a page at the offset its VMA
+ * names and MAP_SHARED writeback puts a page back at that same offset --
+ * neither may move the seek position the process chose, and neither may
+ * be turned into a read-then-restore of f->pos (two callers would race
+ * over one cursor).  Regular files only: a directory has no bytes to map
+ * and a character device has no file behind it, so both answer EINVAL --
+ * which is also what sys_mmap refuses up front. */
+long vfs_pread(struct file *f, void *buf, size_t n, u64 off);
+long vfs_pwrite(struct file *f, const void *buf, size_t n, u64 off);
 void vfs_close_file(struct file *f);
+
+/* What stat(2) needs from a path, gathered without leaving a descriptor
+ * (or anything else) behind: one lookup, the numbers copied out, the
+ * filesystem's node handed straight back via close_node.  `type`/`size`
+ * are what the lookup already resolves, `ino` the stable id, `ro` whether
+ * the volume says the file is not writable.  Answers a negative LNXRM
+ * error -- ENOENT for a path that is not there -- and writes *out only on
+ * success, so a caller that failed never has to un-fill anything. */
+struct vfs_attr {
+    enum vnode_type type;
+    bool ro;
+    u64 ino;
+    u64 dev;
+    u64 size;
+};
+long vfs_stat_path(const char *path, struct vfs_attr *out);
 
 long sys_read(int fd, void *buf, size_t n);
 long sys_write(int fd, const void *buf, size_t n);
@@ -135,6 +182,11 @@ long sys_dup2(int oldfd, int newfd);
 long sys_mkdir(const char *upath);
 long sys_unlink(const char *upath);
 long sys_rmdir(const char *upath);
+/* stat(45): metadata for `path` into a caller-provided lnxrm_stat.  The
+ * path is a KERNEL string (the dispatcher copied it out of user space) --
+ * the same convention sys_unlink/sys_rename follow, and what lets the
+ * self-test call this with paths it built itself. */
+long sys_stat(const char *path, struct lnxrm_stat *buf);
 /* C27: make every cached dirty sector durable before returning. */
 long sys_sync(void);
 long sys_rename(const char *uold, const char *unew);

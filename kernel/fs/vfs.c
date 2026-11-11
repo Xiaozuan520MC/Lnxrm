@@ -3,6 +3,7 @@
 #include <sys/vfs.h>
 #include <console.h>
 #include <mm/mm.h>
+#include <mm/filepage.h> /* MAP_SHARED frames die with their struct file */
 #include <sys/sched.h>
 #include <sys/cpu.h>
 #include <disk.h>
@@ -227,12 +228,18 @@ static int dev_lookup(const char *path, struct vnode *vn)
         vn->fs_data = NULL;
         vn->ops = &dev_ops;
         vn->mnt_data = NULL; /* not a real filesystem: there is no mount */
+        vn->ino = 0;
+        vn->ro = false;
         return 0;
     }
     if (!strcmp(p, "/dev/console")) {
         vn->type = V_CHR;
         vn->fs_data = NULL;
         vn->mnt_data = NULL;
+        /* The id dev_getdent() reports for this very node: stat and
+         * readdir must not disagree about who /dev/console is. */
+        vn->ino = 1;
+        vn->ro = false;
         return 0;
     }
     return LNXRM_ENOENT;
@@ -249,6 +256,7 @@ static long vfs_lookup(const char *path, int flags, struct vnode *vn)
             struct mounted_fs *m = fs_for_path(&p);
             if (m && m->ops->lookup(m->priv, p, vn) == 0) {
                 vn->mnt_data = m->priv; /* C39: the mount this node came from */
+                vn->dev = (u64)(m - mounts) + 1; /* st_dev: slot 1.., 0 = no volume */
                 return 0;
             }
         }
@@ -286,8 +294,13 @@ static long vfs_lookup(const char *path, int flags, struct vnode *vn)
     }
     /* C39: every node that leaves here -- resolved, created or truncated --
      * carries the mount it was resolved through, so read/write/size/close
-     * below never have to ask "which volume was that?" by matching ops. */
+     * below never have to ask "which volume was that?" by matching ops.
+     * The slot index rides along for stat's st_dev, numbered FROM ONE so
+     * that 0 stays unambiguous: 0 means "this node has no volume behind
+     * it" (a synthesised /dev node, an unmounted fallback), which slot 0
+     * at "/". would otherwise also read as. */
     vn->mnt_data = m->priv;
+    vn->dev = (u64)(m - mounts) + 1;
     return 0;
 }
 
@@ -346,6 +359,46 @@ long vfs_open_file(const char *path, int flags, struct file **out)
     return 0;
 }
 
+/* stat's door: one lookup, the four numbers copied out, the node handed
+ * straight back.  Deliberately NOT open-then-close -- that would cost a
+ * struct file, an fd slot and (on O_CREAT paths) the side effect of
+ * creating what was asked about -- and deliberately NOT a size snapshot
+ * either: the size comes from the filesystem's own size op, the same
+ * source vfs_file_size_now() uses, so a file this process has just
+ * written reports the length it has NOW rather than the one the lookup
+ * that opened it took (see the header comment on vfs_attr).
+ *
+ * flags is 0: a stat never creates and never truncates, so the O_CREAT
+ * arm of vfs_lookup() is unreachable from here and asking for a missing
+ * path is ENOENT, not an empty file nobody wanted. */
+long vfs_stat_path(const char *path, struct vfs_attr *out)
+{
+    char abuf[128];
+    struct vnode vn;
+
+    if (!path || !out) return LNXRM_EINVAL;
+    const char *p = abs_path(path, abuf, sizeof(abuf));
+    if (!p) return LNXRM_ENAMETOOLONG;
+    long err = vfs_lookup(p, 0, &vn);
+    if (err < 0) return err;
+
+    out->type = vn.type;
+    out->ino = vn.ino;
+    out->dev = vn.dev;
+    out->ro = vn.ro;
+    /* Directories have no byte length in this kernel (getdent is their
+     * door), and a synthesised /dev node carries no ops at all -- the
+     * lookup's own zeroed size is the honest answer for both. */
+    out->size = vn.type == V_REG && vn.ops && vn.ops->size ? vn.ops->size(vn.mnt_data, vn.fs_data)
+                                                           : vn.size;
+
+    /* C40: the node belongs to the filesystem -- release it exactly the
+     * way sys_close does, and only if it has a release op (a /dev node
+     * has none, its fs_data is NULL). */
+    if (vn.ops && vn.ops->close_node) vn.ops->close_node(vn.mnt_data, vn.fs_data);
+    return 0;
+}
+
 size_t vfs_file_size(struct file *f)
 {
     /* C42: a character device carries no backing vnode -- file_alloc()
@@ -358,6 +411,36 @@ size_t vfs_file_size(struct file *f)
 
 long vfs_read_file(struct file *f, void *buf, size_t n)
 { return f->ops->read(f, buf, n); }
+
+/* Positional read/write on a REGULAR file: straight to the filesystem's
+ * node op at `off`, with no cursor involved.  Both check the descriptor's
+ * access mode themselves -- this is the same door reg_read/reg_write
+ * guard, just without the f->pos half, so an O_WRONLY descriptor still
+ * cannot be used to fill a page and an O_RDONLY one still cannot be used
+ * to write one back. */
+long vfs_pread(struct file *f, void *buf, size_t n, u64 off)
+{
+    if (!f || f->is_dir || !f->priv || !buf) return LNXRM_EINVAL;
+    int mode = f->flags & (O_RDONLY | O_WRONLY | O_RDWR);
+    if (mode != O_RDONLY && mode != O_RDWR) return LNXRM_EBADF;
+    struct vnode *vn = f->priv;
+    if (!vn->ops || !vn->ops->read) return LNXRM_EINVAL;
+    return vn->ops->read(vn->mnt_data, vn->fs_data, off, buf, n);
+}
+
+long vfs_pwrite(struct file *f, const void *buf, size_t n, u64 off)
+{
+    /* `!buf` is refused even for n == 0 on purpose: fat_write() reads a
+     * NULL buffer with a zero length as O_TRUNC and EMPTIES the file, so a
+     * zero-byte positional write with no buffer would be a truncation
+     * nobody asked for. */
+    if (!f || f->is_dir || !f->priv || !buf) return LNXRM_EINVAL;
+    int mode = f->flags & (O_RDONLY | O_WRONLY | O_RDWR);
+    if (mode != O_WRONLY && mode != O_RDWR) return LNXRM_EBADF;
+    struct vnode *vn = f->priv;
+    if (!vn->ops || !vn->ops->write) return LNXRM_EINVAL;
+    return vn->ops->write(vn->mnt_data, vn->fs_data, off, buf, n);
+}
 
 /* C43: dropping a reference must never take the count below zero.
  *
@@ -390,6 +473,13 @@ void vfs_close_file(struct file *f)
     } while (!__sync_bool_compare_and_swap(&f->refcnt, prev, prev - 1));
     if (prev > 1) return;
     if (f->ops && f->ops->close) f->ops->close(f);
+    /* Every MAP_SHARED frame cached for this file goes with it.  A VMA
+     * holds a reference on its file for as long as the range is mapped, so
+     * reaching this line means no mapping of this file survives anywhere;
+     * mappings that were already unmapped dropped their own frame reference
+     * then, so dropping the cache's reference here can never free a frame
+     * some PTE still names. */
+    filepage_drop_file(f);
     kfree(f);
 }
 
@@ -581,6 +671,14 @@ static u64 vn_size_now(struct file *f)
     if (!vn || f->is_dir) return 0;
     return vn->ops && vn->ops->size ? vn->ops->size(vn->mnt_data, vn->fs_data)
                                     : vn->size;
+}
+
+/* The published half of the same answer, for a caller that must not be
+ * fooled by a descriptor's own writes (see the declaration in vfs.h). */
+u64 vfs_file_size_now(struct file *f)
+{
+    if (!f) return 0;
+    return vn_size_now(f);
 }
 
 /* C41: an fd's access mode decides what it serves.  An O_RDONLY descriptor

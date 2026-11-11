@@ -20,6 +20,7 @@
 #include <console.h>
 #include <mm/mm.h>
 #include <mm/vma.h>
+#include <mm/filepage.h>
 #include <mm/pagefault.h>
 #include <sys/sched.h>
 #include <sys/cpu.h>
@@ -308,9 +309,12 @@ static void test_vma_list(void)
     struct task fake;
     memset(&fake, 0, sizeof(fake));
 
-    K_EXPECT_EQ(vma_insert(&fake, 0x1000, 0x3000, LNXRM_PROT_READ), 0);
-    K_EXPECT_EQ(vma_insert(&fake, 0x8000, 0x9000, LNXRM_PROT_WRITE), 0);
-    K_EXPECT_EQ(vma_insert(&fake, 0x4000, 0x7000, LNXRM_PROT_READ), 0); /* out of order */
+    /* Anonymous inserts: flags 0, no file, no offset (the three fields
+     * file mappings add -- see mm/vma.h). */
+    K_EXPECT_EQ(vma_insert(&fake, 0x1000, 0x3000, LNXRM_PROT_READ, 0, 0, NULL), 0);
+    K_EXPECT_EQ(vma_insert(&fake, 0x8000, 0x9000, LNXRM_PROT_WRITE, 0, 0, NULL), 0);
+    K_EXPECT_EQ(vma_insert(&fake, 0x4000, 0x7000, LNXRM_PROT_READ, 0, 0, NULL),
+                0); /* out of order */
     u64 prev = 0;
     for (struct vma *v = fake.vmas; v; v = v->next) { /* kept sorted */
         K_EXPECT(v->start >= prev);
@@ -703,3 +707,155 @@ static void test_stack_guard(void)
     K_EXPECT_EQ(pmm_free_bytes(), fb_before);
 }
 KTEST("mmap", KTEST_LATE, test_stack_guard);
+
+/* ================= file-backed mmap (T-FILE) =================
+ *
+ * The three things only a file mapping can get wrong: WHICH bytes end up
+ * in the page, whether two mappings of one file page are really ONE frame,
+ * and whether a dirty shared page reaches its file before the mapping
+ * goes.  Everything runs through the same doors ring 3 uses --
+ * syscall_probe6() into the real dispatch table, page_fault_try_fix() for
+ * the fill, vma_writeback() for the flush -- and against a file this case
+ * creates and removes itself, so the volume is left exactly as found (the
+ * shape t_vfs.c already uses for /ENOSPC.T).
+ *
+ * The frame identity check is the heart of it: MAP_PRIVATE must stay OUT
+ * of the shared cache (its bytes are the process's), MAP_SHARED must put
+ * exactly ONE entry in it no matter how many ranges ask for that file
+ * page, and mprotect must grant write without copy-on-write -- the frame
+ * has three owners by then, so pmm_refcount() > 1 and the anonymous rule
+ * would hand this process a private copy that neither the other mapping
+ * nor the file would ever see. */
+static void test_mmap_file(void)
+{
+    K_ASSERT(current->vmas == NULL);
+    u64 count_before = vmm_count_user_pages(current->pml4);
+    u64 fb_before = pmm_free_bytes();
+    u64 fp_before = filepage_resident();
+    struct intr_frame f;
+
+    /* The path must be a USER pointer: h_open() reads it with
+     * copy_user_str(), which refuses anything ring 3 could not have named
+     * -- a string literal in this file's .rodata included (that is exactly
+     * what the first run of this case ran into).  So build one the way ring
+     * 3 would: an anonymous mmap (flags 0 + fd -1, which the kernel
+     * normalises to MAP_PRIVATE -- the pre-file shape, exercised here for
+     * real), faulted in through the #PF dispatch, then the string written
+     * through the frame's high-half alias, since a kernel self-test has no
+     * user-mode store of its own. */
+    long path = syscall_probe6(SYS_mmap, 0, PAGE_SIZE,
+                               LNXRM_PROT_READ | LNXRM_PROT_WRITE, 0, (u64)-1, 0);
+    K_ASSERT(path > 0);
+    pf_frame(&f, PF_NP_R);
+    K_EXPECT(page_fault_try_fix(&f, (u64)path));
+    u64 ppa = vmm_translate_in(current->pml4, (u64)path);
+    K_ASSERT(ppa != 0);
+    memcpy((void *)PHYS_TO_VIRT(ppa), "/FMAP.T", 8); /* 7 bytes + NUL */
+
+    long fd = syscall_probe(SYS_open, (u64)path, O_CREAT | O_RDWR | O_TRUNC, 0);
+    K_ASSERT(fd >= 0);
+    static const char payload[8] = {'F', 'I', 'L', 'E', 'M', 'A', 'P', '!'};
+    /* Not SYS_write: that gate runs user_ptr_writable() over the buffer and
+     * this one lives in kernel data.  vfs_pwrite is the same filesystem
+     * door sys_write ends up at, without the ring-3 half of it. */
+    K_ASSERT_EQ(vfs_pwrite(current->fds[fd], payload, sizeof(payload), 0),
+                sizeof(payload));
+
+    /* ---- every refusal costs no address space and no cache entry ---- */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                               LNXRM_MAP_SHARED | LNXRM_MAP_PRIVATE, (u64)fd, 0),
+                LNXRM_EINVAL); /* they mean opposite things */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                               LNXRM_MAP_SHARED | 0x40, (u64)fd, 0),
+                LNXRM_EINVAL); /* unknown flag bit */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                               LNXRM_MAP_PRIVATE, (u64)fd, 0x100),
+                LNXRM_EINVAL); /* offset must be page-aligned */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                               LNXRM_MAP_PRIVATE, 99, 0),
+                LNXRM_EBADF); /* no such descriptor (and 99 > NR_FDS) */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                               LNXRM_MAP_PRIVATE, (u64)-1, PAGE_SIZE),
+                LNXRM_EINVAL); /* anonymous has no file to sit at an offset of */
+    /* None of those refusals may have claimed even a VMA node: the list is
+     * still exactly the one path page it held before they ran. */
+    K_ASSERT(current->vmas != NULL && current->vmas->next == NULL);
+    K_EXPECT_EQ(current->vmas->start, (u64)path);
+
+    /* ---- MAP_PRIVATE: the file's bytes, a frame of its own ---- */
+    long base = syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                               LNXRM_MAP_PRIVATE, (u64)fd, 0);
+    K_ASSERT(base > 0);
+    K_EXPECT_EQ(vmm_translate_in(current->pml4, (u64)base), 0); /* lazy */
+
+    pf_frame(&f, PF_NP_R);
+    K_EXPECT(page_fault_try_fix(&f, (u64)base));
+    u64 pa = vmm_translate_in(current->pml4, (u64)base);
+    K_ASSERT(pa != 0);
+    K_EXPECT_EQ(memcmp((void *)PHYS_TO_VIRT(pa), payload, sizeof(payload)), 0);
+    K_EXPECT_EQ(filepage_resident(), fp_before); /* private stays out of the cache */
+
+    /* ---- MAP_SHARED: one frame per file page, for the whole system ---- */
+    long sh = syscall_probe6(SYS_mmap, 0, PAGE_SIZE,
+                             LNXRM_PROT_READ | LNXRM_PROT_WRITE, LNXRM_MAP_SHARED,
+                             (u64)fd, 0);
+    K_ASSERT(sh > 0);
+    pf_frame(&f, PF_NP_R);
+    K_EXPECT(page_fault_try_fix(&f, (u64)sh));
+    u64 spa = vmm_translate_in(current->pml4, (u64)sh);
+    K_ASSERT(spa != 0);
+    K_EXPECT_EQ(filepage_resident(), fp_before + 1);
+    K_EXPECT_EQ(memcmp((void *)PHYS_TO_VIRT(spa), payload, sizeof(payload)), 0);
+    K_EXPECT(vmm_user_pte(current->pml4, (u64)sh) & PG_W);      /* writable at once */
+    K_EXPECT(!(vmm_user_pte(current->pml4, (u64)sh) & PG_COW)); /* never copy-on-write */
+    K_EXPECT(!(vmm_user_pte(current->pml4, (u64)sh) & PG_D));   /* never written */
+
+    /* a SECOND range over the same file page must be handed the same frame */
+    long sh2 = syscall_probe6(SYS_mmap, 0, PAGE_SIZE, LNXRM_PROT_READ,
+                              LNXRM_MAP_SHARED, (u64)fd, 0);
+    K_ASSERT(sh2 > 0);
+    pf_frame(&f, PF_NP_R);
+    K_EXPECT(page_fault_try_fix(&f, (u64)sh2));
+    K_EXPECT_EQ(vmm_translate_in(current->pml4, (u64)sh2), spa);
+    K_EXPECT_EQ(filepage_resident(), fp_before + 1); /* still one entry */
+
+    /* ---- mprotect consults the VMA (three owners, still not COW) ---- */
+    K_EXPECT_EQ(syscall_probe(SYS_mprotect, (u64)sh, PAGE_SIZE, LNXRM_PROT_READ), 0);
+    K_EXPECT(!(vmm_user_pte(current->pml4, (u64)sh) & PG_W));
+    K_EXPECT_EQ(syscall_probe(SYS_mprotect, (u64)sh, PAGE_SIZE,
+                              LNXRM_PROT_READ | LNXRM_PROT_WRITE),
+                0);
+    K_EXPECT(vmm_user_pte(current->pml4, (u64)sh) & PG_W);
+    K_EXPECT(!(vmm_user_pte(current->pml4, (u64)sh) & PG_COW));
+
+    /* ---- write-back: a dirty shared page is the file's, a clean one costs
+     * nothing.  ktest stores through the high-half alias, which does not
+     * raise the hardware dirty bit, so set the bit the store would have. */
+    static const char fresh[8] = {'S', 'H', 'A', 'R', 'E', 'D', '!', '\n'};
+    memcpy((void *)PHYS_TO_VIRT(spa), fresh, sizeof(fresh));
+    u64 spte = vmm_user_pte(current->pml4, (u64)sh);
+    vmm_user_pte_write(current->pml4, (u64)sh, spte | PG_D);
+
+    K_EXPECT_EQ(vma_writeback(current, current->pml4, 0, MMAP_TOP), 1);
+    K_EXPECT(!(vmm_user_pte(current->pml4, (u64)sh) & PG_D)); /* clean again */
+    char back[8];
+    K_ASSERT_EQ(vfs_pread(current->fds[fd], back, sizeof(back), 0), sizeof(back));
+    K_EXPECT_EQ(memcmp(back, fresh, sizeof(back)), 0);
+    K_EXPECT_EQ(vma_writeback(current, current->pml4, 0, MMAP_TOP), 0); /* nothing left */
+
+    /* ---- teardown: every frame, every node, every cache entry back ---- */
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)path, PAGE_SIZE, 0), 0);
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)sh, PAGE_SIZE, 0), 0);
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)sh2, PAGE_SIZE, 0), 0);
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)base, PAGE_SIZE, 0), 0);
+    K_EXPECT_EQ(syscall_probe(SYS_close, (u64)fd, 0, 0), 0);
+    K_EXPECT_EQ(sys_unlink("/FMAP.T"), 0);
+    /* The cache outlives the mappings but not the file: the last close
+     * dropped its frames, so the buddy must be whole again. */
+    K_EXPECT_EQ(filepage_resident(), fp_before);
+    K_EXPECT(current->vmas == NULL);
+    K_EXPECT_EQ(vmm_count_user_pages(current->pml4), count_before);
+    K_EXPECT_EQ(current->mem_pages, count_before);
+    K_EXPECT_EQ(pmm_free_bytes(), fb_before);
+}
+KTEST("mmap", KTEST_LATE, test_mmap_file);

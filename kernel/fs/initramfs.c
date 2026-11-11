@@ -207,6 +207,8 @@ static int irfs_lookup(void *mnt, const char *path, struct vnode *out)
         out->fs_data = NULL; /* NULL names the root; getdent copes */
         out->ops = &irfs_ops;
         out->mnt_data = mnt;
+        out->ino = 0;   /* no archive entry stands for the root itself */
+        out->ro = true; /* a linked-in archive has no write door at all */
         return 0;
     }
 
@@ -219,6 +221,11 @@ static int irfs_lookup(void *mnt, const char *path, struct vnode *out)
         out->fs_data = e;
         out->ops = &irfs_ops;
         out->mnt_data = mnt;
+        /* Same slot number irfs_getdent() reports for this entry (its
+         * `i + 1`, so 0 stays reserved for "no record"), stable for the
+         * life of the mount. */
+        out->ino = (u64)i + 1;
+        out->ro = true; /* the archive is read-only: irfs_write refuses */
         return 0;
     }
     return LNXRM_ENOENT;
