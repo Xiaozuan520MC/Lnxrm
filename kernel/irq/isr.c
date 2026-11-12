@@ -544,10 +544,6 @@ static void irq_path(struct intr_frame *f)
     if (current && current->pid != 0 && (f->cs & 3) == 3) current->tf = f;
 
     if (irq >= 0 && irq < 16) {
-        /* spurious IRQ7/15 check (still valid with IOAPIC) */
-        if (irq == 7 || irq == 15) {
-            if (f->intno == 0xFF) return;
-        }
         /* EOI BEFORE the handler: handlers such as the PIT tick may call
          * schedule() and switch away; a delayed EOI would leave the LAPIC
          * ISR bit set and stall this vector until the interrupted task

@@ -12,7 +12,7 @@
 > （42 已扩成 Linux 六参 `addr,len,prot,flags,fd,offset`：匿名 + 文件映射
 > `MAP_SHARED`/`MAP_PRIVATE`）与 `mprotect` 44，元数据与时间 2 个
 > （`stat` 45、`gettimeofday` 46）；
-> ktest 141 cases / 4460 checks（q35，2 skipped；pc 同判据 0 failed，`ahci` 无设备即 skip；1 条刻意告警）；
+> ktest 146 cases / 4522 checks（q35，2 skipped；pc 同判据 0 failed，`ahci` 无设备即 skip；1 条刻意告警）；
 > `make smoke` 270/270（默认 `-smp 2`，`--smp 1` 同数）；`make` 零警告。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释里有交叉引用），本文主体**只收仍然开放的条目**，
@@ -27,8 +27,8 @@
 | 维度 | 分 | 现状与主要缺口 |
 |---|---|---|
 | 引导与启动 | 4 | QEMU `-kernel` 与 GRUB `linux` 双路径、VBE 级联选型、E820 采集；缺 GRUB 路径自动化（C68）、只用单个最大 E820 区（C69）、固定物理地址与 loader 指针未校验（C66/C67/C70） |
-| 物理内存 | 3 | buddy 分配器、按进程记账（`ps` 的 MEM/PEAK）、普通用户 64 MiB 配额（`cred_mem_quota`）、管理窗口 `PMM_WINDOW_TOP` = 2 GiB；无回收、无 swap、无 OOM killer |
-| 虚拟内存 | 3 | 三槽 PML4（内核映射对新进程零成本传播）、用户页 NX、懒栈增长（`page_fault_try_fix` → `stack_grow`）、**栈保护页**（`[MMAP_TOP, 栈地板)` 永不映射 + RSP 邻近检查）、`mmap`/`munmap`/`mprotect`（VMA 登记 + 需求分页 + 运行期翻权限，**匿名与文件映射两支**：`MAP_SHARED` 走共享页缓存 `mm/filepage.c`、写回由硬件 `PG_D` 定）、COW `fork`（order-0 帧引用计数）；无 swap/reclaim，内核映射不带 NX（无 W^X） |
+| 物理内存 | 3 | buddy 分配器、按进程记账（`ps` 的 MEM/PEAK）、普通用户 64 MiB 配额（`cred_mem_quota`）、管理窗口 `PMM_WINDOW_TOP` = 2 GiB；**OOM killer 已就位（2026-11-12）**——用户缺页拿不到帧时杀持有最多用户页的进程（`kernel/mm/oom.c`）；仍无回收、无 swap |
+| 虚拟内存 | 3 | 三槽 PML4（内核映射对新进程零成本传播）、用户页 NX、懒栈增长（`page_fault_try_fix` → `stack_grow`）、**栈保护页**（`[MMAP_TOP, 栈地板)` 永不映射 + RSP 邻近检查）、`mmap`/`munmap`/`mprotect`（VMA 登记 + 需求分页 + 运行期翻权限，**匿名与文件映射两支**：`MAP_SHARED` 走共享页缓存 `mm/filepage.c`、写回由硬件 `PG_D` 定）、COW `fork`（order-0 帧引用计数）；无 swap/reclaim；**内核镜像 W^X 已收口（2026-11-12）**——text R-X、`.rodata` R--、data/bss RW-，恒等与高半两个别名一起改 |
 | 进程与信号 | 3 | `fork/execve/wait4/brk/kill`、`sigaction/sigprocmask/sigreturn`、`parent` 存 (pid, 世代) 并经 `task_parent()` 解析；无 CPU 时间限制 |
 | 调度 | 3 | 每 CPU 运行队列、按空闲/队列长度的负载均衡、每 CPU 本地 LAPIC tick；队列实为 push-front LIFO（C62）、内核态不可抢占、无优先级/nice |
 | SMP | 3 | ACPI MADT 枚举 + xAPIC/x2APIC 双路访问、AP 本地时钟与共享标定；全局锁 + 轮询 I/O 使延迟敏感场景不可用 |
@@ -38,8 +38,8 @@
 | 文件系统 | 3 | FAT32 + on-disk redo journal（mount 时 replay，`ktest/t_journal.c`）+ 时间戳 LRU 块缓存 + 簇链步数预算；边界批次已收口（目录游标 C30、LFN 260 字符 C31、FAT 容量拒绝 C32、末条目可达 C33、短名终止符 C34、MBR 范围与 EBR 链 C36），目录结束符同时改回规范字义（0x00 止看，0x05 是别名转义/活记录）；vnode 泄漏（C40）已修；挂载层收口（C28/C39/C43/C47：分区入 `diskinfo`、ops/priv 成对下传、最长前缀多挂载与 `umount`、close 引用计数不回绕） |
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 5 个绘图调用 + `fb_flip`（默认双缓冲），`CAP_FB` 能力门 + 单 pid 归属门两道检查；无直线/圆等图元（暂不作为缺口） |
 | 用户态 | 2 | 16 个静态 ELF64 程序 + 自带 crt0 与迷你 libc；匿名 `mmap`、`mprotect` 与**文件映射**（`kmmap_file`，`MAP_SHARED`/`MAP_PRIVATE`）已就位，但仍无动态链接器（缺解释器与 `.so` 装载），跑不了第三方软件 |
-| 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
-| 测试 | 3 | ktest 141/4460（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入、统一输入队列五例、AHCI 中断自测与多盘挂载分流、mmap/COW/`mprotect`/栈守护**十一例**、stat/时钟三例）、`make smoke` 270/270（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
+| 安全模型 | 2 | `struct cred{kind,uid,caps}` + `CAP_KILL`/`CAP_SYS_ADMIN`/`CAP_FB` + `setuid` 单向降权；`EFER.NXE`/`CR0.WP`/`CR4.WP`/`SMEP`/`SMAP` 均置位并有 ktest 钉点，**内核镜像 W^X 已收口（2026-11-12）**；无 gid、无 RLIMIT、无文件属主、无登录/沙箱、无 KASLR、无栈保护 |
+| 测试 | 3 | ktest 146/4522（含属性测试、随机流暴力用例、`blk_inject_io` 故障注入、OOM 注入与 **OOM killer 四例**、**内核镜像 W^X 逐段与逐页钉点**、统一输入队列五例、AHCI 中断自测与多盘挂载分流、mmap/COW/`mprotect`/栈守护**十一例**、stat/时钟三例）、`make smoke` 270/270（默认 `-smp 2`，`-smp 1` 用 `SMOKE_FLAGS="--smp 1"` 手跑另一套标记）；无 CI、无宿主侧单测与 sanitizer |
 | 可观测性 | 2 | 串口日志、启动分阶段消息、`ps` 内存列（填用户缓冲）、块缓存统计；无 loglevel、无崩溃环形缓冲、无 backtrace/寄存器转储、无 `/proc`，`panic` 最终 `hlt` |
 | 可移植 / 启动安全 | 2 | 门控参数固定为 QEMU pc + TCG + `-m 256`；q35+KVM（`make run` 默认）、GRUB ISO、内存档位靠手动跑；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
 
@@ -86,7 +86,7 @@
 
 | 编号 | 位置 | 后果 | 修法与量级 |
 |---|---|---|---|
-| OBS-1 | `ktest/t_cache.c` `test_write_readback_is_coherent`；2026-10-21 一次连跑 | 历史出现过一次失败（伴随 FAT/dir `I/O error`），重跑通过。I/O 类根因已定位并修掉：IDE 轮询预算（旧 10 万次 port read）短于 QEMU 在 vCPU 线程同步落宿主盘时的 BSY 保持，正常命令被判 EIO（改 `IDE_POLL_ITERS`，旧预算 A/B 必现）；修后连跑 16/17 全绿，余 1 次（3 用例 5 断言，伴 fs 用例整段 skip）未复现 | 连跑 N 次的抖动门 + 失败时保存串口现场，约 1 天 |
+| OBS-1 | `ktest/t_cache.c` `test_write_readback_is_coherent`；2026-10-21 一次连跑 | 历史出现过一次失败（伴随 FAT/dir `I/O error`），重跑通过。I/O 类根因已定位并修掉：IDE 轮询预算（旧 10 万次 port read）短于 QEMU 在 vCPU 线程同步落宿主盘时的 BSY 保持，正常命令被判 EIO（改 `IDE_POLL_ITERS`，旧预算 A/B 必现）；修后连跑 16/17 全绿，余 1 次（3 用例 5 断言，伴 fs 用例整段 skip）未复现。**2026-11-12 再现一次（同族不同点）**：smoke 阶段 6 的 forged self-loop 启动里 `blkcache/test_a_200_sector_file_costs_one_writeback_each` 撞 `[ide] FLUSH CACHE (E7) failed after write lba=1027+1`（C55 的 `ide_wait_flush` 判 ERR/超时）→ `fat_write_impl` 回 `-5` → `[PANIC] kernel self-test failed` → 该次 `forged FAT boot` 无 shell，判据 269 条中 1 失败；**同一次 smoke 的阶段 4/5 主启动同用例通过、`FLUSH` 失败 0 次**，紧接复跑 **270/270 全绿**。仍是设备层时序偶发，不是内核回归（isr 删除的分支不可达、OOM killer 本次只打假任务 pid 61xx） | 连跑 N 次的抖动门 + 失败时保存串口现场，约 1 天 |
 
 ---
 
@@ -106,12 +106,12 @@
 
 ### 3.2 内存映射与 mmap
 
-匿名 `mmap`/`munmap`、缺页分发器三段化、COW `fork`、`mprotect`（44）与栈保护页已于 2026-11-07 收口；**文件映射 `mmap`（42 扩成 Linux 六参 `addr,len,prot,flags,fd,offset`，`MAP_SHARED` 共享页缓存 + 三处写回）已于 2026-11-09 收口**（见第 6 节）。此处只留仍然开放的。
+匿名 `mmap`/`munmap`、缺页分发器三段化、COW `fork`、`mprotect`（44）与栈保护页已于 2026-11-07 收口；**文件映射 `mmap`（42 扩成 Linux 六参 `addr,len,prot,flags,fd,offset`，`MAP_SHARED` 共享页缓存 + 三处写回）已于 2026-11-09 收口**；**OOM killer 已于 2026-11-12 收口**（见第 6 节）。此处只留仍然开放的。
 
 | 缺口 | 影响 | 量级 |
 |---|---|---|
 | 动态链接器与共享库装载 | 文件映射已就位，但 `execve` 仍是一次性把 ELF 段读进全新帧（不经过 mmap），用户态也没有 `ld.so`：跑不了依赖 `.so` 的第三方程序，"可执行文件映射"也还没被 loader 用上 | 在文件映射之上约 1–2 周（`PT_INTERP`、解释器、`.so` 装载与重定位） |
-| OOM 策略与回收 | 无 OOM killer、无 swap/reclaim：内核侧 `kmalloc` 失败没有受害者选择也没有归因（mmap 需求分页已过 `cred_mem_quota()`，但超限只拒该次 fault） | 约 150 行（启发式杀最大进程，或内核分配按进程记账） |
+| swap/reclaim 与内核分配归因 | **OOM killer 已就位（2026-11-12）**：用户缺页取不到帧时杀持有最多用户页的进程、一次短缺只杀一个（第 6 节）。仍缺的是另一半——没有回收与 swap（没有页可换出，杀掉的帧也要等 exit + reap 才回池），`kmalloc`/`brk` 的失败也仍然只回答错误、不选受害者不归因 | swap/reclaim 约 1 周起；内核分配按进程归因约 200 行 |
 
 ### 3.3 权限与隔离
 
@@ -128,7 +128,6 @@
 | 缺口 | 影响 | 量级 |
 |---|---|---|
 | KASLR | 内核固定链接在 `0xffffffff80100000`，地址完全可预测，gadget 定位零成本 | 加载偏移 + 全局指针修正，约 100–200 行 |
-| 内核镜像 W^X | 高半区与恒等映射用 2 MiB 页 `PG_P \| PG_W`，从不带 `PG_NX`：内核 text 可写可执行 | 分段加 NX，约 10 行加逐段核对 |
 | 栈保护 | Makefile 两处 `-fno-stack-protector`，安全性靠"当前没有危险的变长写"这条纪律 | canary 放取 + 入口校验，约 50 行 |
 | `swapgs` 与 GS 契约 | 入口/返回从不 `swapgs`：今天安全是因为用户态没有任何途径改 GS base（无 `arch_prctl`，WRMSR 是特权指令），但用户态也因此没有 TLS；加 TLS 必须同时引入 | 入口与返回各 2 行 + 契约检查，约 30 行 |
 | IST / 双故障栈 | 无独立故障栈：引导栈 16 KiB 无 guard，栈被打穿后下一个异常落在被毁的 IDT 上 | TSS IST 表 + 双故障/NMI 栈，约 80 行 |
@@ -190,10 +189,10 @@
 | 场景 | 结论 | 依据 |
 |---|---|---|
 | 跑自己写的 `userland/` 程序 | 安全 | `sigreturn` 恢复内核保存的帧（不读用户栈，CS/SS 不经用户之手）；ELF 装载七项校验；syscall 指针一律 `copy_*_user` → `user_ptr_ok`（范围 + 逐页 present）；表外编号回 `ENOSYS`；用户态异常只杀进程；`kprintf` 格式串全是字面量且无 `%n` |
-| 跑不完全信任的用户程序 | 不安全 | 权限止于 `uid` + 3 个能力位（无 gid / 文件属主 / CPU 限额 / 沙箱）；内核全程关中断加一把全局 FS 锁，一个 bug 可拖死整机；内核镜像可写可执行、无栈保护、无 KASLR |
+| 跑不完全信任的用户程序 | 不安全 | 权限止于 `uid` + 3 个能力位（无 gid / 文件属主 / CPU 限额 / 沙箱）；内核全程关中断加一把全局 FS 锁，一个 bug 可拖死整机；内核镜像已 W^X（2026-11-12，text 与 `.rodata` 不可写、data/bss 不可执行），但仍无栈保护、无 KASLR |
 | 挂载可信磁盘 | 基本安全 | on-disk redo journal + mount replay，故障注入覆盖提交点前后两个窗口，块缓存时间戳 LRU，簇链有步数预算；静默损坏三件已修（C19/C20/C21：`O_TRUNC` 落盘、写回按槽位定位、找不到 dirent 即 EIO 回滚）；vnode 泄漏（C40）已修；脏页三道同步门已就位（C27：BSP tick 每秒 / 普通文件 close / panic try 回写，外加 `SYS_sync(33)`；崩溃窗口从 32 KiB 收窄到「上次同步以来写过扇区」）；路由与挂载本身也收口了（C39/C47：ops/priv 成对下传、最长前缀匹配、第二挂载点与 `umount` 有 ktest 钉点；C28：分区与满槽处理一致，`diskinfo` 看得到每个分区）；C55 让 IDE 写路径也以 `0xE7` CACHE FLUSH 收尾并检查返回，落盘承诺不再只是轮询 DRDY |
 | 挂载不可信或可能损坏的磁盘 | 不安全 | 簇链步数预算（`FAT_CHAIN_MAX_STEPS`）+ 单簇自环即断（本批新增）拦住坏链挂钩；BPB 三项校验（55AA / `"FAT32"` / 簇因子 2 的幂）、目录游标（C30）、LFN 长度（C31）、FAT 容量（C32/C33）、短名终止符（C34）、MBR 范围与 EBR 链（C36）、目录结束符回归规范字义（0x00 止看，尾槽后的残留字节浮不出伪记录）均已收口；仍不安全是因为有界长走持 irqsave 锁、无 checksum、目录条目内容仍逐扇区信任读回 |
-| 硬件缓解 | 已开但不完整 | `EFER.NXE`、`CR0.WP`、`CR4.WP`、`SMEP`、`SMAP` 全部置位，BSP 与 AP 都走 `cpu_protect_init()`，启动日志打印 `EFER.NXE` 并有 ktest 钉点；缺 KASLR、KPTI、canary、内核 W^X、IST |
+| 硬件缓解 | 已开但不完整 | `EFER.NXE`、`CR0.WP`、`CR4.WP`、`SMEP`、`SMAP` 全部置位，BSP 与 AP 都走 `cpu_protect_init()`，启动日志打印 `EFER.NXE` 并有 ktest 钉点；**内核镜像 W^X 已收口（2026-11-12）**：页表按段赋权、两个别名同改、ktest 逐页扫；缺 KASLR、KPTI、canary、IST |
 | 横向定位 | 与 `xv6` 同档 | 同为简单权限模型、同无 KASLR；`sigreturn`、ELF 解析、`copy_user` 三处比常见教学实现更严谨 |
 
 ---
@@ -205,10 +204,10 @@
 1. 锁与抢占：先 C7（锁外做 I/O），再 C10（请求队列），然后 C62/C4（RR 与队列读），最后 3.6 的内核态抢占与 syscall 关中断——每一步都要有 smoke 兜底。
 2. 验证面：smoke 矩阵化（C68：ISO、内存档位、q35+KVM、双盘）+ 连跑抖动门（OBS-1），再上 CI（3.5）。
 3. 可观测性最小集：loglevel + 崩溃环形缓冲 + backtrace（3.7）——此后并发改动才可诊断。
-4. 内核自身加固：内核 W^X、canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。
+4. 内核自身加固：canary、`swapgs`/IST、KASLR（3.4）——排在测试与可观测性之后。**内核 W^X 已收口（2026-11-12）**。
 5. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（3.3）。
 6. 驱动收口：PCI 配置机制按总线选择与注释（C56）；AHCI 中断/多盘、IDE LBA48 已收口（C49/C51/C53）。
-7. 能力面：`pipe`（3.1）→ 动态链接器与共享库（3.2，文件映射已是它的前置）。匿名映射、COW、需求分页与 `mprotect`/栈保护页已收口（2026-11-07），**文件映射已收口（2026-11-09）**，**`stat`/`gettimeofday` 已收口（2026-11-11）**。
+7. 能力面：`pipe`（3.1）→ 动态链接器与共享库（3.2，文件映射已是它的前置）。匿名映射、COW、需求分页与 `mprotect`/栈保护页已收口（2026-11-07），**文件映射已收口（2026-11-09）**，**`stat`/`gettimeofday` 已收口（2026-11-11）**，**OOM killer 已收口（2026-11-12）**。
 8. 暂不做：新子系统、更换文件系统、POSIX 全覆盖、网络栈——上面 1–7 未落地前不加宽度。
 
 
@@ -272,7 +271,7 @@
 - **匿名 `mmap`/`munmap`（42/43，ABI 只有 3 参）**：`sys_mmap(addr, len, prot)` 要求 `addr == 0`（内核选址，hint 不假装采纳）、top-down 扫 `[MMAP_LO, MMAP_TOP)` 空隙；窗宽 64 GiB、`MMAP_TOP` = 栈增长地板（`USER_STACK_TOP-0x80000`），`sys_brk` 上限从 `USER_STACK_TOP-1MiB` 移到 `MMAP_LO`——旧上限落在 mmap 窗**内**，堆与 mmap 可以争同一页面。**只登记不映射**：首触经缺页分发器的 demand fixer 补零帧、按 VMA prot 给 W/NX、先过 `cred_mem_quota()`（配额从"堆上限"升级为"一切映射上限"）；`sys_munmap` 从 VMA 列表摘除（中段挖洞自动拆分、部分相交按 POSIX 静默截断、零相交 `EINVAL`）→ 逐页 unmap → `vmm_reclaim_empty_tables` 回收空 PT/PD/PDPT（否则每个新触碰的 2 MiB 区永久搁浅 2 个表帧，buddy 差额恰好 2 页）。VMA 列表 `kernel/mm/vma.c` 挂 `struct task.vmas`（fork 深拷、execve 与 `task_free_slot` 释放，alloc 槽位清 NULL 防继承）。
 - **缺页分发器三段化**：`page_fault_try_fix` 从单 `stack_grow` 变 demand（VMA 内 not-present，含"已 present 不再分配"幂等防御）→ stack_grow → COW（保护错 + `PG_COW`）；**真 rodata 写保护（!W !COW）仍落 SIGSEGV**（若只查"非 COW 即放行"会把 fault 当已修复，用户态死循环）；already-W 的竞争故障 claim 并重写 PTE flush TLB。
 - **COW `fork`**：`dup_user_aspace` 不再逐页 `pmm_alloc+memcpy`——**共享帧**：可写页两边清 `PG_W` 置 `PG_COW`（PTE bit 9，软件可用位）并 `invlpg` 源侧，只读页原样共享（写保持非法）。order-0 帧引用计数 `pmm.c frame_ref[]`（2 GiB 窗 1 MiB .bss；alloc=1、free CAS 递减、归零才回 buddy、`pmm_ref` 供 fork 加签；**ref==0 释放照旧放行**，播种与遗留路径不会被计数卡死；order>0 不经过计数）。写保护缺页 → `page_cow_break`：**先复制、再换 PTE、最后放旧引用**——本方引用在复制完成前钉住旧帧，计数归零必然发生在所有复制者之后，双核同帧竞争读不到已回收帧；`user_ptr_writable` 成为唯一 COW 解析门（`copy_to_user`/信号帧 push/vfs 写一处生效），`vmm_map_user` 的 widen 分支拒绝给 `PG_COW` 页回写 `PG_W`（否则两个共享者会静默重新共享可写）。
-- ktest 基线升到 **132 cases / 4163 checks**（该批次当时；同日栈保护页/mprotect 批次后 137/4308，2026-11-09 文件映射批次后 138/4360，2026-11-11 stat/gettimeofday 批次后 141/4460，见文首基线与第 6 节末两条）：新增 `ktest/t_mmap.c` 五例——syscall 分发与负例（hint/未对齐/零长/窗外）、demand（配额拒绝、幂等、权限来源、buddy 精确复原）、COW fork（dup 后 `refcount==2` → fault break → payload 跟帧走 → rodata 放行 SIGSEGV → 全 user leaf 快照恢复）、pmm refcount 语义、VMA 列表单元（排序/拆洞/深拷）。
+- ktest 基线升到 **132 cases / 4163 checks**（该批次当时；同日栈保护页/mprotect 批次后 137/4308，2026-11-09 文件映射批次后 138/4360，2026-11-11 stat/gettimeofday 批次后 141/4460，2026-11-12 OOM Killer 批次后 145/4497（死代码删除批次判据未变），2026-11-12 内核 W^X 批次后 146/4522，见文首基线与第 6 节末四条）：新增 `ktest/t_mmap.c` 五例——syscall 分发与负例（hint/未对齐/零长/窗外）、demand（配额拒绝、幂等、权限来源、buddy 精确复原）、COW fork（dup 后 `refcount==2` → fault break → payload 跟帧走 → rodata 放行 SIGSEGV → 全 user leaf 快照恢复）、pmm refcount 语义、VMA 列表单元（排序/拆洞/深拷）。
 - 验证：KTEST=0/1 与 userland 零警告；q35 ktest 全量 0 failed、KTEST=0 `ready in ~8.3 s` 到 `root@lnxrm$` 0 异常；16 bins。
 
 ### 2026-11-07 栈保护页与 mprotect 批次
@@ -304,7 +303,7 @@
 
 ### 2026-11-09 大扫除第 3 轮（史山重写 / 零引用收尾）
 
-- **`isr_common` 264 行 / 嵌套 6 → `isr_common` 32 行 / 嵌套 3**（行数按签名到收尾 `}`，嵌套按花括号深度，下同）：拆成 `handle_ipi` / `cr2_read` / `struct pf_walk`+`pf_walk`+`pf_slot_again`+`pf_leaf_alive`+`pf_walk_print` / `pf_error_print` / `pf_tables_dump` / `exception_report` / `fault_to_signal` / `kernel_context_dump` / `irq_path`。**逐条比对 `kprintf` 格式串序列，运行期输出逐字不变**；唯一删除是 `irq==7||irq==15` 分支里 `if (f->intno==0xFF) return;`（`irq==7→intno 39`、`irq==15→intno 47`，永不等 0xFF，**可证不可达**）。新增 `#include <mm/mm.h>`（原为函数内 `extern vmm_translate_in`）。
+- **`isr_common` 264 行 / 嵌套 6 → `isr_common` 32 行 / 嵌套 3**（行数按签名到收尾 `}`，嵌套按花括号深度，下同）：拆成 `handle_ipi` / `cr2_read` / `struct pf_walk`+`pf_walk`+`pf_slot_again`+`pf_leaf_alive`+`pf_walk_print` / `pf_error_print` / `pf_tables_dump` / `exception_report` / `fault_to_signal` / `kernel_context_dump` / `irq_path`。**逐条比对 `kprintf` 格式串序列，运行期输出逐字不变**；`irq==7||irq==15` 分支里 `if (f->intno==0xFF) return;` 当时判定**可证不可达**（`irq==7→intno 39`、`irq==15→intno 47`，永不等 0xFF）但**未真正删除**，2026-11-12 死代码批次才落地（见该批次）。新增 `#include <mm/mm.h>`（原为函数内 `extern vmm_translate_in`）。
 - **`ahciProbe` 334 行 / 嵌套 4 / 9 条清理梯子 → 48 行 / 嵌套 2**：引入 `struct ahci_port_res`（`px/p/clb/fis/ct/port/ident/bd/started/keep`）+ 单出口 `ahciPortRelease()`——原先 9 处「port skipped」各自重复 `dmaFree()/kfree()/ahciPortReclaim` 的子集，每加一条退出路径就多一次漏掉刚分配缓冲的机会；拆出 `ahciMapBar`/`ahciHbaReset`/`ahciWaitLink`/`ahciPortAlloc`/`ahciPortProgram`/`ahciPortIdentify`/`ahciPortPublish`/`ahciPortBringup`。`dmaFree(NULL)`/`kfree(NULL)` 本就 NULL-safe，已核实。
 - **`sys_execve` 187 行 → 49 行**：`struct exec_args`（16×64 argv/envp + path[128] + argc/envc）+ `exec_copy_args`/`exec_read_image`/`exec_commit`/`exec_build_stack` 四段，`sys_execve` 只剩编排。原第一大半是「free img / close file / destroy new_pml4」的资源阶梯，每个阶段各自记着已经拿了哪几样；现在清理规则只剩调用点的「free img、destroy new_pml4」。POSIX 语义（失败返回、不退出）保留在注释与控制流里。
 - **`fat_mount` 196 行 / 嵌套 4 → 48 行 / 嵌套 1**：9 处一模一样的 `kfree(m); return NULL;` 收成 `fat_reject()`（内部 `fat_pages_free(m); kfree(m);`，`fat_pages_free` 对 NULL 安全，页数组未分配时也无害）；拆出 `fat_bpb_ok`/`fat_layout`（带 `u32 *totsec_out` 回传**卷** totsec 给挂载横幅——原打印的就是 BPB 的 totsec，不是设备容量，已逐字对齐）/`fat_fat_alloc`/`fat_fat_read`。每处拒绝的打印留在出问题的那条检查旁边。
@@ -329,7 +328,7 @@
 - **ktest 基线 137/4308 → 138 cases / 4360 checks / 0 failed**（late 95/3467 → 96/3519）：`ktest/t_mmap.c` 新增 `test_mmap_file`（52 checks）——拒绝零副作用（两种 flags 同给、未知位、未对齐 offset、`fd=99`、匿名带 offset、三参老形状）、私有映射读到文件字节且**不进缓存**、共享映射**两段区间同一帧**且缓存只增 1、共享页当场可写且**永不含 `PG_COW`**、`mprotect` 撤权/授予权都不改 COW、写回后 `PG_D` 清、文件内容变、**第二次写回 0 页**、`munmap`/`close`/`unlink` 后缓存与 buddy 与账目**逐字回到基线**。路径必须放用户页：`h_open` 走 `copy_user_str()`，字面量在 `.rodata` 会被拒（首跑就栽在这），改为 `syscall_probe6(SYS_mmap,…)` 出来的匿名页里放 `/FMAP.T`。
 - **`systest` 新增 `t_mmap_file()`（ring 3 才能做的那半）+ smoke 判据 `SYSTEST_TAGS` 120 → 143**：私有读到文件/写不回、共享写在 `munmap` 落盘、**写回后文件仍 8 字节**（clamp 不是撑成一页）、四条拒绝（`-9`/`-22`/`-22`/`-13`），以及**真实 `fork`**：子进程写继承来的 `MAP_SHARED` 映射，父进程 `waitpid` 后必须读到同一个帧里的 `'C'`——这正是 `vma_fork_shared()` 要保的东西，漏掉它父进程只会读到 `'P'`(80)。用例自建自删 `/MF.T`，卷面不留下痕迹。
 - **已知限制（如实记下，不粉饰）**：① 写回只在 `munmap`/`exec`/`exit` 三处发生，**没有 `msync`**——映射活着期间脏页只在帧里，`sync` 也不会替它落盘；② **共享页缓存与 `write()` 两条路互不知晓**：映射期间另一路 `write()` 改同一文件，映射看到的是旧字节，而映射侧的脏页写回还会盖掉 `write()` 的结果（Linux 靠同一套页缓存天然免疫；这里要修得跨所有地址空间 unmap 该文件范围的 PTE，代价不小）。约定：**别在有人 `MAP_SHARED` 映射的同时 `write()` 同一个文件**。详见 `include/mm/filepage.h` 头注释。
-- **不做**：动态链接器与 `.so` 装载（已从"缺文件映射"改为"缺解释器"，见 3.2）、swap/OOM 回收、内核映射 NX/W^X（第 2 节既有开放项）。
+- **不做**：动态链接器与 `.so` 装载（已从"缺文件映射"改为"缺解释器"，见 3.2）、swap/OOM 回收（内核映射 NX/W^X 一项当时列为开放，**2026-11-12 已收口**，见文末批次）。
 - 验证：KTEST=0/1 与 userland 零警告；ktest **138 / 4360 / 0 failed**（early 25/404、mm 17/437、late 96/3519、2 skipped、1 刻意 warn），无 PANIC/BUG/Oops；16 bins；`make run` 正常到 `root@lnxrm$`；`make smoke` **240/240 PASS**。
 
 ### 2026-11-11 stat / gettimeofday 批次
@@ -343,3 +342,31 @@
 - **`systest` 新增 `t_stat_time()`（ring 3 才能证明的那半）+ smoke 判据 `SYSTEST_TAGS` 143 → 173（+30）**：stat 侧 21 条（类型/权限条件、`nlink=1`、`uid=0`、`ino≠0`、`blksize=512`、`blocks` 进位、`/` 是目录且 size 0、`/dev/console` 是字符设备且 `ino=1`、`ENOENT`/`EFAULT`×2、**问两次都不创建**、写 10 字节后 `size=10`、unlink 复原）+ 时间侧 9 条（`epoch=1[78]\d{8}` 落在 2026–2028 一带、2020–2100 区间、usec 合法、不回退、timezone 清零、仅 zone 合法、两 NULL `-22`）。判据报**条件**而非原始数值——`README.md` 是 0644 还是只读取决于盘上那一个属性位，而"它是普通文件""size 就是现在这个 size"在任何能挂载的文件系统上都成立；`time.epoch` 原样打印，供人眼与宿主日期对表。
 - **不做**：`fstat`/`futimes`（描述符侧元数据，见 3.8）、`clock_gettime` 的单调钟与 `CLOCK_REALTIME` 之外的钟、时区/DST 数据库、写时钟的 setter（CMOS 是权威，本内核不改它）。
 - 验证：KTEST=0/1 与 userland 零警告；ktest **141 / 4460 / 0 failed**（early 25/408、mm 17/437、late 99/3615、2 skipped、1 刻意 warn），日志含 `[rtc] now=2026-11-11T05:18:54Z`（与当天一致）；16 bins、镜像含 `stat.enoent`/`time.bothnull` 串；`make run` 正常到 `root@lnxrm$` 无 PANIC；`make smoke` **270/270 PASS**。
+
+### 2026-11-12 OOM Killer 批次
+
+- **触发面只有一处：用户缺页拿不到帧**（`kernel/mm/pagefault.c` 四个取帧失败点——`stack_grow` 的栈增长、`demand_page` 的匿名与私有文件两支、`page_cow_break` 的 COW 复制，外加共享文件页在 **buddy 确实空了** 时那一次，`filepage_get` 回 0 也可能是读失败，所以拿 `pmm_free_bytes()==0` 当"这是短缺"的证据，读失败不许牵连任何人）。**能回答的失败一律照旧回答**：`brk` 回 `ENOMEM`、`kmalloc` 回 `NULL`、页表建不起来回错误——T-004/T-032 钉着这些返回值，`systest` 的 `brk.oom` 正是靠"把 buddy 抽干、再一寸不少地还回去"活着的，从一条可恢复的路径上杀进程等于把一次瞬时 `ENOMEM` 变成死刑；缺页的另一条出路本来就是必死（SIGSEGV），只有它值得花一条命。
+- **受害者 = 持有最多用户页的进程**（`oom_select_victim()`，纯函数：按 `mem_pages` 最大，平手取先扫到的那一格，结果只取决于任务表、与时机无关），排除 pid ≤ 1（idle/init，杀掉就没有系统了）、`CRED_KXLD`（kxld 就是内核那一侧）、`T_EMBRYO`/`T_ZOMBIE`（还不存在 / 已经死了）、已带 `SIGKILL` 的（在死路上，杀两次不会还回来两次）、`mem_pages == 0` 的（杀了也拿不回东西）。**`current` 也在候选里**：如果缺页的就是那个大戶，它本来就该死。
+- **一次短缺只杀一个**：`oom_kill_largest()` 杀完置闩，只有 `oom_frame_granted()`——`pmm_alloc_order()` 每次真把帧交出去时调用——才开闩；否则一串 fault 会顺着任务表一个一个杀到只剩最后一个。**杀掉不能立刻用**：受害者的帧要等它 exit **并且被 reap** 才回池，而 #PF 处理器里做不了那次上下文切换，所以本次 fault 照旧失败（SIGSEGV），下一次尝试（信号处理器重试、下一轮 brk）才是这次击杀要救的对象。
+- **`send_signal(SIGKILL)` 补醒 `T_STOPPED`**（`kernel/sched/signal.c`）：原来只醒 `T_SLEEPING`，而停住的任务永远不会自己回到用户态——挂在它身上的 SIGKILL 永远送不到、帧也永远回不来（"杀不掉的受害者不是受害者"）。`kill(2)` 给停住进程送 SIGKILL 因此一并修好。
+- **日志一行**：`[oom] frame allocation failed: killing pid N (name), M pages`。
+- **ktest 新增 LATE 四例（suite `oom`，+4 cases / +37 checks）**：① 选择与排除——大户胜出、九种"不许杀"各自持页更多也不许它上位、全排掉后回 `NULL` 且永不含 `current`；② 一次短缺只杀一个 + 一帧出手后开闩（并证明"已带 SIGKILL 的跳过"）；③ 停住的受害者必须被唤醒入队（`state==T_RUNNABLE`、SIGKILL 位已置、`rq_cpu>=0`，`task_free_slot` 出队复原）；④ **端到端**——`syscall_probe(SYS_mmap)` 建 VMA → `pmm_inject_oom(1)` 让需求分页取帧失败 → fault 被拒（没映射、`pmm_free_bytes`/`mem_pages` 分毫不差）**且**大户已收 `SIGKILL`。四例全在 KTEST_LATE（`sched_init()` 之后、`/bin/init` 之前，该阶段关中断，短暂入队的假任务没人能切走），不真抽内存：假任务槽 + 注入，跑完把槽、闩、VMA 全部还原。
+- **不做**：swap/reclaim、`kmalloc`/`brk` 失败的受害者选择与归因、按压力的退避与多次击杀策略、把 `brk` 纳入触发（契约与 `brk.oom` 都不许）；smoke 也**不加**"日志里不许出现 `[oom]`"的禁止项——`brk.oom` 抽干 buddy 是设计行为，那个窗口里真来一次 fault 触发击杀是正确行为，不该判成冒烟失败。
+- **验证**：KTEST=0（40 CC）/ KTEST=1（70 CC）与 userland 零警告；ktest **145 / 4497 / 0 failed**（early 25/408、mm 17/437、late 103/3652、2 skipped、1 刻意 warn），日志含 4 行 `[oom] frame allocation failed: killing pid 6121/6122/6131/6141`，boot 到 `root@lnxrm$` 无 PANIC；`make smoke` **270/270 PASS**（判据数不变，未加新判据）。
+
+### 2026-11-12 死代码删除批次（spurious IRQ7/15 分支）
+
+- **删 `kernel/irq/isr.c` 的 `if (irq == 7 || irq == 15) { if (f->intno == 0xFF) return; }`**（原注释 "spurious IRQ7/15 check (still valid with IOAPIC)"）。**可证不可达**：`irq = f->intno - 32`，`irq==7 → intno 39`、`irq==15 → intno 47`，永远不等于 `0xFF`；而且 LAPIC 的 spurious 向量 0xFF 走 `idt_init` 的 49–255 catch-all 门（`isr19`，压出 `intno=19`），根本到不了 `irq_path` 的 `[32,48)` 分支。即它想挡的那件事由别处决定，这条比较一次也不会成立。
+- **零行为变化**：分支体只有一句 `return`，不可达 ⇒ 删掉后运行期输出、控制流逐字不变；`kprintf` 格式串序列不受影响。
+- **为什么现在删**：2026-11-09 大扫除第 3 轮已把它判定为"可证不可达"并写进记录，但当时只拆 `isr_common` 没落地这句删除，代码里留了一条注释宣称在做事的空分支——现在补上（该批次条目已改注为"当时未真正删除"）。
+- **验证**：KTEST=0（40 CC）/ KTEST=1（70 CC）零警告；ktest **145 / 4497 / 0 failed**（early 25/408、mm 17/437、late 103/3652、2 skipped、1 刻意 warn），无 PANIC、无 `stray vector`。`make smoke` **第一次 1 条失败、紧接着复跑 270/270 PASS（rc=0）**：失败是阶段 6 forged self-loop 启动里 `blkcache` 撞 `[ide] FLUSH CACHE (E7) failed`（设备层，C55 的 `ide_wait_flush` 判 ERR）→ `[PANIC] kernel self-test failed` → 无 shell，判据 269 条中 1 失败；**同一次 smoke 的阶段 4/5 主启动同用例通过、`FLUSH` 失败 0 次**，复跑 forged 串口 `FLUSH`/`PANIC` 均 0 次——归入 OBS-1 的同族偶发（已补记），不是本批回归：`isr.c` 删的分支不可达，OOM killer 本次只打假任务 pid 61xx。smoke 里 ktest 记 4475/4476、3 skipped 是 `ahci` 无中断线整例 skip 的既有机器差异（直跑 4497/2 skipped），非判据变化。
+
+### 2026-11-12 内核 W^X 批次
+
+- **缺口的原样**：`entry64.S` 把低 1 GiB 铺成 2 MiB 大页 `0x083`（`P|W|PS`，无 NX），恒等（`PD_M`/`PD_M2`）与高半别名（`PD_HI`/`PD_HI2`）各一份，`vmm.c` 的别名环与堆窗也照写 `PG_P|PG_W|PG_PS`——内核 text 既可写又可执行，一次写进 `.text` 的失误就是代码注入点。3.4 那行「分段加 NX，约 10 行」由此关闭。
+- **段边界先落地（`arch/kernel.ld`）**：`.image` 内新增 `__text_start`/`__text_end` 与 `__rodata_start`/`__rodata_end`（text、rodata 各自结束处 `ALIGN(4096)`）、`__data_start`。**页对齐是硬要求**：只有不跨页的边界才能给每个页唯一策略，跨页的那一页只能在两段之间二选一。
+- **赋权（`kernel/mm/vmm.c` 的 `vmm_kernel_wx()`，`vmm_init()` 最后一步）**：跑在 `EFER.NXE` 已确保置位之后；`wx_split_pd()` 把 `PD_M` 与 `PD_HI` 中覆盖 `[__kernel_start, ALIGN_UP(__bss_end))` 的 2 MiB 槽拆成 4 KiB（PAT 位搬移沿用 `vmm_map_kernel_page()` 的既有写法，PG_PS 必须清掉否则仍读作"大页"），再由 `wx_pte_flags()` 逐页赋权：text `PG_P`（R-X）、`.rodata` `PG_P|PG_NX`（R--）、其余（`.init_array`/`.data`/`.ktest`/`.initramfs`/`.trampoline`/`.bss`）`PG_P|PG_W|PG_NX`（RW-），逐页 `invlpg`，日志一行 `[vmm] W^X: …`。
+- **两个别名一起改**：只改高半不改恒等（或反过来）等于从另一个方向把洞留着——写代码的人用哪个别名的指针都一样。**镜像外的页一律不动**：1 MiB 以下的低内存、与镜像共享同一 2 MiB 槽的 buddy 帧仍保持 `P|W`，因为 AP trampoline 从恒等映射的 `0x8000` 执行，带上 NX 会当场打死 SMP；ktest 用 `raw_leaf(root, 0x8000) & PG_NX == 0` 钉住这条边界。
+- **`.trampoline` 为什么可以失去执行权**：镜像里那份只是 `copy_trampoline()` `memcpy` 到 `0x8000` 的**源**（`kernel/core/smp.c:96`），AP 真正执行的是拷贝目标；同理 `.bss`（含 16 KiB 引导栈）、`.ktest` 用例表、`.init_array` 只需要 RW，给了 NX 正好补上"数据页可执行"那一半。
+- **ktest 一例钉点**（`ktest/t_mm.c` `test_vmm_kernel_wx`，suite `vmm`，`KTEST_MM`，+25 checks）：① 三段边界页对齐且严格递增；② 从 `__kernel_start` 到 `ALIGN_UP(__bss_end)` **逐页走两个别名**：都 present、都指向自己的物理帧（防"策略赋给了别的页"）、无一页 `PG_W` 置位而 `PG_NX` 未置位；③ text/`.rodata`/data/`.bss` 四处落点各自验 W/NX——逐页扫描只证明"不是坏的"，落点检查才证明"是这套策略"；④ 恒等 `0x8000` 仍可执行。判据刻意聚合成 3 个计数（440 页 × 2 别名不逐页打点），免得真实失败被检查噪声淹没。**踩过的坑记下**：首版把判据写成 `(W|NX) == (W|NX)`，那是"可写且**不可**执行"（data 页的目标状态），于是 728 个 data 页全报违规——W^X 的判据必须是 `W && !NX`。
+- **验证**：KTEST=0（40 CC）/ KTEST=1（70 CC）零警告；ktest **146 / 4522 / 0 failed**（early 25/408、mm 18/462、late 103/3652、2 skipped、1 刻意 warn），启动日志含 `[vmm] W^X: 0x100000..0x2bb000 text R-X / rodata R-- / data RW-, both aliases`，**`[smp] 2 CPUs online`**（AP 用被拆过的恒等表照常上线），boot 到 `root@lnxrm$` 无 PANIC；`make smoke` **270/270 PASS（rc=0）**，三次启动（主 + forged self-loop + out-of-volume）串口都打出同一行 `[vmm] W^X: …`、`PANIC` 0 次、`stray vector` 0 次，smoke 里 ktest 记 146 cases / 4500–4501 checks / 3 skipped（`ahci` 无中断线整例 skip 的既有机器差异，直跑 4522/2 skipped）。

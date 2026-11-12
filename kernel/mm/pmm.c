@@ -311,6 +311,9 @@ u64 pmm_alloc_order(int order)
         if (addr < PMM_WINDOW_TOP)
             __atomic_store_n(&frame_ref[addr >> 12], 1, __ATOMIC_RELAXED);
         irq_restore(f);
+        /* A frame changed hands: memory flows again, so a shortage that
+         * killed somebody earlier may kill again (mm/oom.c). */
+        oom_frame_granted();
         return addr;
     }
 
@@ -319,6 +322,7 @@ u64 pmm_alloc_order(int order)
     u64 addr = buddy_take_locked(order);
     if (addr) __atomic_fetch_sub(&free_pg, 1UL << order, __ATOMIC_RELAXED);
     spin_unlock_irqrestore(&pmm_lock, flags);
+    if (addr) oom_frame_granted();
     return addr;
 }
 

@@ -15,6 +15,7 @@
 #include <framebuffer.h>
 #include <sys/cpu.h>
 
+#define PD_M   0x52000UL /* identity 0..1 GiB, 2 MiB pages (entry64.S PDPT_M[0]) */
 #define PD_HI  0x54000UL /* keep in sync with entry64.S */
 #define PD_HI2 0x58000UL /* high-half alias of 1..2 GiB (entry64.S PDPT_HI[511]) */
 #define ACPI_SCRATCH_PD 108 /* ACPI_SCRATCH_VA in sys/acpi.h — keep in sync */
@@ -295,6 +296,118 @@ void vmm_destroy_user_aspace(u64 root)
 
 extern void load_cr3(u64);
 
+/* ---- W^X for the kernel image (GAP 3.4) -------------------------------
+ *
+ * entry64.S maps the low GiB twice -- identity (PD_M) and high-half alias
+ * (PD_HI) -- as 2 MiB pages of P|W with no NX anywhere, so kernel text was
+ * writable AND executable: one stray store into .text was a code-injection
+ * point, and every byte after it was runnable.  EFER.NXE and CR0.WP are
+ * already on (entry64.S), so the hardware can enforce the split; what was
+ * missing was a page table that asked for it.
+ *
+ * This carves the page-directory slots the image occupies into 4 KiB pages
+ * and gives each one the policy of the segment it holds:
+ *
+ *     text      PG_P              (read+execute, no write)
+ *     .rodata   PG_P | PG_NX      (read only)
+ *     the rest  PG_P | PG_W|PG_NX (data/.init_array/.ktest/.initramfs/
+ *                                  .trampoline/.bss: writable, no execute)
+ *
+ * ...in BOTH mappings.  Fixing one alias and leaving the other alone would
+ * keep the whole hole open from the other direction: writes go through
+ * whichever alias a pointer happens to use.
+ *
+ * The boundaries come from arch/kernel.ld (__text_end/__rodata_end, each
+ * aligned to a page), so no page ever has to straddle two segments.  The
+ * loop still defends against that case -- an overlapping page takes the
+ * executable policy, which costs a page that is writable-free-but-runnable
+ * rather than a #PF in the middle of text. */
+
+extern char __kernel_start[], __text_end[], __rodata_end[], __bss_end[];
+
+/* Policy for one physical page; 0 means "not ours, keep what is there"
+ * (everything below 1 MiB and the buddy frames that share a 2 MiB slot
+ * with the image keep P|W: the AP trampoline at 0x8000 is executed out of
+ * the identity map, and the alias of a free frame is never run from). */
+static u64 wx_pte_flags(u64 pa)
+{
+    u64 lo = VIRT_TO_PHYS((uptr)__kernel_start);
+    u64 text_end = VIRT_TO_PHYS((uptr)__text_end);
+    u64 rodata_end = VIRT_TO_PHYS((uptr)__rodata_end);
+    u64 hi = ALIGN_UP(VIRT_TO_PHYS((uptr)__bss_end), PAGE_SIZE);
+
+    if (pa < lo || pa >= hi) return 0;
+    if (pa < text_end) return PG_P;           /* text     : R-X */
+    if (pa < rodata_end) return PG_P | PG_NX; /* .rodata  : R-- */
+    return PG_P | PG_W | PG_NX;               /* data/bss : RW- */
+}
+
+/* Split every 2 MiB slot of `pd_pa` that overlaps [lo, hi) -- both page
+ * directories index slot `pa >> 21`, they map the low GiB straight through
+ * -- and lay the policy over the pages that belong to the image.  Everything
+ * else in those slots keeps the flags the 2 MiB page had. */
+static void wx_split_pd(u64 pd_pa, u64 lo, u64 hi)
+{
+    u64 *pd = ptable_ptr(pd_pa);
+
+    for (u64 base = lo & ~0x1FFFFFUL; base < hi; base += 0x200000UL) {
+        u64 *pde = &pd[base >> 21];
+        if (!(*pde & PG_P)) continue;
+        u64 *pt;
+
+        if (*pde & PG_PS) {
+            /* Same split as vmm_map_kernel_page(): the low flags survive,
+             * but PAT moves from bit 12 (large page) to bit 7 (4 KiB PTE) --
+             * bit 7 is PG_PS, so copying them verbatim would silently change
+             * the memory type.  PG_PS itself must go: this entry now points
+             * at a table, not at memory. */
+            u64 dflags = *pde & 0xFFF;
+            u64 pat = (*pde & (1UL << 12)) ? PG_PS : 0;
+            u64 pte_flags = (dflags & ~PG_PS) | pat;
+            u64 pt_pa = pmm_alloc();
+            if (!pt_pa) panic("wx: no frame to split the kernel image slot");
+            pt = ptable_ptr(pt_pa);
+            for (int i = 0; i < 512; i++) pt[i] = (base + (u64)i * PAGE_SIZE) | pte_flags;
+            *pde = pt_pa | (dflags & ~PG_PS);
+        } else {
+            pt = ptable_ptr(*pde & ~0xfffUL); /* someone already split it */
+        }
+
+        u64 first = (base > lo) ? base : lo;
+        u64 last = (base + 0x200000UL < hi) ? base + 0x200000UL : hi;
+        for (u64 pa = first; pa < last; pa += PAGE_SIZE) {
+            u64 flags = wx_pte_flags(pa);
+            if (!flags) continue;
+            u64 i = (pa >> 12) & 511;
+            /* Keep the cache type the entry already carries: the image is
+             * plain WB so this is a no-op today, and it stays one if the
+             * range is ever mapped UC/WC (PG_PAT is bit 7 of a 4 KiB PTE). */
+            u64 cache = pt[i] & (PG_PCD | PG_PWT | PG_PAT);
+            pt[i] = pa | flags | cache;
+        }
+
+        /* A 2 MiB entry can sit in the TLB as one translation; invalidate
+         * every 4 KiB address it covered so no stale mapping of the old
+         * writable-anywhere page survives.  Runs once, at boot. */
+        for (int i = 0; i < 512; i++)
+            __asm__ volatile("invlpg (%0)" ::"r"(base + (u64)i * PAGE_SIZE) : "memory");
+    }
+}
+
+/* Apply W^X to both aliases of the kernel image.  Call after EFER.NXE is
+ * on (a XD bit without NXE is just ignored, i.e. the page stays runnable
+ * -- safe, but not the policy we are claiming). */
+static void vmm_kernel_wx(void)
+{
+    u64 lo = VIRT_TO_PHYS((uptr)__kernel_start);
+    u64 hi = ALIGN_UP(VIRT_TO_PHYS((uptr)__bss_end), PAGE_SIZE);
+
+    wx_split_pd(PD_M, lo, hi);  /* identity map of the image */
+    wx_split_pd(PD_HI, lo, hi); /* high-half alias of it */
+    kprintf("[vmm] W^X: 0x%lx..0x%lx text R-X / rodata R-- / data RW-, both aliases\n",
+            lo, hi);
+}
+
 void vmm_init(void)
 {
     volatile u64 *pdhi = (volatile u64 *)PHYS_TO_VIRT(PD_HI);
@@ -382,6 +495,12 @@ void vmm_init(void)
     if (!(efer & EFER_NXE)) wrmsr(MSR_IA32_EFER, efer | EFER_NXE);
     kprintf("[vmm] EFER.NXE=%d, user pages NX\n",
             (int)((rdmsr(MSR_IA32_EFER) & EFER_NXE) != 0));
+
+    /* NXE is on and the CR3 in force is the master table: split the image's
+     * slots and drop the permissions.  Last thing vmm_init does, so every
+     * mapping decision above (alias fill, heap window) is already in place
+     * and nothing re-writes these slots afterwards. */
+    vmm_kernel_wx();
 }
 
 /* Map a single physical page into the kernel's DEV_VMA window (PD slot 128).

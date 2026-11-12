@@ -46,8 +46,12 @@ void send_signal(struct task *t, int sig)
     /* SIGKILL and SIGSTOP cannot be ignored/blocked */
     if (sig == SIGKILL) {
         t->signal_pending |= (1ULL << SIGKILL);
-        /* wake if sleeping so it can be killed */
-        if (t->state == T_SLEEPING) {
+        /* Wake it so it can be killed.  A SLEEPING task would otherwise sit
+         * in its wait forever, and a STOPPED one never returns to user space
+         * on its own, so the SIGKILL just set would never be delivered: an
+         * OOM victim that cannot die is no victim at all (mm/oom.c), and its
+         * frames would stay held by a task nobody will ever run again. */
+        if (t->state == T_SLEEPING || t->state == T_STOPPED) {
             t->state = T_RUNNABLE;
             runqueue_add(t);
         }

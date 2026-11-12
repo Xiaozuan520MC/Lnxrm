@@ -48,6 +48,20 @@ void pmm_inject_oom(int n);
 #define pmm_alloc()  pmm_alloc_order(0)
 #define pmm_free(pa) pmm_free_order((pa), 0)
 
+/* ---- out-of-memory killer (mm/oom.c) ----
+ *
+ * No reclaim, no swap: the only way out of a real shortage is to end the
+ * process holding the most user pages and let its frames come back.  The
+ * trigger is a user fault that could not get a frame (pagefault.c); a
+ * failure that can be answered -- brk's ENOMEM, kmalloc's NULL -- keeps
+ * answering and never kills.  One victim per shortage: the latch set by
+ * oom_kill_largest() is released only when a frame is handed out again,
+ * which pmm_alloc_order() reports through oom_frame_granted(). */
+struct task;
+struct task *oom_select_victim(void); /* the heuristic, pure: biggest mem_pages */
+bool oom_kill_largest(void);          /* choose + SIGKILL + report + latch */
+void oom_frame_granted(void);         /* a frame went out: the next shortage may kill */
+
 /* ---- kernel heap (mm/kheap.c) ----
  * NBINS power-of-two free lists: bin 0 serves 16 bytes, bin 8 serves 4096.
  * The count and the bin function are published because the boot self-test

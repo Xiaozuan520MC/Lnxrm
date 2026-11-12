@@ -126,7 +126,11 @@ static bool stack_grow(struct intr_frame *f, u64 cr2)
             /* Out of frames part-way.  Whatever was mapped stays mapped and
              * accounted (the address space is torn down correctly on exit);
              * the faulting page is still missing, so report failure and let
-             * the caller turn it into SIGSEGV rather than loop forever. */
+             * the caller turn it into SIGSEGV rather than loop forever.
+             * Before that: the machine is dry, so somebody else's memory
+             * gives it back -- this task faulted, it is rarely the one that
+             * emptied the pool (mm/oom.c). */
+            oom_kill_largest();
             return false;
         }
         memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
@@ -208,10 +212,22 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
         u64 off = v->file_off + (page - v->start);
         if (v->flags & LNXRM_MAP_SHARED) {
             pa = filepage_get(v->file, off);
-            if (!pa) return false;
+            if (!pa) {
+                /* 0 means no frame came back: a dry buddy, a failed read or
+                 * a cache node that could not be allocated.  Only the first
+                 * is a shortage to kill over, and an empty buddy is the
+                 * evidence -- the other two must cost nobody a life. */
+                if (!pmm_free_bytes()) oom_kill_largest();
+                return false;
+            }
         } else {
             pa = pmm_alloc();
-            if (!pa) return false;
+            if (!pa) {
+                /* Dry buddy inside a fault: before this fault is turned into
+                 * SIGSEGV, have the memory hog pay for the machine (mm/oom.c). */
+                oom_kill_largest();
+                return false;
+            }
             memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
             /* A SHORT read is normal: the file's last page is usually
              * partial and the frame was zeroed first, so the tail reads as
@@ -226,7 +242,14 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
         }
     } else {
         pa = pmm_alloc();
-        if (!pa) return false;
+        if (!pa) {
+            /* The anonymous first touch is the common case, and a dry buddy
+             * here is a real machine shortage: kill the biggest holder before
+             * refusing, so the frames this touch wanted exist for the next
+             * one (mm/oom.c). */
+            oom_kill_largest();
+            return false;
+        }
         memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
     }
     /* PROT_READ is implicit (every present page is readable -- x86 has no
@@ -277,7 +300,12 @@ bool page_cow_break(struct task *t, u64 page)
     if (!(pte & PG_COW)) return true; /* not COW: nothing to resolve here */
 
     u64 npa = pmm_alloc();
-    if (!npa) return false;
+    if (!npa) {
+        /* Same shortage, same answer as the other fixers: the hog pays, this
+         * fault still fails and stays copy-on-write (mm/oom.c). */
+        oom_kill_largest();
+        return false;
+    }
     /* Read the shared frame through the high-half alias, never through
      * `page`: that would resolve against the LIVE cr3 (which may be another
      * address space) and a user page would trip SMAP with no STAC window. */

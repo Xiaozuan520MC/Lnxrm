@@ -359,12 +359,96 @@ static void test_pmm_random_churn(void)
     K_EXPECT(nalloc > 500); /* the stream actually churned */
 }
 
+/* W^X (GAP 3.4): no page of the kernel image may be writable AND
+ * executable through either alias.  entry64.S maps the image as 2 MiB
+ * P|W pages with no NX; vmm_init() splits those slots and lays the
+ * per-segment policy down (text R-X, .rodata R--, the rest RW-).  This is
+ * the case that proves it happened, in both mappings at once -- fixing one
+ * alias and not the other leaves the hole open from the other direction. */
+static void test_vmm_kernel_wx(void)
+{
+    extern char __kernel_start[], __text_end[], __rodata_end[], __bss_start[], __bss_end[];
+    u64 root = master_pml4_phys();
+    K_ASSERT(root != 0);
+
+    u64 lo = VIRT_TO_PHYS((uptr)__kernel_start);
+    u64 text_end = VIRT_TO_PHYS((uptr)__text_end);
+    u64 rodata_end = VIRT_TO_PHYS((uptr)__rodata_end);
+    u64 hi = ALIGN_UP(VIRT_TO_PHYS((uptr)__bss_end), PAGE_SIZE);
+
+    /* The linker draws every boundary on a page: a segment that ended
+     * mid-page would force one page to carry two policies. */
+    K_EXPECT_EQ(lo & (PAGE_SIZE - 1), 0);
+    K_EXPECT_EQ(text_end & (PAGE_SIZE - 1), 0);
+    K_EXPECT_EQ(rodata_end & (PAGE_SIZE - 1), 0);
+    K_EXPECT(lo < text_end && text_end < rodata_end && rodata_end < hi);
+
+    /* The sweep: every page of [__kernel_start, __bss_end), through the
+     * high-half alias AND through the identity map -- still present, still
+     * naming its own frame (a policy laid over the wrong page would be a
+     * silent "protection" of memory that is not the image), and no page is
+     * ever writable AND executable -- W with NX clear is the violation;
+     * W with NX set is the data-page policy and is exactly the point.
+     * Counted rather than asserted per page: 400 pages x 2 aliases would
+     * bury a real failure in check noise. */
+    u64 missing = 0, wrong_frame = 0, wx_pages = 0;
+    for (u64 pa = lo; pa < hi; pa += PAGE_SIZE) {
+        u64 hp = raw_leaf(root, PHYS_TO_VIRT(pa));
+        u64 ip = raw_leaf(root, pa);
+        if (!hp || !ip) {
+            missing++;
+            continue;
+        }
+        if ((hp & PTE_PA_MASK) != pa || (ip & PTE_PA_MASK) != pa) wrong_frame++;
+        if ((hp & PG_W) && !(hp & PG_NX)) wx_pages++;
+        if ((ip & PG_W) && !(ip & PG_NX)) wx_pages++;
+    }
+    K_EXPECT_EQ(missing, 0);
+    K_EXPECT_EQ(wrong_frame, 0);
+    K_EXPECT_EQ(wx_pages, 0);
+
+    /* ... and each segment carries ITS policy, not merely "something that
+     * is not W+X": an accidentally-unmapped page passes the sweep above. */
+    u64 text = raw_leaf(root, (u64)&test_vmm_kernel_wx);
+    K_ASSERT(text != 0);
+    K_EXPECT_EQ(text & PG_W, 0);           /* code: not writable */
+    K_EXPECT_EQ(text & PG_NX, 0);          /* ... but it is what runs */
+    u64 text_id = raw_leaf(root, VIRT_TO_PHYS((uptr)&test_vmm_kernel_wx));
+    K_ASSERT(text_id != 0);
+    K_EXPECT_EQ(text_id & PG_W, 0);        /* same through the identity alias */
+    K_EXPECT_EQ(text_id & PG_NX, 0);
+
+    u64 ro = raw_leaf(root, PHYS_TO_VIRT(text_end)); /* first .rodata page */
+    K_ASSERT(ro != 0);
+    K_EXPECT_EQ(ro & PG_W, 0);
+    K_EXPECT_EQ(ro & PG_NX, PG_NX);
+
+    u64 data = raw_leaf(root, PHYS_TO_VIRT(rodata_end)); /* first data page */
+    K_ASSERT(data != 0);
+    K_EXPECT_EQ(data & PG_W, PG_W);
+    K_EXPECT_EQ(data & PG_NX, PG_NX);
+
+    u64 bss = raw_leaf(root, (u64)__bss_start); /* globals + boot stack */
+    K_ASSERT(bss != 0);
+    K_EXPECT_EQ(bss & PG_W, PG_W);
+    K_EXPECT_EQ(bss & PG_NX, PG_NX);
+
+    /* The policy stops at the image: the AP trampoline is executed straight
+     * out of the identity map at 0x8000 (trampoline.S), so slot 0 of PD_M
+     * may be split into 4 KiB pages but must not have NX pasted onto the
+     * low memory the APs are launched from. */
+    u64 tramp = raw_leaf(root, 0x8000UL);
+    K_EXPECT(tramp != 0);
+    K_EXPECT_EQ(tramp & PG_NX, 0);
+}
+
 KTEST("pmm", KTEST_MM, test_pmm_buddy_accounting);
 KTEST("pmm", KTEST_MM, test_pmm_random_churn);
 KTEST("pmm", KTEST_MM, test_pmm_high_alias);
 KTEST("kheap", KTEST_MM, test_kheap_alloc_free);
 KTEST("kheap", KTEST_MM, test_kheap_distinct_blocks);
 KTEST("vmm", KTEST_MM, test_vmm_kernel_windows);
+KTEST("vmm", KTEST_MM, test_vmm_kernel_wx);
 KTEST("vmm", KTEST_MM, test_vmm_user_range);
 KTEST("vmm", KTEST_MM, test_vmm_user_aspace);
 KTEST("vmm", KTEST_MM, test_vmm_count_user_pages);

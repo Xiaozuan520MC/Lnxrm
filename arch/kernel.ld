@@ -15,6 +15,7 @@ SECTIONS
     .image : AT(KERNEL_LMA)
     {
         __kernel_start = .;
+        __text_start = .;
         /* --gc-sections must never drop the boot entry: ENTRY(_start64)
          * roots this section, but KEEP makes that explicit -- _start32
          * lives here too and scripts/patch_setup_jmp.py needs BOTH symbols
@@ -22,7 +23,24 @@ SECTIONS
         KEEP(*entry64.o(.text.prologue))
         *(.text .text.*)
 
+        /* W^X (GAP 3.4): vmm.c needs to know where the executable part of
+         * the image ends, so that it can take PG_W off these pages and put
+         * PG_NX on everything after them.  The boundary is aligned to a
+         * page so no page can ever straddle two segments -- a straddler
+         * would have to pick one policy and break the other segment. */
+        . = ALIGN(4096);
+        __text_end = .;
+
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(4096);
+        __rodata_end = .;
+
+        /* From here on the image is data: writable, non-executable.  It
+         * starts with .init_array (run once by start_kernel, never written
+         * afterwards -- writable anyway, so a constructor table that ever
+         * has to be patched up does not need a new policy). */
+        __data_start = .;
 
         __init_array_start = .;
         KEEP(*(.init_array*))
