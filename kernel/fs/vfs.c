@@ -39,20 +39,19 @@ int copy_to_user(void *, const void *, size_t);
 bool user_ptr_ok(u64 p, u64 n);
 bool user_ptr_writable(u64 p, u64 n);
 
-/* ---------------- routing ----------------
- *
- * C39/C47: a path is answered by ONE mount entry, and the entry -- not the
- * ops table -- is what the caller keeps.  ops+priv are a pair: looking them
- * up separately (ops first, then "the priv of whichever mount has that ops")
- * is what let two mounts of the same filesystem hand back the wrong volume,
- * and it is why vnode.mnt_data used to be a placeholder rather than the
- * mount the path was actually resolved through.
- *
- * Longest matching prefix wins.  This is not cosmetic: the root mount "/"
- * is a prefix of *every* absolute path, so a first-match scan would never
- * reach "/alt" -- the second mount point could be registered and then be
- * permanently unreachable, which is the state C47 is about.  A prefix only
- * matches on a component boundary, so "/alt" cannot claim "/alphabet". */
+      /* ---------------- routing ----------------
+       *
+       * C39/C47: a path is answered by ONE mount entry, and the entry -- not
+       * the ops table -- is what the caller keeps.  ops+priv are a pair: looking
+       * them up separately is what let two mounts of the same filesystem hand
+       * back the wrong volume, which is why vnode.mnt_data names the mount the
+       * path was actually resolved through.
+       *
+       * Longest matching prefix wins.  This is not cosmetic: the root mount "/"
+       * is a prefix of *every* absolute path, so a first-match scan would never
+       * reach "/alt" -- the second mount point could be registered and then be
+       * permanently unreachable, which is the state C47 is about.  A prefix only
+       * matches on a component boundary, so "/alt" cannot claim "/alphabet". */
 static struct mounted_fs *fs_for_path(const char **path)
 {
     struct mounted_fs *best = NULL;
@@ -99,13 +98,11 @@ static int register_mount(struct fs_ops *ops, void *priv, const char *prefix)
         if (mounts[i].active && !strcmp(mounts[i].prefix, prefix)) return LNXRM_EFAIL;
         if (slot < 0 && !mounts[i].active) slot = i;
     }
-    /* A deactivated slot is free again (C51).  This used to append
-     * unconditionally, so every mount/umount pair spent a slot of a fixed
-     * array: with several volumes to place and test cases that mount and
-     * unmount, the fourth pair would lock mounting out of a table standing
-     * three quarters empty.  Order carries no meaning -- routing takes the
-     * longest matching prefix, and two mounts may not share a prefix at all
-     * (checked above). */
+      /* A deactivated slot is free again (C51): appending unconditionally spent
+       * a slot of a fixed array per mount/umount pair, so the fourth pair would
+       * lock mounting out of a table standing three quarters empty.  Order
+       * carries no meaning -- routing takes the longest matching prefix, and two
+       * mounts may not share a prefix at all (checked above). */
     if (slot < 0) {
         if (mount_count >= MAX_MOUNTS) return LNXRM_EFAIL;
         slot = mount_count++;
@@ -621,8 +618,8 @@ long sys_read(int fd, void *ubuf, size_t n)
     struct file *f = fd_get(fd);
     if (!f) return LNXRM_EBADF;
     if (f->is_dir) return LNXRM_EFAIL;
-    /* Per-syscall stack buffer: the old static kbuf was shared by all
-     * tasks and broke under concurrent reads (SMP + preemption). */
+      /* Per-syscall stack buffer: a static kbuf would be shared by all tasks and
+       * break under concurrent reads (SMP + preemption). */
     char kbuf[4096];
     if (n > sizeof(kbuf)) n = sizeof(kbuf);
     /* Validate the whole (clamped) destination BEFORE reading: a bad
@@ -681,10 +678,10 @@ u64 vfs_file_size_now(struct file *f)
     return vn_size_now(f);
 }
 
-/* C41: an fd's access mode decides what it serves.  An O_RDONLY descriptor
- * that could be written used to hand a stale or foreign record a silent
- * rewrite; O_APPEND was simply ignored, letting a write clobber wherever
- * the descriptor happened to be seeked. */
+      /* C41: an fd's access mode decides what it serves.  An O_RDONLY
+       * descriptor that could be written would hand a stale or foreign record a
+       * silent rewrite, and an ignored O_APPEND would let a write clobber
+       * wherever the descriptor happened to be seeked. */
 static long reg_read(struct file *f, void *buf, size_t n)
 {
     int mode = f->flags & (O_RDONLY | O_WRONLY | O_RDWR);
@@ -904,21 +901,20 @@ bool vfs_root_is_fat(void)
     return false;
 }
 
-/* The block registry: every device the system knows about, in the order
- * diskinfo reports them.  A driver's device and a parsed partition are
- * registered the same way -- a partition *is* a device, with its own name
- * and its own bounds (C28).
- *
- * The table has a fixed capacity because it is a fixed array, not because
- * a full table is a usable state: once it fills, blk_register() refuses the
- * newcomer and says so.  What it never does is accept the device and then
- * drop it on the floor, which is what "the slot is full but the log said
- * registered" used to amount to.
- *
- * Returns 0 when `b` is in the table, LNXRM_EFAIL when it could not be
- * taken (full or not a device).  Callers that must have their device
- * visible -- the boot disks -- get a loud refusal instead of silently
- * having no disk. */
+      /* The block registry: every device the system knows about, in the order
+       * diskinfo reports them.  A driver's device and a parsed partition are
+       * registered the same way -- a partition *is* a device, with its own name
+       * and its own bounds (C28).
+       *
+       * The table has a fixed capacity because it is a fixed array, not because
+       * a full table is a usable state: once it fills, blk_register() refuses the
+       * newcomer and says so.  It never accepts a device and then drops it on
+       * the floor.
+       *
+       * Returns 0 when `b` is in the table, LNXRM_EFAIL when it could not be
+       * taken (full or not a device).  Callers that must have their device
+       * visible -- the boot disks -- get a loud refusal instead of silently
+       * having no disk. */
 static struct blkdev *blk_list[BLK_MAX];
 static int blk_count;
 
@@ -969,9 +965,9 @@ int blk_list_all(void *ubuf, int max)
 {
     if (max < 0) return LNXRM_EINVAL;
     int n = blk_count < max ? blk_count : max;
-    /* Validate the whole record range up front: the per-entry copy below
-     * used to answer a bad destination with the count written so far --
-     * 0, indistinguishable from "no devices registered". (2026-10-20) */
+          /* Validate the whole record range up front: the per-entry copy below
+           * would otherwise answer a bad destination with the count written so
+           * far -- 0, indistinguishable from "no devices registered". */
     if (n && !user_ptr_writable((u64)ubuf, (u64)n * 28)) return LNXRM_EFAULT;
     for (int i = 0; i < n; i++) {
         struct blkdev *b = blk_list[i];
@@ -1199,28 +1195,27 @@ static int vfs_try_mount_one(struct blkdev *bd, void **mounted)
     return where[1] == 0 ? 0 : 1;
 }
 
-/* Place every registered disk volume (C51), and report whether one of them
- * became the root: 0 = "/" has a disk on it, negative = it does not.  A data
- * volume that mounted is not that answer -- main.c tells the two apart with
- * vfs_data_volume_ready().
- *
- * T-081 / C28: this used to be "mount the first registered device, or give
- * up" -- and the first registered device is whichever driver called
- * blk_register() first.  ide_init() runs before ahci_init() (main.c), so on
- * hardware where the legacy IDE port answers but has nothing usable, a
- * speculative probe that found a phantom disk locked out the real one behind
- * it.  The policy is "every device that actually mounts", and each gets its
- * own attempt line, so a machine that has to fall through to the second disk
- * says so in the log.
- *
- * C51: the loop does NOT stop at the device that filled "/" -- a data disk
- * behind the boot disk still gets placed at /mnt..., and a boot disk behind
- * a data disk still wins "/" because only its volume carries /bin/init.
- *
- * The bound is snapshotted because an attempt *grows* the table: the
- * partitions of disk N are registered while disk N is being tried, and a
- * bound read fresh each round would then walk into those partitions and try
- * to parse a partition table on them. */
+      /* Place every registered disk volume (C51), and report whether one of them
+       * became the root: 0 = "/" has a disk on it, negative = it does not.  A
+       * data volume that mounted is not that answer -- main.c tells the two
+       * apart with vfs_data_volume_ready().
+       *
+       * T-081 / C28: this used to be "mount the first registered device, or give
+       * up" -- and the first registered device is whichever driver called
+       * blk_register() first.  ide_init() runs before ahci_init() (main.c), so
+       * a speculative probe that found a phantom disk locked out the real one
+       * behind it.  The policy is "every device that actually mounts", each with
+       * its own attempt line.
+       *
+       * C51: the loop does NOT stop at the device that filled "/" -- a data disk
+       * behind the boot disk still gets placed at /mnt..., and a boot disk
+       * behind a data disk still wins "/" because only its volume carries
+       * /bin/init.
+       *
+       * The bound is snapshotted because an attempt *grows* the table: the
+       * partitions of disk N are registered while disk N is being tried, and a
+       * bound read fresh each round would then walk into those partitions and try
+       * to parse a partition table on them. */
 int vfs_try_mount_disk(void)
 {
     int n = blk_count;

@@ -12,7 +12,7 @@ MAKEFLAGS += --no-print-directory
 USERFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie -O2 \
              -mcmodel=large $(WARN) \
              -mno-mmx -mno-sse -Ilib -I../include -idirafter ../include
-USERLDFLAGS := -nostdlib -nostartfiles -static
+USERLDFLAGS := -nostdlib -nostartfiles -static -fuse-ld=lld
 
 USER_LINK_BASE := 0x7f8000400000
 

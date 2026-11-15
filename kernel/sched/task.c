@@ -237,20 +237,17 @@ static int user_stack_map(u64 pml4)
     return signal_map_restorer(pml4);
 }
 
-/* ---- execve, in pieces ----
- *
- * execve is a pipeline: copy what the caller handed over, read the image,
- * build a new address space, load into it, commit, lay out the stack.  The
- * whole thing used to be one 187-line function whose first half was a
- * ladder of "free the image and close the file" exits -- each stage
- * remembering which of the four resources it had already taken.  Splitting
- * it at the stage boundaries leaves sys_execve() as the ordering, and the
- * one cleanup rule it still needs is "free img, destroy new_pml4", which
- * both live in the caller.
- *
- * POSIX says exec failure RETURNS to the caller: nothing below may exit on
- * a failed stage (this sys_exit(-8)'d once, after CR3 had already been
- * switched, leaving current->pml4 pointing at a destroyed pml4). */
+      /* ---- execve, in pieces ----
+       *
+       * execve is a pipeline: copy what the caller handed over, read the image,
+       * build a new address space, load into it, commit, lay out the stack.
+       * Splitting it at the stage boundaries leaves sys_execve() as the ordering,
+       * and the one cleanup rule it still needs is "free img, destroy new_pml4",
+       * both of which live in the caller.
+       *
+       * POSIX says exec failure RETURNS to the caller: nothing below may exit on
+       * a failed stage (this sys_exit(-8)'d once, after CR3 had already been
+       * switched, leaving current->pml4 pointing at a destroyed pml4). */
 #define EXEC_MAX_ARGS 16
 #define EXEC_ARG_LEN  64
 
@@ -262,18 +259,16 @@ struct exec_args {
     int envc;
 };
 
-/* Path, argv and envp strings may straddle unmapped pages: copy them
- * through the per-byte validated helper instead of reading user memory
- * raw.
- *
- * A NULL argv/envp stays legal (userland/sh.c execs with envp NULL); a
- * NON-NULL but unreachable array used to be accepted and dropped -- the
- * new image then ran with argc 0 instead of the caller being told the
- * pointer was bad.  Refuse it, and refuse a bad entry pointer or entry
- * string instead of truncating the array there. (2026-10-20)
- *
- * envp used to be accepted and silently dropped; it is copied for real so
- * the new image's stack carries it (crt0 publishes it as `environ`). */
+      /* Path, argv and envp strings may straddle unmapped pages: copy them
+       * through the per-byte validated helper instead of reading user memory
+       * raw.
+       *
+       * A NULL argv/envp stays legal (userland/sh.c execs with envp NULL); a
+       * NON-NULL but unreachable array, a bad entry pointer or a bad entry
+       * string is refused rather than silently dropped or truncated -- the
+       * image would otherwise run with argc 0 while the caller was told
+       * nothing.  envp is copied for real so the new image's stack carries it
+       * (crt0 publishes it as `environ`).  (2026-10-20) */
 static long exec_copy_args(struct exec_args *a, const char *upath,
                            char *const uargv[], char *const uenvp[])
 {
@@ -386,7 +381,7 @@ static void exec_commit(const struct exec_args *a, u64 old_pml4, u64 new_pml4,
     current->mem_pages = vmm_count_user_pages(current->pml4);
     current->mem_peak = current->mem_pages;
 
-    /* Close O_CLOEXEC descriptors (the old body was an empty if). */
+        /* Close O_CLOEXEC descriptors. */
     for (int i = 0; i < NR_FDS; i++)
         if (current->fds[i] && (current->fds[i]->flags & O_CLOEXEC))
             sys_close(i);
@@ -483,13 +478,13 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     }
 
     u64 entry = 0, brk_end = 0;
-    /* Deliberately NO vmm_switch_to() here: elf_load() maps and fills every
-     * frame through the high-half alias and an explicit `pml4` root, so it
-     * works under ANY address space (see elf.c).  Switching CR3 this early
-     * opened a ~15-line window in which CR3 was the new root while
-     * current->pml4 still named the old one -- the exact state the #PF
-     * report calls (*MISMATCH*).  The switch now happens at the point of
-     * no return, two instructions before current->pml4 is published. */
+          /* Deliberately NO vmm_switch_to() here: elf_load() maps and fills every
+           * frame through the high-half alias and an explicit `pml4` root, so it
+           * works under ANY address space (see elf.c).  Switching CR3 this early
+           * opened a window in which CR3 was the new root while current->pml4
+           * still named the old one -- the exact state the #PF report calls
+           * (*MISMATCH*).  The switch happens at the point of no return, two
+           * instructions before current->pml4 is published. */
     entry = elf_load(new_pml4, img, sz, &brk_end);
     kfree(img);
     if (!entry) {

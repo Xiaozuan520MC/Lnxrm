@@ -4,7 +4,7 @@ lnxrm
 
 构建
 
-依赖：clang、nasm、binutils、python3、qemu-system-x86_64；
+依赖：clang、nasm、ld.lld、llvm-objcopy、python3、qemu-system-x86_64；
 ISO 额外要 grub-mkrescue + grub-pc-bin；镜像要 dosfstools（mkfs.vfat）与 mtools。
 
 |image/bitcat.svg| 吉祥物 |

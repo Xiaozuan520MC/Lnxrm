@@ -4,11 +4,13 @@
  *   - Each cpu_info has its own run queue (sentinel at cpu->runq_head).
  *     A RUNNABLE task sits on exactly one queue, identified by
  *     task->rq_cpu (-1 == not queued).
- *   - The queue is a push-front singly linked list, NOT a circular list:
- *     enqueue_on() inserts at the HEAD and pick_next() takes from the HEAD,
- *     so under continuous contention it behaves LIFO, not round-robin (C62).
- *     The topology is circular only in the weak sense that the sentinel
- *     runq_head closes the list (last->rq_next == &runq_head).
+ *   - The queue is a singly linked FIFO closed by the sentinel: enqueue_on()
+ *     appends at the TAIL and pick_next() takes from the HEAD, so first in
+ *     is first out and a requeued current goes behind everyone who waited --
+ *     true round-robin under contention (C62 closed 2026-11-13; it used to
+ *     push at the head, which made the queue LIFO).  The topology is
+ *     circular only in the weak sense that the sentinel runq_head closes
+ *     the list (last->rq_next == &runq_head).
  *   - A single global runq_lock (taken with interrupts off) serializes
  *     every enqueue/dequeue/pick so cross-CPU handoff cannot corrupt
  *     links. Critical sections are only a few pointer stores, so one
@@ -31,12 +33,14 @@
  * irqsave at all -- and a twenty-line primitive did not merit a translation
  * unit.  Reference: Linux kernel/locking/spinlock.c.
  *
- * Only the irqsave variant exists: every lock in this kernel can be taken
- * from interrupt context (handlers print, the tick calls the scheduler), so
- * a lock held with interrupts on would self-deadlock when the same CPU
- * re-enters it from an IRQ.  The historical non-irq
- * spin_lock()/spin_unlock()/spin_init() trio had no callers left after every
- * call site migrated to irqsave and was removed (2026-10-01); static
+ * The irqsave variant is the default: every lock here except the one named
+ * in spin_lock_irqon() can be taken from interrupt context (handlers print,
+ * the tick calls the scheduler), so a lock held with interrupts on would
+ * self-deadlock when the same CPU re-enters it from an IRQ.  The historical
+ * non-irq spin_lock()/spin_unlock()/spin_init() trio had no callers left
+ * after every call site migrated to irqsave and was removed (2026-10-01);
+ * spin_lock_irqon() reintroduces just that shape, for exactly one lock and
+ * under the contract spelled out in <sys/spinlock.h> (C7).  Static
  * initialization goes through SPINLOCK_INIT. */
 void spin_lock_irqsave(spinlock_t *l, u64 *flags)
 {
@@ -52,6 +56,24 @@ void spin_unlock_irqrestore(spinlock_t *l, u64 flags)
     __sync_synchronize();
     __sync_lock_release(&l->locked);
     __asm__ volatile("push %0; popfq" ::"r"(flags) : "memory");
+}
+
+/* C7: same mutual exclusion, interrupt state left alone -- this lock never
+ * cli's and never restores a saved IF.  Every current caller already runs
+ * at IF=0 (interrupt-gate entry), so this is a contract change, not a
+ * behavioural one: it drops the cli/popfq pair and keeps the lock correct
+ * for a future IF-on kernel path (GAP §3), where irqsave would stop this
+ * CPU's tick for the length of each FS operation. */
+void spin_lock_irqon(spinlock_t *l)
+{
+    while (__sync_lock_test_and_set(&l->locked, 1));
+    __sync_synchronize();
+}
+
+void spin_unlock_irqon(spinlock_t *l)
+{
+    __sync_synchronize();
+    __sync_lock_release(&l->locked);
 }
 
 /* C27 (panic side door): a panic that fires while holding this very lock
@@ -109,11 +131,19 @@ struct task *task_find_by_pml4(u64 pml4)
 
 static void switch_to(struct task *next);
 
-/* Per-CPU pick_next: find runnable task from this CPU's queue. */
+/* Per-CPU pick_next: find runnable task from this CPU's queue.
+ * C4: the head read runs under runq_lock -- cross-CPU enqueues write that
+ * pointer (and a linked-in task's rq_next), so reading it bare raced them.
+ * The critical section is one pointer read; removal of the picked task
+ * stays where it was (runqueue_remove in schedule()), under the same lock. */
 static struct task *pick_next(void)
 {
     struct cpu_info *cpu = this_cpu_data();
-    struct task *head = cpu->runq_head.rq_next;
+    u64 flags;
+    struct task *head;
+    spin_lock_irqsave(&runq_lock, &flags);
+    head = cpu->runq_head.rq_next;
+    spin_unlock_irqrestore(&runq_lock, flags);
     if (head == &cpu->runq_head) return NULL;
     return head;
 }
@@ -162,12 +192,20 @@ static struct cpu_info *preferred_cpu(void)
     return best;
 }
 
-/* Enqueue `t` at the HEAD of `cpu`'s queue. Caller holds runq_lock. */
+/* Enqueue `t` at the TAIL of `cpu`'s queue. Caller holds runq_lock.
+ * C62: tail insertion is what makes the queue round-robin -- a fresh wake
+ * (or a requeued current) waits behind what is already there instead of
+ * barging in at the head, where continuous contention could starve it.
+ * The walk is at most NR_TASKS-1 pointer hops, under a lock whose critical
+ * sections are a few pointer stores. */
 static void enqueue_on(struct cpu_info *cpu, struct task *t)
 {
+    struct task *sentinel = &cpu->runq_head;
     t->rq_cpu = (int)cpu->id;
-    t->rq_next = cpu->runq_head.rq_next;
-    cpu->runq_head.rq_next = t;
+    t->rq_next = sentinel;
+    struct task *p = sentinel;
+    while (p->rq_next && p->rq_next != sentinel) p = p->rq_next;
+    p->rq_next = t;
 }
 
 /* Add task to a run queue using the placement policy (self / idle CPU /

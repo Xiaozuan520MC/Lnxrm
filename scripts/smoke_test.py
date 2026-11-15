@@ -1019,6 +1019,13 @@ def main():
                     help="guest CPU count (default 2).  1 switches the boot "
                          "markers to the single-CPU pair -- this is the old "
                          "scripts/smoke_smp1.py folded in here")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="OBS-1 jitter gate: run the boot+shell and forged-FAT "
+                         "phases N times (default 1 = unchanged).  "
+                         "toolchain/build/artifacts stay single-shot; every "
+                         "failing round keeps its serial transcript as "
+                         "build/smoke/serial-fail-<round>.log instead of "
+                         "letting the next round overwrite the evidence")
     ap.add_argument("--mem", type=int, default=256, metavar="MIB",
                     help="guest RAM in MiB (default 256).  Raise above the "
                          "kernel's managed window (>=1024) to exercise a "
@@ -1028,9 +1035,11 @@ def main():
         ap.error("--smp must be >= 1")
     if args.mem < 16:
         ap.error("--mem must be >= 16")
+    if args.repeat < 1:
+        ap.error("--repeat must be >= 1")
 
-    print("lnxrm smoke test  (root: %s, -smp %d, -m %d)"
-          % (ROOT, args.smp, args.mem))
+    print("lnxrm smoke test  (root: %s, -smp %d, -m %d, -repeat %d)"
+          % (ROOT, args.smp, args.mem, args.repeat))
     report = Report()
 
     if not phase_toolchain(report):
@@ -1039,11 +1048,46 @@ def main():
         return finish(report)
     if not phase_artifacts(report):
         return finish(report)
-    if not phase_boot_and_shell(report, args):
-        return finish(report)
-    if not phase_forged_fat(report, args):
-        return finish(report)
+
+    # OBS-1: the three phases above are build work -- once.  The two that
+    # actually boot the guest are what jitter shows up in (the one observed
+    # incident was a device FLUSH CACHE error in a single boot), so they are
+    # the unit that repeats.  A failing round keeps its transcript (the next
+    # round overwrites serial.log) and the loop keeps going on purpose: a
+    # later green round next to a red one is exactly the intermittency this
+    # gate has to tell apart from a hard break.
+    for rnd in range(1, args.repeat + 1):
+        if args.repeat > 1:
+            print("\n" + "=" * 60 +
+                  "\nround %d/%d (OBS-1 repeat gate)" % (rnd, args.repeat) +
+                  "\n" + "=" * 60, flush=True)
+        before = len(report.failed)
+        booted = phase_boot_and_shell(report, args)
+        if not booted:
+            if len(report.failed) > before:
+                save_failed_serial(args, rnd)
+            continue  # no point forging FAT entries on a guest that won't boot
+        if not phase_forged_fat(report, args):
+            if len(report.failed) > before:
+                save_failed_serial(args, rnd)
     return finish(report)
+
+
+def save_failed_serial(args, rnd):
+    """OBS-1: copy this round's serial transcript aside before the next
+    round overwrites it.  Returns the kept path (or None if the round died
+    before a transcript existed)."""
+    src = serial_log_path(args.smp)
+    if not os.path.exists(src):
+        return None
+    stem = "serial-fail-%d" % rnd
+    if args.smp != 2:
+        stem += "-smp%d" % args.smp
+    dst = os.path.join(SMOKE_DIR, stem + ".log")
+    shutil.copyfile(src, dst)
+    print("\n  round %d failed -- serial transcript kept: %s"
+          % (rnd, os.path.relpath(dst, ROOT)), flush=True)
+    return dst
 
 
 def finish(report):

@@ -76,7 +76,22 @@ SECTIONS
         . = ALIGN(16);
     }
 
-    .bss : AT(LOADADDR(.image) + SIZEOF(.image))
+    /* AP trampoline (trampoline.bin -> objcopy'd .trampoline.o).  Written
+     * out explicitly rather than left as an orphan: GNU ld and ld.lld place
+     * orphans differently and lld rejects an orphan that lands on .bss's
+     * load address ("section .trampoline load address range overlaps with
+     * .bss").  This reproduces the original GNU ld placement byte for
+     * byte: VMA = end of .image, LMA = LOADADDR(.image) + SIZEOF(.image),
+     * so VMA = LMA + (KERNEL_VMA - KERNEL_LMA) still holds.  Nothing in
+     * the script may glob it back into .image -- smp.c memcpy()s
+     * [trampoline_start, trampoline_end) to physical 0x8000, so it is
+     * plain read-only-at-runtime payload that travels in the bzImage. */
+    .trampoline : AT(LOADADDR(.image) + SIZEOF(.image))
+    {
+        KEEP(*(.trampoline))
+    }
+
+    .bss : AT(LOADADDR(.trampoline) + SIZEOF(.trampoline))
     {
         __bss_start = .;
         *(COMMON)

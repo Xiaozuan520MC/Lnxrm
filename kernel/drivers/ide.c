@@ -211,36 +211,29 @@ static struct blkdev ide_bd = {
     .write = NULL,
 };
 
-/* Serialises the LBA-register setup + command + data-phase sequence so two
- * CPUs can't interleave and make task A's command use task B's LBA. */
-static spinlock_t ide_lock = SPINLOCK_INIT;
-
-/* Shared body of ide_blk_read / ide_blk_write: bounds-check the request as
- * a whole (a request past the end of the device fails rather than reading
- * what it can), then walk it IDE_MAX_CHUNK at a time under ide_lock.  `write`
- * selects the direction routine; the const the write path asks for is
- * dropped here and never written through. */
+/* C10 (2026-11-13): this body used to hold `ide_lock` around the
+ * LBA-register setup + command + data-phase sequence so two CPUs could not
+ * interleave and make task A's command use task B's LBA.  The same
+ * guarantee now comes from one layer up: blk_cache.c holds THIS device's
+ * io_lock across the whole drain, so no other transfer can reach ide_blk_xfer
+ * concurrently -- and nothing else touches the channel registers.  Shared
+ * body of ide_blk_read / ide_blk_write: bounds-check the request as a whole
+ * (a request past the end of the device fails rather than reading what it
+ * can), then walk it IDE_MAX_CHUNK at a time.  `write` selects the
+ * direction routine; the const the write path asks for is dropped here and
+ * never written through. */
 static int ide_blk_xfer(struct blkdev *b, u64 lba, u32 count, void *buf, bool write)
 {
     u8 *p = buf;
-    u64 flags;
-    spin_lock_irqsave(&ide_lock, &flags);
-    if (count && lba + count > b->num_sectors) {
-        spin_unlock_irqrestore(&ide_lock, flags);
-        return LNXRM_EFAIL;
-    }
+    if (count && lba + count > b->num_sectors) return LNXRM_EFAIL;
     while (count) {
         u32 n = count > IDE_MAX_CHUNK ? IDE_MAX_CHUNK : count;
         int rc = write ? ide_write_sectors(lba, n, p) : ide_read_sectors(lba, n, p);
-        if (rc) {
-            spin_unlock_irqrestore(&ide_lock, flags);
-            return LNXRM_EFAIL;
-        }
+        if (rc) return LNXRM_EFAIL;
         lba += n;
         p += n * 512;
         count -= n;
     }
-    spin_unlock_irqrestore(&ide_lock, flags);
     return 0;
 }
 

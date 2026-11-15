@@ -69,7 +69,7 @@ const char *mbr_type_name(u8 type);
 
 /* Every kernel block transfer is supposed to go through blk_io_read() /
  * blk_io_write() instead of calling blkdev->read / blkdev->write directly.
- * Two reasons, both about failures:
+ * Three reasons, all about failures:
  *   - one place that validates the request before it reaches the driver;
  *   - one place a test can break: blk_inject_io() makes transfers to a
  *     chosen LBA fail exactly as a dying disk would, so the filesystem's
@@ -77,6 +77,9 @@ const char *mbr_type_name(u8 type);
  *     Injecting at this level (rather than in the driver) means a cached
  *     sector cannot hide the fault: the filesystem sees the error whether
  *     or not the cache happens to hold the LBA.
+ *   - C10: the same pair owns the per-device request queue -- phase 1
+ *     parks the request under blkdev->io_lock, phase 2 drains the queue
+ *     in arrival order under it, and the driver itself needs no lock.
  * Return value: 0 on success, nonzero on failure -- LNXRM_EIO from an
  * injected fault, or whatever the driver answers on a real one. */
 #define BLK_IO_READ  0x1
@@ -91,6 +94,18 @@ int blk_io_write(struct blkdev *dev, u64 lba, u32 count, const void *buf);
 void blk_inject_io(struct blkdev *dev, u64 lba, int ops);
 void blk_inject_io_off(void);
 
+#ifdef CONFIG_KTEST
+/* C10 test support (ktest/t_blk.c): park a request on `dev`'s request
+ * queue WITHOUT executing it -- the next blk_io_* on that device drains
+ * the queue in arrival order, so this node runs first and its effect (or
+ * its failure status) is observable in that later call.  Returns the node
+ * (read `state`/`status` off it afterwards), or NULL when the arguments
+ * are unusable or the one static node is still parked from an earlier
+ * push that no I/O has drained yet. */
+struct blk_req *blk_queue_push_test(struct blkdev *dev, bool is_write, u64 lba, u32 count,
+                                    void *buf);
+#endif
+
 /* ---------------- sector cache ---------------- */
 
 #define CACHE_SECTOR_SIZE 512
@@ -101,6 +116,14 @@ struct cache_entry {
     u8 data[CACHE_SECTOR_SIZE];
     bool valid;         /* Is this entry valid? */
     bool dirty;         /* Does this entry need writeback? */
+    /* C7: this slot is reserved by a device transfer that is running with
+     * cache_lock RELEASED, so the slot must not move while the driver owns
+     * data[]: a fill has it open (valid is clear, so nobody can hit it) and
+     * a writeback has it open (valid stays set -- readers may still take
+     * the copy they can see -- but it may not be evicted, purged or handed
+     * to another fill).  cache_find_victim() and blk_cache_purge() skip a
+     * busy slot; that is the whole mechanism letting the lock go. */
+    bool busy;
     struct blkdev *dev; /* Associated block device */
     /* Recency stamp (T-007): bumped on every hit, fill and stage, so the
      * victim -- the resident entry with the smallest stamp -- is the least
@@ -154,6 +177,20 @@ void blk_cache_stats_reset(void);
 /* Slot index holding (dev, lba), or -1 when it is not resident.  Lets a
  * test observe *which* sector was evicted instead of inferring it. */
 int blk_cache_lookup(struct blkdev *dev, u64 lba);
+
+#ifdef CONFIG_KTEST
+/* C7 test support (ktest/t_cache.c): is cache_lock free right now?
+ * Answered by a plain read of the flag rather than a trylock, so it is safe
+ * to ask from the one place that matters -- the I/O point of a path that
+ * has just RELEASED the lock.  If a future edit put the lock back around
+ * the transfer this reads 1 and the case fails; nothing here can spin. */
+bool blk_cache_lock_is_free(void);
+
+/* Called at every "about to touch the device with cache_lock released"
+ * point of blk_cache.c.  NULL in production (and in every ktest that did
+ * not install one). */
+void blk_cache_set_io_probe(void (*fn)(void));
+#endif
 
 /* Write back every dirty entry of `dev`, then drop all of its entries, so
  * the next lookup is guaranteed to reach the device.  Returns the flush

@@ -3,11 +3,10 @@
  * on this machine, on this boot".
  *
  * HOW IT WORKS
- *   Every test case is one `struct ktest_case` dropped into the `.ktest`
- *   section (KEEP'd by arch/kernel.ld, so --gc-sections cannot throw it
- *   away).  The runner walks that section and calls the cases whose stage
- *   matches.  Nothing is registered at runtime and nothing needs a central
- *   list: adding a test means adding one function and one KTEST() line.
+ *   Every case is one `struct ktest_case` in the `.ktest` section (KEEP'd by
+ *   arch/kernel.ld, so --gc-sections cannot throw it away).  The runner walks
+ *   that section and calls the cases whose stage matches: nothing is registered
+ *   at runtime, so adding a test means one function and one KTEST() line.
  *
  * ADDING A TEST
  *     static void test_pmm_alignment(void)          // static, void, no args
@@ -27,18 +26,16 @@
  * REPORTING
  *   Every failed check prints one greppable line:
  *       [ktest] FAIL <suite>.<name> <file>:<line>: <expr> [got=.. want=..]
- *   Checks that are not inside a case (or a bare ASSERT() in kernel code)
- *   print as [selftest] FAIL <file>:<line>: ...; see console.h for the
- *   ASSERT/WARN/BUG_ON triple and the selftest_pass/fail/warn counters they
- *   share with the macros above.
+ *   Checks outside a case (or a bare ASSERT() in kernel code) print as
+ *   [selftest] FAIL <file>:<line>: ...; see console.h for the ASSERT/WARN/
+ *   BUG_ON triple and the counters they share with the macros above.
  *   Each stage ends with a count line, and ktest_summary() prints the two
- *   machine-readable verdicts the smoke test looks for:
+ *   verdicts the smoke test looks for:
  *       [ktest] selftest PASS (N cases, M checks)
  *       [selftest] N/M pass
- *   A failure prints [selftest] FAILED and stops the kernel (panic) before
- *   any user process is spawned.  `ktest=continue` boots on past a failure
- *   -- but never past a BUG_ON; `ktest=off` skips the whole framework.
- */
+ *   A failure prints [selftest] FAILED and panics before any user process is
+ *   spawned.  `ktest=continue` boots on past a failure -- but never past a
+ *   BUG_ON; `ktest=off` skips the whole framework. */
 #pragma once
 #include <types.h>
 

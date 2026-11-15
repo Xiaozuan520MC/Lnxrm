@@ -1,20 +1,17 @@
-/* FAT32 driver core: cached FAT table access, mount, and the locked
- * fs_ops table.  Directory scanning lives in fat32_dir.c, file data in
- * fat32_file.c and namespace changes in fat32_meta.c; shared types are
- * in fat32.h. */
+/* FAT32 driver core: cached FAT table access, mount and the locked fs_ops
+ * table.  Scanning: fat32_dir.c; file data: fat32_file.c; namespace:
+ * fat32_meta.c; shared types: fat32.h. */
 #include "fat32.h"
 
 void *fat_priv; /* active mount or NULL */
 
-/* Global FAT32 lock: serialises cluster allocation,
- * directory scans and FAT updates across CPUs.  Without it two tasks on
- * different CPUs can allocate the same free cluster (cross-linking) or
- * rewrite FAT/dirent sectors concurrently.  Lock order: fat -> cache -> driver. */
+/* Serialises cluster allocation, directory scans and FAT updates across CPUs
+ * (otherwise two CPUs cross-link the same free cluster).  Lock order: fat ->
+ * cache -> driver; taken without touching IRQ state (C7, see fat32.h). */
 spinlock_t fat_fs_lock = SPINLOCK_INIT;
 
-/* Corruption reporting is rate limited: a hostile image can trip these on
- * every single operation, and an unbounded console flood is its own denial
- * of service. */
+/* Corruption reporting is rate limited: a hostile image can trip it on every
+ * operation, and an unbounded console flood is its own denial of service. */
 #define FAT_WARN_LIMIT 16
 
 static bool fat_warn_allowed(struct fat_mount *m)
@@ -55,22 +52,17 @@ static void fat_warn_steps(struct fat_mount *m, u32 clus, u32 budget)
             budget, clus, fat_warn_tail(m));
 }
 
-/* An I/O failure, named and rate-limited like the corruption reports above.
- * Published so every layer of the driver can say *which* transfer died --
- * "the write failed" is the only evidence a swallowed return value used to
- * destroy (T-005). */
+/* Rate-limited I/O failure report, so every layer can say *which* transfer
+ * died (T-005). */
 void fat_warn_io(struct fat_mount *m, const char *op, u64 lba)
 {
     if (!fat_warn_allowed(m)) return;
     kprintf("[fat32] I/O error %s LBA %llu%s\n", op, lba, fat_warn_tail(m));
 }
 
-/* --- paged FAT access ---------------------------------------------------
- * One frame (PAGE_SIZE) holds PAGE_SIZE/4 = 1024 FAT entries, and every FAT
- * position is a byte offset that divides evenly into a frame, so a frame
- * lookup plus an in-frame offset is the whole translation.  These are the
- * only places that compute it; everything else in the driver goes through
- * them (and so does ktest). */
+/* --- paged FAT access --------------------------------------------------- */
+/* One frame holds 1024 entries and every FAT offset divides evenly into a
+ * frame: frame lookup + in-frame offset, computed nowhere else. */
 u32 fat_entry_get(struct fat_mount *m, u32 clus)
 {
     u64 off = (u64)clus * 4;
@@ -85,8 +77,8 @@ void fat_entry_put_raw(struct fat_mount *m, u32 clus, u32 val)
 
 void *fat_sector_ptr(struct fat_mount *m, u64 off)
 {
-    /* `off` is sector-aligned and bytes_per_sector | PAGE_SIZE, so the whole
-     * sector lives inside the one frame the offset starts in. */
+    /* `off` is sector-aligned and bytes_per_sector | PAGE_SIZE, so the sector
+     * lies wholly inside the frame the offset starts in. */
     return fat_page_at(m, off) + (off & (PAGE_SIZE - 1));
 }
 

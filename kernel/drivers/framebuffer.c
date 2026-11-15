@@ -30,7 +30,6 @@ static volatile u8 *fb_back;  /* the offscreen draw surface; NULL = single buffe
  * draw into the back surface -- fb_flip (syscall 32) is what shows it. */
 static void fb_put_pixel(u32 x, u32 y, u32 color);
 
-
 u32 fb_pitch;
 u32 fb_bpp = 8;
 u32 fb_pxsz = 1; /* bytes per stored pixel */
@@ -332,83 +331,60 @@ static void fb_copy_fwd(volatile void *dst, const volatile void *src, size_t n)
 }
 
 /* ---- double buffering ----
- * Everything below draws into fb_ptr, which is the back surface whenever
- * one could be mapped (fb_back_init()).  Presenting is deliberately not
- * the caller's job for ordinary output:
+ * Everything below draws into fb_ptr, which is the back surface whenever one
+ * could be mapped (fb_back_init()).  Presenting is deliberately not the
+ * caller's job for ordinary output: the console has a stream of characters, not
+ * frames, so a console write marks its region dirty and lets the batch boundary
+ * (fb_console_flush) decide when the screen is worth updating, while a drawing
+ * program does have frames and calls fb_flip() to land one as one.
  *
- *  - The console has no frames, it has a stream of characters.  Presenting
- *    per character would push a region to the screen thousands of times
- *    over a boot log, so a console write marks its region dirty and lets
- *    the batch boundary (fb_console_flush) decide when the screen is
- *    worth updating.
- *  - A drawing program does have frames, and calls fb_flip() (or the
- *    fb_flip syscall) to land one as one.
+ * Dirty tracking is a *region*, not a flag: fb_mark_dirty(x,y,w,h) unions the
+ * box each write covered into (fb_dx0..fb_dx1, fb_dy0..fb_dy1) and a present
+ * copies exactly that box, so a char cell costs an 8x16 copy instead of the
+ * whole surface.  The box is sound because fb_console_init() clears the whole
+ * surface before the first flip and every write afterwards marks its box;
+ * fbc_scroll()'s raw fb_copy_fwd() is the one write that bypasses fb_store_px(),
+ * so it marks its rows itself.
  *
- * Dirty tracking is a *region*, not a flag: fb_mark_dirty(x,y,w,h) unions
- * the box each write covered into (fb_dx0..fb_dx1, fb_dy0..fb_dy1), and a
- * present copies exactly that box, row by row -- a char cell costs an
- * 8x16 copy instead of the whole surface.  The box is sound because
- * fb_console_init() clears the whole surface before the first flip (front
- * and back then agree everywhere) and every write afterwards marks its
- * box; fbc_scroll()'s raw fb_copy_fwd() is the one write that bypasses
- * fb_store_px(), so it marks its rows itself.
+ * Two rules keep a mark from being lost to a present running on the other CPU
+ * -- a lost *region* would sit in the back surface until something marked it
+ * again, so both rules are structural:
  *
- * Two rules keep a mark from being lost to a present running on the other
- * CPU.  With the whole-surface flag this was merely a tear -- the next
- * store anywhere repainted everything -- but a lost *region* would sit in
- * the back surface until something marked that region again, so both
- * rules are structural:
+ *  - Mark after the store, never before (under fb_box_lock).  A present may
+ *    then skip a write that is not marked yet (one more frame for it), but it
+ *    can never consume the mark of a write that has not happened.
+ *  - The present consumes the box (flag down, box emptied) under fb_box_lock
+ *    and copies the pixels under console_out_lock.  Every back-surface writer
+ *    holds console_out_lock for its whole write, so the copy reads one
+ *    consistent frame; a mark needs that lock too, so it lands before the copy
+ *    (its pixels are in it) or after (a fresh box, presented next).
  *
- *  - Mark after the store, never before (under fb_box_lock).  A present
- *    may then skip a write that is not marked yet (one more frame for
- *    it), but it can never consume the mark of a write that has not
- *    happened.
- *  - The present consumes the box (flag down, box emptied) under
- *    fb_box_lock and copies the pixels under console_out_lock.  Every
- *    back-surface writer holds console_out_lock for its whole write --
- *    a console batch from the first character to fb_console_flush, a
- *    drawing syscall for the whole primitive -- so the copy reads one
- *    consistent frame.  A scroll or cursor redraw landing mid-copy on
- *    the other CPU is what used to stack two frames on one screen
- *    during a fast scroll; holding the writer's own lock across the
- *    copy is what closes that window, and a mark cannot slip in either:
- *    it needs console_out_lock too, so it lands before the copy (its
- *    pixels are in it) or after (a fresh box, presented next).
- *
- * fb_box_lock is held for about a dozen stores on each side (irqsave:
- * handlers print); console_out_lock spans the copy itself, which is a
- * WB->WC blast over the dirty box -- at most a couple of milliseconds
- * with the aperture in WC (fb_memtype_program), and every spinner on the
- * other CPU is a console batch, already bounded by the same budget.
+ * fb_box_lock is held for about a dozen stores on each side (irqsave: handlers
+ * print); console_out_lock spans the copy itself, a WB->WC blast over the dirty
+ * box of at most a couple of milliseconds with the aperture in WC
+ * (fb_memtype_program).
  *
  * Presenting is split between three callers:
  *
- *  - Once the timer runs (everything after lapic_timer_start(), which is
- *    where the steady state lives), the BSP's tick presents: at most one
- *    copy every FB_PRESENT_TICKS ticks, no matter how much was drawn in
- *    between, and always in the timer handler -- never in whatever
- *    context printed the byte.  A burst of kprintfs becomes one present,
- *    not one per line.  The batch gate is shut for good after the first
- *    tick (see fb_present_wanted): it used to reopen for the rest of any
- *    tick in which a present had landed, which made a fast-scrolling
- *    console present once per 64-byte chunk -- each copy as long as the
- *    whole frame budget, so output ran at a crawl and the screen lagged
- *    behind it.
- *  - Before the first tick (fb_init() through kernel_spawn, which
- *    includes all of ktest stage 3), jiffies never advances and no tick
- *    is coming, so the console presents itself at its batch boundary:
- *    kvprintf and console_write emit their output under console_out_lock
- *    and call fb_console_flush() at console_out_unlock, so each printed
- *    message lands on screen as one frame.  Coalescing on the batch, not
- *    on a character count, is what makes the boot log advance as it is
- *    printed: the whole boot log is ~3 KB, so the old once-per-1024-
- *    characters clock showed three frames for the entire boot.
- *  - fb_present_due() keeps that character count as a backstop for
- *    output that never crosses the console lock; it cannot fire inside
- *    one batch (kvprintf formats into 1024 bytes, console_write chunks
- *    64).  The paths that halt before the timer ever starts (panic, the
- *    kernel_spawn failure loop) flip the surface themselves for the
- *    same reason. */
+ *  - Once the timer runs, the BSP's tick presents: at most one copy every
+ *    FB_PRESENT_TICKS ticks, always in the timer handler -- never in whatever
+ *    context printed the byte, so a burst of kprintfs becomes one present.
+ *    The batch gate is shut for good after the first tick (fb_present_wanted):
+ *    reopening it for the rest of a tick made a fast-scrolling console present
+ *    once per 64-byte chunk and run at a crawl.
+ *  - Before the first tick (fb_init() through kernel_spawn, which includes all
+ *    of ktest stage 3), jiffies never advances, so the console presents itself
+ *    at its batch boundary: kvprintf and console_write emit under
+ *    console_out_lock and call fb_console_flush() at console_out_unlock, so
+ *    each message lands as one frame.  Coalescing on the batch rather than a
+ *    character count is what makes the boot log advance as printed -- the whole
+ *    boot log is ~3 KB, so a once-per-1024-characters clock showed three
+ *    frames for the entire boot.
+ *  - fb_present_due() keeps that character count as a backstop for output that
+ *    never crosses the console lock; it cannot fire inside one batch (kvprintf
+ *    formats into 1024 bytes, console_write chunks 64).  The paths that halt
+ *    before the timer ever starts (panic, the kernel_spawn failure loop) flip
+ *    the surface themselves for the same reason. */
 #define FB_PRESENT_TICKS  2    /* HZ=100 -> a dirty box shows within 20 ms */
 #define FB_PRESENT_CHARS 1024  /* unlocked-output backstop, see above */
 
@@ -1109,7 +1085,6 @@ void fb_init(void)
 
     kprintf("[fb] mapped at %p (phys=0x%lx), %ux%u %u bpp, pitch=%u\n", (void *)fb_ptr, pa,
             fb_width, fb_height, fb_bpp, fb_pitch);
-
 
     /* palette: DAC programming for 8bpp, packed pixels otherwise */
     fb_setup_palette();

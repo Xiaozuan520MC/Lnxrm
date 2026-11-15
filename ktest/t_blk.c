@@ -112,5 +112,64 @@ static void test_a_full_registry_refuses_without_side_effects(void)
     K_EXPECT_EQ(blk_registry_count(), parked >= 1 ? parked : 0);
 }
 
+/* C10: per-device I/O lock + FIFO request queue.  Two structural facts get
+ * pinned here: the lock belongs to EACH device (a single global would put
+ * every disk back in one line -- that is what ide_lock/ahci_lock were), and
+ * requests execute in arrival order -- a write parked on the queue runs
+ * before a read issued after it, so that read sees the written bytes.  The
+ * parked node is also where a failure lands: its own status, never the
+ * queue's. */
+static void test_block_queue_is_fifo_per_device(void)
+{
+    struct kblk *k = kblk_make("kblkfifo", 64, 64);
+    K_ASSERT(k != NULL);
+    struct kblk *k2 = kblk_make("kblkfifo2", 64, 64);
+    K_ASSERT(k2 != NULL);
+
+    /* one lock per device: two addresses, never one shared global */
+    K_EXPECT((uptr)&k->dev.io_lock != (uptr)&k2->dev.io_lock);
+    K_EXPECT(k->dev.req_head == NULL && k->dev.req_tail == NULL);
+
+    /* park a WRITE to sector 7: queued, not executed */
+    u8 pattern[512];
+    memset(pattern, 0x5A, sizeof(pattern));
+    struct blk_req *qf = blk_queue_push_test(&k->dev, true, 7, 1, pattern);
+    K_ASSERT(qf != NULL);
+    K_EXPECT_EQ(qf->state, BLK_REQ_QUEUED);
+    K_EXPECT_EQ(k->writes, 0u); /* parked, so nothing reached the driver */
+    K_EXPECT_EQ(k->reads, 0u);
+
+    /* the read drains the queue FIFO: the parked write goes first ... */
+    u8 out[512];
+    memset(out, 0, sizeof(out));
+    K_EXPECT_EQ(blk_io_read(&k->dev, 7, 1, out), 0);
+    K_EXPECT_EQ(out[0], 0x5A); /* ... so the read already sees it */
+    K_EXPECT_EQ(out[511], 0x5A);
+    K_EXPECT_EQ(qf->state, BLK_REQ_DONE);
+    K_EXPECT_EQ(qf->status, 0);
+    K_EXPECT_EQ(k->writes, 1u);
+    K_EXPECT_EQ(k->reads, 1u);
+    K_EXPECT(k->dev.req_head == NULL && k->dev.req_tail == NULL);
+
+    /* a failing request answers in ITS OWN status: lba 10000 is past a
+     * 64-sector disk, the drain stamps LNXRM_EIO onto that node -- and the
+     * read queued behind it is untouched and still succeeds */
+    u8 junk[512];
+    struct blk_req *qe = blk_queue_push_test(&k->dev, true, 10000, 1, junk);
+    K_ASSERT(qe != NULL);
+    K_EXPECT_EQ(blk_io_read(&k->dev, 0, 1, out), 0);
+    K_EXPECT_EQ(qe->status, LNXRM_EIO);
+    K_EXPECT_EQ(qe->state, BLK_REQ_DONE);
+    K_EXPECT(k->dev.req_head == NULL);
+
+    /* the other device's queue never moved: no cross-device coupling */
+    K_EXPECT_EQ(k2->reads, 0u);
+    K_EXPECT_EQ(k2->writes, 0u);
+
+    kblk_free(k);
+    kblk_free(k2);
+}
+
 KTEST("blk", KTEST_LATE, test_partition_devices_reach_the_registry);
 KTEST("blk", KTEST_LATE, test_a_full_registry_refuses_without_side_effects);
+KTEST("blk", KTEST_LATE, test_block_queue_is_fifo_per_device);

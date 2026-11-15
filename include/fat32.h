@@ -1,8 +1,7 @@
 /* Shared internals of the FAT32 driver: on-disk structures, mount state,
- * path/cluster helpers and the cross-file entry points of
- * fat32.c / fat32_dir.c / fat32_file.c / fat32_meta.c.  Consumers: those
- * four files plus the boot self-test (ktest/t_fs.c and friends), which is
- * precisely the second consumer these helpers need. */
+ * path/cluster helpers and the cross-file entry points of fat32.c /
+ * fat32_dir.c / fat32_file.c / fat32_meta.c.  Also consumed by the boot
+ * self-test (ktest/t_fs.c). */
 #ifndef LNXRM_FAT32_H
 #define LNXRM_FAT32_H
 
@@ -16,16 +15,24 @@ extern void *fat_priv;          /* the volume fat_*_impl with no mount argument
                                 * first mounted (C51 -- never overwritten) */
 extern struct fs_ops fat32_ops; /* defined in fat32.c */
 
-/* Global FAT32 lock: serialises cluster allocation, directory scans and
- * FAT updates across CPUs.  Without it two tasks on different CPUs can
- * allocate the same free cluster (cross-linking) or rewrite FAT/dirent
- * sectors concurrently.  Lock order: fat -> cache -> driver. */
+/* Global FAT32 lock: serialises cluster allocation, directory scans and FAT
+ * updates across CPUs -- otherwise two CPUs can allocate the same free cluster
+ * (cross-linking).  Lock order: fat -> cache -> driver.
+ *
+ * C7 (2026-11-13): taken with spin_lock_irqon, i.e. WITHOUT touching
+ * interrupt state -- the one lock here that may be.  Safe because only the
+ * fs_ops wrappers in fat32.c take it (no IRQ handler, tick or panic() does),
+ * nothing between FAT_ENTER and FAT_LEAVE can raise a #PF while it is held,
+ * and ring-0 holders are never preempted; every taker already arrives at
+ * IF=0, so this costs the lock only its cli/popfq pair (a contract change,
+ * not a behavioural one).  It becomes load-bearing the moment a caller runs
+ * with interrupts on (GAP §3), where irqsave would stop this CPU's tick for
+ * the length of every FS operation.  It does NOT buy much yet: the FS is
+ * still one critical section wide across device I/O -- the remaining half of C7. */
 extern spinlock_t fat_fs_lock;
 
-#define FAT_ENTER()                                                                                \
-    u64 _fat_fl;                                                                                   \
-    spin_lock_irqsave(&fat_fs_lock, &_fat_fl)
-#define FAT_LEAVE() spin_unlock_irqrestore(&fat_fs_lock, _fat_fl)
+#define FAT_ENTER() spin_lock_irqon(&fat_fs_lock)
+#define FAT_LEAVE() spin_unlock_irqon(&fat_fs_lock)
 
 static inline char ascii_toupper(char c)
 { return c >= 'a' && c <= 'z' ? c - 32 : c; }
@@ -35,12 +42,9 @@ static inline char ascii_tolower(char c)
 
 /* ---------------- crash-consistency journal (fat32_journal.c) ----------
  * One record = the after-image of a single metadata sector plus the LBA it
- * belongs at.  The journal buffers these in RAM while a transaction is open,
- * writes them to the on-disk log before touching any home location, and
- * replays them on mount after a crash that landed between commit and apply.
- * Recording the *after*-image (not the before-image) is what makes replay an
- * idempotent redo: applying a record twice leaves the same bytes as applying
- * it once, so recovery never has to know how far the previous run got. */
+ * belongs at, buffered in RAM while a transaction is open, written to the log
+ * before any home location is touched, replayed on mount after a crash.
+ * Recording the *after*-image is what makes replay an idempotent redo. */
 
 #define JRN_RECORDS_MAX 128 /* hard ceiling on one transaction's records */
 
@@ -68,27 +72,25 @@ struct jrn_super {
     u32 crc;      /* CRC over every field above */
 };
 
-/* Journal entry points (fat32_journal.c).  All are called with fat_fs_lock
- * held, from the locked wrappers in fat32.c or from fat_mount(). */
+/* Journal entry points (fat32_journal.c), all called with fat_fs_lock held,
+ * from the locked wrappers in fat32.c or from fat_mount(). */
 struct fat_mount;
-/* Format-or-find the journal in the reserved area and roll a committed but
- * unapplied transaction forward.  Safe to call on a volume that has never
- * been journalled: it lays the superblock down in place.  Leaves j_active
- * false when the volume has no usable reserved area, in which case every
- * operation below degrades to the pre-journal write path. */
+/* Format-or-find the journal and roll a committed but unapplied transaction
+ * forward.  Safe on a volume never journalled: it lays the superblock down.
+ * Leaves j_active false when there is no usable reserved area, in which case
+ * every operation below degrades to the pre-journal write path. */
 void fat_journal_mount(struct fat_mount *m);
-/* Open a transaction.  Always returns 0: a volume without a log, or one
- * that could not allocate the record buffer, simply runs unjournaled
- * instead of failing the operation. */
+/* Open a transaction.  Always 0: no log, or no record buffer, simply runs
+ * unjournaled instead of failing the operation. */
 int fat_journal_begin(struct fat_mount *m);
 /* Close the transaction durably: flush file data, write the records and the
- * commit record to the log, apply them home, then clear the commit.  Also
- * the entry point for an unjournaled volume, where it is just the old
- * fat_sync() cache flush.  Returns 0 or LNXRM_EIO. */
+ * commit record, apply them home, then clear the commit.  Also the entry point
+ * for an unjournaled volume, where it is just fat_sync()'s cache flush.
+ * Returns 0 or LNXRM_EIO. */
 int fat_journal_commit(struct fat_mount *m);
 /* Buffer one metadata sector's after-image, or -- with no transaction open
  * -- write it home the way the driver did before the journal existed.
- * Returns 0 or LNXRM_EIO.  Called by fat_write_sector() and fat_set_entry(). */
+ * Returns 0 or LNXRM_EIO.  Called by fat_write_sector()/fat_set_entry(). */
 int fat_journal_add(struct fat_mount *m, u64 lba, const void *buf);
 /* Serve a read from the open transaction's buffer, if it holds `lba`.
  * Returns true when it filled `buf`.  Called by fat_read_sector(). */
@@ -105,15 +107,13 @@ struct fat_mount {
     u32 root_cluster;
     u64 data_start_lba; /* cluster 2 */
     u32 max_cluster;
-    /* Cached FAT table, held as an array of PAGE_SIZE frames rather than one
-     * contiguous buffer.  A real volume's FAT is proportional to its size --
-     * 8 MiB for a 16 GiB partition, far past what one buddy block can serve
-     * contiguously -- so a single kmalloc(fat_bytes) used to fail silently on
-     * every drive above ~4 MiB of table.  Paging it removes the ceiling
-     * entirely: fat_npages frames, each pmm_alloc()ed (order-0, no heap
-     * header), reachable through fat_pages[i].  Entries and sectors never
-     * straddle a frame (4 B | 4096 B, and bytes_per_sector is one of
-     * 512/1024/2048/4096, all | 4096), so the page lookup below is exact. */
+    /* Cached FAT table as an array of PAGE_SIZE frames, not one contiguous
+     * buffer: a real volume's FAT is proportional to its size (8 MiB for a
+     * 16 GiB partition), so a single kmalloc(fat_bytes) used to fail silently
+     * above ~4 MiB of table.  Paging removes the ceiling -- fat_npages frames,
+     * each pmm_alloc()ed.  A FAT entry (4 B) and a sector (512..4096 B) both
+     * divide PAGE_SIZE, so neither ever straddles a frame: the lookup below is
+     * exact. */
     u8 **fat_pages; /* fat_npages frames, each PAGE_SIZE */
     u32 fat_npages; /* == ceil(fat_bytes / PAGE_SIZE) */
     u64 fat_bytes;
@@ -124,15 +124,14 @@ struct fat_mount {
                       * identity stamp (the guard behind C21) */
 
     /* --- crash-consistency journal (fat32_journal.c) -------------------
-     * A metadata-only redo log living in the reserved sectors mkfs leaves
-     * unused (sector 8 .. reserved_sectors-1).  It turns each mutating
-     * operation into one atomic transaction: the after-images of every
-     * metadata sector it touches are buffered in RAM, committed to the log
-     * *before* any of them reaches its home location, and replayed on the
-     * next mount if the machine died between commit and apply.  File data
-     * is deliberately not logged (ordered mode): a crash can leave stale
-     * bytes inside a file, but never a half-updated FAT or a dangling
-     * directory entry. */
+     * A metadata-only redo log in the reserved sectors mkfs leaves unused
+     * (sector 8 .. reserved_sectors-1).  It turns each mutating operation
+     * into one atomic transaction: after-images of every metadata sector it
+     * touches are buffered in RAM, committed to the log *before* any of them
+     * reaches its home location, and replayed on the next mount if the machine
+     * died between commit and apply.  File data is deliberately not logged
+     * (ordered mode): a crash can leave stale bytes inside a file, but never
+     * a half-updated FAT or a dangling directory entry. */
     u32 j_start;   /* first LBA of the journal (0 = no journal) */
     u32 j_sectors; /* total journal sectors including the superblock */
     bool j_active; /* journal present and usable on this volume */
@@ -164,27 +163,21 @@ struct fat_dirent {
 #define ATTR_ARCHIVE 0x20
 #define ATTR_LFN     0x0F
 /* FAT-standard slot first-byte states: 0x00 is an unused slot and the
- * directory terminator (it only ever sits in the tail), 0xE5 is deleted,
- * anything else is live.  0x05 is live too: the spec re-uses it to carry a
- * literal 0xE5 character in an 8.3 alias, and the fifth piece of a
- * long-name run legitimately begins with its sequence number 5.  Keying
- * end-of-directory on 0x05 while scanning on past 0x00 cut a 20-piece
- * long name right at piece five and let records stranded behind the real
- * terminator surface as phantom names. */
+ * directory terminator, 0xE5 is deleted, anything else is live.  0x05 is live
+ * too: the spec re-uses it to carry a literal 0xE5 in an 8.3 alias, and the
+ * fifth piece of a long-name run begins with its sequence number 5.  Keying
+ * end-of-directory on 0x05 while scanning on past 0x00 cut a 20-piece long
+ * name at piece five and let stranded records surface as phantom names. */
 #define ENT_END      0x00 /* scanners stop here; claims may take the slot */
 #define ENT_E5       0xE5 /* deleted: scanners skip it, claims may reuse  */
 
 /* Sector I/O through the write-back cache.  Contract (T-005): returns 0 or
  * LNXRM_EIO, never a driver-specific code -- callers propagate the value
- * unchanged, so "the disk refused" reaches user space as EIO instead of
- * being mistaken for EOF, "not found" or success.  Every one of these
- * results must be checked: an unchecked read feeds uninitialised bytes to
- * the write below, and that is how kernel stack garbage ends up in a
- * directory entry.
- *
- * Reads consult the open journal transaction first so that a mutating
- * operation sees its own metadata writes before they reach their home
- * location (fat32_journal.c). */
+ * unchanged, so "the disk refused" reaches user space as EIO rather than as
+ * EOF, "not found" or success.  Every result must be checked: an unchecked
+ * read feeds uninitialised bytes to the write below.  Reads consult the open
+ * journal transaction first, so a mutating operation sees its own metadata
+ * writes before they reach their home location. */
 static inline int fat_read_sector(struct fat_mount *m, u64 lba, void *buf)
 {
     if (fat_journal_read(m, lba, buf)) return 0;
@@ -192,27 +185,24 @@ static inline int fat_read_sector(struct fat_mount *m, u64 lba, void *buf)
 }
 
 /* Metadata write (directory entries, new-directory contents, FAT sectors).
- * When a transaction is open this buffers the after-image in the journal
- * instead of touching the home location -- the commit record must reach the
- * log first, or a crash mid-operation would leave a half-applied change with
- * no record to roll forward from.  With no transaction open (or no journal on
- * this volume) it degrades to the plain write-back-cache write, which is
- * exactly the pre-journal behaviour. */
+ * With a transaction open this buffers the after-image instead of touching
+ * the home location -- the commit record must reach the log first, or a crash
+ * mid-operation would leave a half-applied change with nothing to roll forward
+ * from.  With no transaction (or no journal) it is the plain write-back-cache
+ * write, i.e. exactly the pre-journal behaviour. */
 static inline int fat_write_sector(struct fat_mount *m, u64 lba, const void *buf)
 { return fat_journal_add(m, lba, buf); }
 
-/* File *data* write: bypasses the journal entirely and goes straight to the
- * write-back cache.  The journal is metadata-only (ordered mode) -- logging
- * file contents would multiply every write by two for no consistency gain,
- * since data bytes carry no cross-referential structure to keep coherent. */
+/* File *data* write: bypasses the journal entirely (ordered mode).  Logging
+ * contents would multiply every write by two for no consistency gain -- data
+ * bytes carry no cross-referential structure to keep coherent. */
 static inline int fat_write_sector_raw(struct fat_mount *m, u64 lba, const void *buf)
 { return blk_cache_write(m->dev, lba, buf) ? LNXRM_EIO : 0; }
 
 /* Read a whole cluster through the same write-back cache every write goes
- * through.  A raw dev->read here would bypass dirty cache lines, so an entry
- * just created (still in the cache, not yet written back) would be invisible
- * to path resolution, ls and unlink until writeback -- which is exactly how
- * mkdir/touch could "succeed" and then never appear. */
+ * through.  A raw dev->read would bypass dirty cache lines, so an entry just
+ * created would be invisible to path resolution, ls and unlink until writeback
+ * -- exactly how mkdir/touch could "succeed" and then never appear. */
 static inline int fat_read_cluster(struct fat_mount *m, u64 clba, void *buf)
 {
     u8 *p = buf;
@@ -236,15 +226,13 @@ static inline void name_to_short(const char *in, u8 out[11])
 }
 
 /* NT case bits (dirent.ntres): which half of an 8.3 name renders lowercase.
- * This is the *only* place FAT32 records case for a short name -- the 11 name
- * bytes are uppercase by convention -- so a driver that ignores them cannot
- * show "README.md" as anything but "readme.md". */
+ * The *only* place FAT32 records case for a short name -- a driver that
+ * ignores them cannot show "README.md" as anything but "readme.md". */
 #define FAT_NTRES_LOWER_BASE 0x08u /* base is lower case */
 #define FAT_NTRES_LOWER_EXT  0x10u /* extension is lower case */
 
-/* LFN alias checksum (ECMA-107): shared by the writer (fat32_meta.c) and
- * the reader (fat32_dir.c), so an assembled long name can be bound to the
- * 8.3 record that owns it. */
+/* LFN alias checksum (ECMA-107): shared by writer and reader, so an
+ * assembled long name can be bound to the 8.3 record that owns it. */
 static inline u8 fat_lfn_checksum(const u8 *sn)
 {
     u8 sum = 0;
@@ -255,15 +243,12 @@ static inline u8 fat_lfn_checksum(const u8 *sn)
 /* 8.3 short name -> display name, honouring the NT case bits:
  *   "README  MD " + FAT_NTRES_LOWER_EXT  -> "README.md"
  *   "BIN        " + FAT_NTRES_LOWER_BASE -> "bin"
- * A clear bit hands the byte back exactly as stored (what Linux does in
- * fs/fat/dir.c: fat_shortname2uni() only lowercases when asked to). */
+ * A clear bit hands the byte back exactly as stored (Linux does the same). */
 void fat_short_to_name(const u8 *sn, u8 ntres, char out[13]);
-/* Case bits that let `name`'s own 8.3 alias render back to `name` verbatim.
- * A part whose letters are all one case needs no long-name record: mark it
- * lowercase (or leave an all-caps one alone) and the alias already spells it.
- * A mixed-case part cannot be spelled by 8.3 at all -- no bit makes it match,
- * so fat_lfn_count()'s strcmp sees the mismatch and allocates an LFN record
- * instead of storing a name that would read back in the wrong case. */
+/* Case bits that let `name`'s own 8.3 alias render back to `name` verbatim:
+ * an all-one-case part needs no long-name record, a mixed-case part cannot be
+ * spelled by 8.3 at all, so fat_lfn_count()'s strcmp sees the mismatch and
+ * allocates an LFN instead of storing a name that would read back wrong. */
 static inline u8 fat_short_ntres(const char *name)
 {
     u8 bits = 0;
@@ -289,16 +274,15 @@ static inline int cluster_is_eoc(u32 c)
 
 #define FAT_EOC 0x0FFFFFFFu
 
-/* Hard ceiling on one cluster-chain walk.  A legal FAT32 chain never holds
- * more than 4 GiB / 512 B = 8,388,608 clusters (largest possible file,
- * smallest legal cluster), so a walk that outlives this budget can only be
- * a cyclic or hostile FAT -- never a valid file. */
+/* Hard ceiling on one cluster-chain walk: a legal FAT32 chain never holds
+ * more than 4 GiB / 512 B = 8,388,608 clusters, so a walk that outlives this
+ * budget can only be a cyclic or hostile FAT -- never a valid file. */
 #define FAT_CHAIN_MAX_STEPS 0x800010u /* 8,388,624 */
 
 /* C16: longest chain one volume can legally hold, capped by
- * FAT_CHAIN_MAX_STEPS.  A write demand reaching beyond
- * fat_chain_cap_bytes() is refused before any allocation -- never wrapped
- * through u32, never booked into the whole free pool. */
+ * FAT_CHAIN_MAX_STEPS.  A write demand beyond fat_chain_cap_bytes() is refused
+ * before any allocation -- never wrapped through u32, never booked into the
+ * whole free pool. */
 static inline u32 fat_chain_cap(struct fat_mount *m)
 {
     u32 data = m->max_cluster > 2 ? m->max_cluster - 2 : 0;
@@ -310,14 +294,12 @@ static inline u64 fat_chain_cap_bytes(struct fat_mount *m)
     return (u64)fat_chain_cap(m) * m->cluster_size;
 }
 
-/* A single bounded walk over a cluster chain.  Every chain walk in the
- * driver goes through one of these instead of open-coded
- * `c = fat_next_cluster()` loops: fat_chain_start() rejects an illegal
- * first cluster, fat_chain_advance() refuses to follow an entry that is
- * neither a data cluster of this volume nor an end-of-chain marker, and
- * fat_chain_more() hands out a fixed step budget, so a FAT that points at
- * itself (or at a cluster past the end of the volume) can neither hang the
- * kernel with fat_fs_lock held nor steer a read off the disk. */
+/* A single bounded walk over a cluster chain -- every chain walk goes through
+ * one of these instead of open-coded `c = fat_next_cluster()` loops: start
+ * rejects an illegal first cluster, advance refuses an entry that is neither
+ * a data cluster nor end-of-chain, and `steps` is a fixed budget, so a FAT
+ * pointing at itself (or past the end) can neither hang the kernel with
+ * fat_fs_lock held nor steer a read off the disk. */
 struct fat_chain {
     struct fat_mount *m;
     u32 clus;   /* cluster the walk sits on; FAT_EOC once it is done */
@@ -329,9 +311,8 @@ bool fat_chain_more(struct fat_chain *ch);
 void fat_chain_advance(struct fat_chain *ch);
 /* Free every cluster of the chain starting at `first`, one entry at a time.
  * Returns 0 or LNXRM_EIO (already reported): an entry that cannot be cleared
- * leaks its cluster, and the walk stops right there so two files can never
- * end up sharing it.  Read-then-free ordering is the caller's contract with
- * itself -- the next cluster has to be known before this one goes. */
+ * leaks its cluster and stops the walk right there, so two files can never
+ * share it.  Read-then-free ordering is the caller's own contract. */
 int fat_free_chain(struct fat_mount *m, u32 first);
 
 static inline u64 cluster_lba(struct fat_mount *m, u32 clus)
@@ -343,10 +324,9 @@ static inline void *cluster_buf_alloc(struct fat_mount *m)
 static inline bool entry_used(const struct fat_dirent *e)
 { return e->name[0] != ENT_END && e->name[0] != ENT_E5; }
 
-/* Compare an 8.3 alias against a wanted short name, byte 0 case
- * sensitivity untouched: a stored first byte of 0x05 is the spec's
- * escape for a literal 0xE5, so an entry written with the escape still
- * matches the name the user typed. */
+/* Compare an 8.3 alias against a wanted short name, byte 0 case-insensitive:
+ * a stored 0x05 is the spec's escape for a literal 0xE5, so an entry written
+ * with the escape still matches what the user typed. */
 static inline bool fat_alias_eq(const u8 stored[11], const u8 want[11])
 {
     for (int i = 0; i < 11; i++) {
@@ -363,10 +343,8 @@ static inline bool fat_alias_eq(const u8 stored[11], const u8 want[11])
 /* Cluster / FAT table access (fat32.c). */
 /* The FAT is paged (fat_pages, see struct fat_mount): these three helpers are
  * the ONLY way driver or ktest code touches a FAT entry or sector.  Byte
- * offset `off` names a FAT position; it maps to frame off / PAGE_SIZE at
- * within-frame offset off & (PAGE_SIZE - 1).  A FAT entry (4 B) and a sector
- * (512/1024/2048/4096 B) both divide PAGE_SIZE, so neither ever straddles a
- * frame and the lookup is exact. */
+ * offset `off` maps to frame off / PAGE_SIZE at offset off & (PAGE_SIZE-1);
+ * entries and sectors both divide PAGE_SIZE, so neither straddles a frame. */
 static inline u8 *fat_page_at(struct fat_mount *m, u64 off)
 { return m->fat_pages[off / PAGE_SIZE]; }
 /* Raw 32-bit entry at cluster `clus` (all four bytes, high nibble intact);
@@ -384,10 +362,9 @@ void fat_pages_free(struct fat_mount *m);
 
 u32 fat_next_cluster(struct fat_mount *m, u32 clus);
 /* Write one FAT entry (memory copy + the sector backing it).
- * Returns 0 or LNXRM_EIO.  On failure the in-memory entry still changes:
- * the mounted copy is the authority that keeps the next allocation scan
- * from handing the same cluster out twice, so a cluster is leaked to the
- * disk rather than cross-linked. */
+ * Returns 0 or LNXRM_EIO.  On failure the in-memory entry still changes: the
+ * mounted copy is what keeps the next scan from handing the same cluster out
+ * twice, so a cluster is leaked to the disk rather than cross-linked. */
 int fat_set_entry(struct fat_mount *m, u32 clus, u32 val);
 u32 fat_find_free_cluster(struct fat_mount *m);
 /* Rate-limited I/O failure report (fat32.c): a dying disk can fail every
@@ -395,9 +372,8 @@ u32 fat_find_free_cluster(struct fat_mount *m);
 void fat_warn_io(struct fat_mount *m, const char *op, u64 lba);
 
 /* Directory scan + path resolution (fat32_dir.c). */
-/* dirclus/off locate the directory entry physically (containing cluster
- * and byte offset inside it), which is what makes a stable inode number
- * out of a FAT32 record. */
+/* dirclus/off locate the directory entry physically, which is what makes a
+ * stable inode number out of a FAT32 record. */
 typedef int (*dirent_cb)(const char *name, const struct fat_dirent *e, u32 dirclus, u32 off,
                          void *ctx);
 struct find_ctx {
@@ -416,24 +392,23 @@ struct resolve {
     struct fat_dirent de; /* valid if found */
     bool found;
 };
-/* Inode number: (containing cluster << 32) | offset inside that cluster.
- * A FAT32 record lives in exactly one physical cluster at one offset, so
- * the pair is unique across the volume and stable across reboots.  Shared
- * by the directory scan (getdent) and fat_lookup_impl (stat) so both
- * doors hand out the SAME number for the same record. */
+/* Inode number: (containing cluster << 32) | offset inside that cluster --
+ * unique across the volume and stable across reboots.  Shared by the directory
+ * scan (getdent) and fat_lookup_impl (stat) so both doors hand out the SAME
+ * number for the same record. */
 static inline u64 fat_ino(u32 dirclus, u32 off)
 { return ((u64)dirclus << 32) | off; }
 
 /* Walk a directory chain, calling `cb` per live entry.
- * T-005: returns 1 when a callback stopped the walk (it matched), 0 when the
- * directory was walked to its end, or a negative LNXRM error when a sector
- * could not be read.  A failed read is never folded into "0 = not found":
- * the caller would answer ENOENT/empty for data it never got to see. */
+ * T-005: 1 when a callback stopped the walk (matched), 0 when the directory
+ * was walked to its end, negative when a sector could not be read.  A failed
+ * read is never folded into "0 = not found": the caller would answer
+ * ENOENT/empty for data it never got to see. */
 int fat_scan_dir(struct fat_mount *m, u32 dirclus, dirent_cb cb, void *ctx);
-/* C30: same walk started at the getdent cursor `resume` -- (cluster << 32)
- * | offset of the next record to examine.  All-ones or garbage answers
- * "ended"; clusters before the cursor cost no device read.  Meant for the
- * readdir path; the name-lookup path keeps calling fat_scan_dir(). */
+/* C30: same walk started at the getdent cursor `resume` -- (cluster << 32) |
+ * offset of the next record to examine.  All-ones or garbage answers "ended";
+ * clusters before the cursor cost no device read.  Readdir path only; name
+ * lookup keeps calling fat_scan_dir(). */
 #define DIRIT_START 0ULL
 #define DIRIT_END   ((u64)-1)
 int fat_scan_dir_at(struct fat_mount *m, u32 dirclus, u64 resume, dirent_cb cb, void *ctx);
@@ -445,15 +420,15 @@ int fat_scan_find_cb(const char *name, const struct fat_dirent *e, u32 dirclus, 
 int fat_resolve_path(struct fat_mount *m, const char *path, struct resolve *r);
 /* One readdir step: 1 = `d` filled, 0 = no more entries, negative = the
  * directory could not be read.  fs_ops->getdent hands that shape straight to
- * dir_getdent(), which needs to tell "finished" from "failed" (T-005). */
+ * dir_getdent(), which must tell "finished" from "failed" (T-005). */
 int fat_dir_iter(struct dir_iter *it, struct dirent_out *d);
 int fat32_getdent_impl(void *mnt, void *dirnode, u64 *cookie, struct dirent_out *d);
 
 /* Locked fs_ops implementations (fat32_file.c / fat32_meta.c). */
 int fat_lookup_impl(void *mnt, const char *path, struct vnode *out);
-/* Mount the volume behind `dev` (or NULL when the BPB is refused).
- * Boot-only entry point; the ktest boundary cases forge volumes and
- * exercise it directly, so it is exported here, not in a public header. */
+/* Mount the volume behind `dev` (NULL when the BPB is refused).  Boot-only
+ * entry point; the ktest boundary cases forge volumes and exercise it
+ * directly, so it is exported here, not in a public header. */
 void *fat_mount(struct blkdev *dev);
 int fat_read_impl(void *mnt, void *node, u64 off, void *ubuf, size_t n);
 u64 fat_size_impl(void *mnt, void *node);

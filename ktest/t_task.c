@@ -77,10 +77,11 @@ static void test_task_table_wellformed(void)
     K_EXPECT(seen < NR_TASKS); /* and it did not swallow the whole table */
 }
 
-/* The scheduler's run queue is a push-front list, NOT round-robin (C62).
- * This test pins the contract documented in sched.c so a future change to
- * real round-robin has to update the comment AND this test together. */
-static void test_runqueue_is_push_front(void)
+/* The scheduler's run queue is a FIFO: tail insertion, head pickup --
+ * round-robin, not LIFO (C62 closed 2026-11-13).  This test pins the
+ * contract documented in sched.c so a change to the placement policy has
+ * to update the comment AND this test together. */
+static void test_runqueue_is_fifo_round_robin(void)
 {
     struct cpu_info *cpu = this_cpu_data();
     struct task *a = task_alloc_slot();
@@ -89,31 +90,45 @@ static void test_runqueue_is_push_front(void)
     a->state = T_RUNNABLE;
     b->state = T_RUNNABLE;
 
-    struct task *was_first = cpu->runq_head.rq_next;
+    /* Snapshot the queue as it stands (ktest LATE runs with IF=0 and one
+     * CPU, but the walk keeps the assertions positional instead of
+     * assuming an empty queue). */
+    struct task *before[NR_TASKS];
+    int n_before = 0;
+    for (struct task *t = cpu->runq_head.rq_next;
+         t != &cpu->runq_head && n_before < NR_TASKS; t = t->rq_next)
+        before[n_before++] = t;
 
-    /* push-front: the most recently added task sits at the head */
+    /* FIFO: a was enqueued first, so a sits ahead of b; b is the tail. */
     runqueue_add_local(a);
-    K_EXPECT_EQ(cpu->runq_head.rq_next, a); /* a is now first */
-    K_EXPECT_EQ(a->rq_next, was_first);      /* and links to the old first */
+    runqueue_add_local(b);
+    struct task *after[NR_TASKS + 2];
+    int n_after = 0;
+    for (struct task *t = cpu->runq_head.rq_next;
+         t != &cpu->runq_head && n_after < NR_TASKS + 2; t = t->rq_next)
+        after[n_after++] = t;
+    K_EXPECT_EQ(n_after, n_before + 2);
+    K_EXPECT_EQ(after[n_before], a);           /* first in -> first out */
+    K_EXPECT_EQ(after[n_before + 1], b);       /* last in -> tail */
+    K_EXPECT_EQ(b->rq_next, &cpu->runq_head); /* b closes the list */
     K_EXPECT_EQ(a->rq_cpu, (int)cpu->id);
 
+    /* adding an already-queued task must be a no-op (no duplicate node) */
     runqueue_add_local(b);
-    K_EXPECT_EQ(cpu->runq_head.rq_next, b); /* b (last added) is first */
-    K_EXPECT_EQ(b->rq_next, a);             /* LIFO: b before a */
-    K_EXPECT_EQ(a->rq_next, was_first);
+    int n_dup = 0;
+    for (struct task *t = cpu->runq_head.rq_next;
+         t != &cpu->runq_head && n_dup < NR_TASKS + 2; t = t->rq_next)
+        n_dup++;
+    K_EXPECT_EQ(n_dup, n_before + 2);
 
-    /* adding an already-queued task must be a no-op (no self-loop) */
-    runqueue_add_local(b);
-    K_EXPECT_EQ(cpu->runq_head.rq_next, b);
-    K_EXPECT_EQ(b->rq_next, a);
-
-    /* removal restores the "not queued" invariant */
+    /* removal restores the "not queued" invariant and the queue behind it */
     runqueue_remove(a);
     K_EXPECT_EQ(a->rq_cpu, -1);
     K_EXPECT(a->rq_next == NULL);
     runqueue_remove(b);
     K_EXPECT_EQ(b->rq_cpu, -1);
-    K_EXPECT_EQ(cpu->runq_head.rq_next, was_first); /* queue restored */
+    K_EXPECT_EQ(cpu->runq_head.rq_next,
+                n_before ? before[0] : &cpu->runq_head); /* queue restored */
 
     task_free_slot(a);
     task_free_slot(b);
@@ -263,7 +278,7 @@ KTEST("task", KTEST_LATE, test_current_is_bsp_idle);
 KTEST("task", KTEST_LATE, test_slot_claim_and_recycle);
 KTEST("task", KTEST_LATE, test_find_task_misses_unused_pids);
 KTEST("task", KTEST_LATE, test_task_table_wellformed);
-KTEST("task", KTEST_LATE, test_runqueue_is_push_front);
+KTEST("task", KTEST_LATE, test_runqueue_is_fifo_round_robin);
 KTEST("task", KTEST_LATE, test_generation_names_one_incarnation);
 KTEST("task", KTEST_LATE, test_parent_link_dies_with_incarnation);
 KTEST("task", KTEST_LATE, test_multi_console_waiters_all_woken);

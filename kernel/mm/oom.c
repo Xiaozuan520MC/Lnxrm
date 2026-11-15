@@ -1,52 +1,34 @@
 /* T-OOM: the out-of-memory killer.
  *
- * This kernel has no reclaim and no swap (docs/GAP_ANALYSIS.md), so when the
- * machine is out of frames the only way to get any back is to hand a
- * process's memory back to the buddy -- which means ending the process that
- * holds the most of it.  Every allocation a user task can reach is also
- * gated by cred_mem_quota(), and that ceiling stops a *process* before the
- * machine runs dry; what it cannot stop is the machine running dry anyway
- * (several processes each inside their own quota, or one root task with no
- * quota at all) while somebody asks for one more page.
+ * No reclaim, no swap (docs/GAP_ANALYSIS.md): the only way back from a real
+ * shortage is to end the process holding the most user pages.
+ * cred_mem_quota() stops a *process* before the machine runs dry, but not
+ * several processes each inside their own quota (or one root task with no
+ * quota).  That ask arrives as a #PF with no frame to give, and the default
+ * SIGSEGV would be paid by whichever task happened to fault -- rarely the one
+ * that emptied the pool -- so pick the largest holder and SIGKILL it.  It dies
+ * through the ordinary exit path and its frames return when it is reaped.
  *
- * That ask arrives as a #PF with no frame to give.  The fault's default
- * answer -- SIGSEGV -- is paid by whichever task happened to fault, which is
- * rarely the one that emptied the pool, and killing it frees nothing the
- * machine can hand out.  So before refusing, pick the task holding the most
- * user pages and SIGKILL it.  It dies through the ordinary exit path
- * (writeback, close, reparent, reap), its address space is destroyed when it
- * is reaped, and the frames it held are back in the buddy for whoever asks
- * next.
+ * Deliberately NOT:
  *
- * What this deliberately does NOT do:
+ *   - triggering on a failure that can be ANSWERED (brk's ENOMEM, kmalloc's
+ *     NULL, an unbuildable page table -- T-004/T-032 pin all of those as
+ *     returns).  A caller with an answer has a way out; only the fault path,
+ *     whose alternative is certain death, spends a life on it.
  *
- *   - trigger on a failure that can be ANSWERED.  brk answers ENOMEM, kmalloc
- *     answers NULL, a page table that cannot be built answers an error, and
- *     T-004/T-032 pin all of those as returns -- /bin/systest's brk.oom block
- *     depends on brk draining the buddy and surviving it.  A caller holding
- *     an answer has a way out (shrink, retry, report); a transient ENOMEM is
- *     not a death sentence.  Only the fault path, whose alternative is
- *     certain death, spends a life on it.
+ *   - killing twice for one shortage: a kill latches until
+ *     oom_frame_granted() sees a frame handed out, so a fault storm cannot
+ *     walk the process table one victim at a time.  The victim's frames only
+ *     return when it is reaped -- a context switch a #PF handler cannot make
+ *     -- so the kill is for the NEXT attempt.
  *
- *   - kill twice for one shortage.  A kill sets a latch that only
- *     oom_frame_granted() -- called on every frame actually handed out by
- *     pmm_alloc_order() -- releases, so a fault storm cannot walk the process
- *     table one victim at a time while memory is still dry.  The kill cannot
- *     be *used* by the fault that asked for it either: the victim's frames
- *     come back when it exits and is reaped, which takes a context switch a
- *     #PF handler cannot make.  The next attempt (the signal handler's
- *     re-fault, the next brk) is what the kill is for.
- *
- *   - touch a task that has nothing to give back: idle and init hold the
+ *   - touching a task with nothing to give back: idle and init hold the
  *     machine together, a kxld task IS the kernel's side of it, an embryo or
- *     a zombie is not (or no longer) a live process, one already carrying
- *     SIGKILL is on its way out and cannot be killed twice, and a task with
- *     no user pages would free nothing.
+ *     zombie is not live, one already carrying SIGKILL cannot be killed twice.
  *
  * Selection is a pure function of the task table (oom_select_victim()), so
- * the heuristic can be pinned by ktest without allocating a single frame;
- * oom_kill_largest() is the whole policy: choose, announce, SIGKILL, latch.
- */
+ * ktest pins the heuristic without allocating a frame; oom_kill_largest() is
+ * the whole policy: choose, announce, SIGKILL, latch. */
 #include <sys/sched.h>
 #include <mm/mm.h>
 #include <console.h>

@@ -1,24 +1,7 @@
 /* T-090/T-094/T-MMAP: page-fault dispatch -- demand paging, lazy stack
- * growth and copy-on-write in one seam.
- *
- * isr_common() used to treat every #PF as fatal: report, then SIGSEGV (user)
- * or panic (kernel).  That is right for a fault nobody can fix, but it made
- * a deepening user stack lethal (sys_execve maps only 16 KiB of stack), and
- * it had nowhere to put the two later arrivals: an mmap region whose first
- * touch must materialize a frame, and a fork-shared page whose write must
- * be copied out.
- *
- * The dispatch is the seam fixers plug into.  Each inspects (cr2, err) and
- * claims the fault if it can resolve it; the first claim wins and the safe
- * default (kill) is kept for everything else.  Today three mount here, in
- * order: demand_page (not-present inside an mmap VMA -- anonymous AND
- * file-backed: it is one fixer because the VMA, not the fault, decides
- * which), stack_grow (not-present inside the stack growth window),
- * cow_fault (write-protect fault on a PG_COW page).  A write-protect fault
- * on a page that is neither writable nor COW is a genuine read-only
- * violation and deliberately falls through to SIGSEGV.  A swap-in would
- * join here the same way demand_page did.
- */
+ * growth and copy-on-write in one seam.  isr_common() used to treat every #PF
+ * as fatal, which made a deepening user stack lethal (sys_execve maps only
+ * 16 KiB of stack); the dispatch order lives in page_fault_try_fix(). */
 #include <sys/sched.h>
 #include <mm/mm.h>
 #include <mm/vma.h>
@@ -27,24 +10,18 @@
 #include <sys/vfs.h>
 #include <console.h>
 
-/* How far the stack may grow below its initial mapping.  The initial stack
- * sits at [USER_STACK_TOP-0x4000, USER_STACK_TOP).  Below the growth floor
- * lies STACK_GUARD bytes that NOBODY maps (types.h: MMAP_TOP stops one
- * guard below this floor), then the mmap window [MMAP_LO, MMAP_TOP), with
- * brk capped at MMAP_LO -- so heap, mmap, guard and stack approach each
- * other and never overlap.  512 KiB of stack is far more than these
- * programs need. */
+/* How far the stack may grow below its initial mapping.  Below the growth
+ * floor lie STACK_GUARD bytes nobody maps (types.h: MMAP_TOP stops one guard
+ * below it), then the mmap window -- heap, mmap, guard and stack approach
+ * each other and never overlap. */
 #define USTACK_MAX_GROW 0x80000ULL /* 512 KiB */
 
-/* How far below the running user RSP a fault may sit and still be treated
- * as a stack access worth growing for.  x86-64 SysV grants leaf functions
- * a 128-byte red zone below RSP without moving it, and a prologue always
- * subtracts a frame from RSP before touching it, so every legitimate stack
- * fault lands at or above RSP minus this window; a wild store aimed far
- * below the stack does not, and must die as SIGSEGV rather than be handed
- * a fresh page.  Deliberately equal to STACK_GUARD (types.h): with the
- * stack at its deepest, every fault this window accepts falls inside the
- * guard and can never reach an mmap VMA. */
+/* How far below the running user RSP a fault may sit and still count as a
+ * stack access worth growing for: the SysV red zone and a prologue's frame put
+ * every legitimate stack fault at or above RSP minus this window, so a wild
+ * store aimed far below dies as SIGSEGV.  Equal to STACK_GUARD (types.h), so
+ * the deepest accepted fault always lands inside the guard and can never reach
+ * an mmap VMA. */
 #define STACK_GROW_WINDOW 0x10000ULL /* 64 KiB */
 
 LNXRM_STATIC_ASSERT(USER_STACK_TOP - MMAP_TOP == USTACK_MAX_GROW + STACK_GROW_WINDOW,
@@ -53,32 +30,26 @@ LNXRM_STATIC_ASSERT(USER_STACK_TOP - MMAP_TOP == USTACK_MAX_GROW + STACK_GROW_WI
 
 /* The window must sit INSIDE user space: below USER_BASE a mmap could never
  * be mapped (vmm_map_user refuses) and a mprotect over it would be a bogus
- * EINVAL.  A wrong shift here -- one digit in the 64 GiB -- drops MMAP_LO
- * 8 TiB under USER_BASE, which is exactly the bug that made a mprotect over
- * an empty window answer EINVAL instead of ENOMEM. */
+ * EINVAL -- one wrong digit in the 64 GiB shift did exactly that. */
 LNXRM_STATIC_ASSERT(MMAP_LO >= USER_BASE,
                     "mmap window must lie inside [USER_BASE, MMAP_TOP)");
 LNXRM_STATIC_ASSERT(MMAP_TOP <= USER_STACK_TOP - USTACK_MAX_GROW,
                     "mmap window must stop at or below the stack growth floor");
 
-/* Resolve one user-mode #PF by growing the stack so it covers `page`.
- * Returns true if the fault is now fixed.  Conservative by design: it
- * declines anything outside [USER_STACK_TOP-USTACK_MAX_GROW, ustack_lo),
- * anything further than STACK_GROW_WINDOW below the running user RSP, or
- * anything that would breach the per-task memory quota, so a runaway
- * recursion or a wild pointer dies as SIGSEGV instead of eating the
- * machine. */
+/* Resolve one user-mode #PF by growing the stack so it covers `page`;
+ * returns true if the fault is now fixed.  Declines anything outside
+ * [USER_STACK_TOP-USTACK_MAX_GROW, ustack_lo), anything further than
+ * STACK_GROW_WINDOW below the user RSP, or anything past cred_mem_quota(),
+ * so a runaway recursion dies as SIGSEGV instead of eating the machine. */
 static bool stack_grow(struct intr_frame *f, u64 cr2)
 {
-    /* Only a NOT-PRESENT fault is a candidate.  A protection fault (P=1) is
-     * a real access violation (e.g. write to a read-only page) that growth
-     * must not paper over. */
+    /* A protection fault (P=1) is a real access violation growth must not
+     * paper over -- only a NOT-PRESENT fault is a candidate. */
     if (f->err & 1) return false;
 
-    /* A FETCH is never a stack access either: every user page but the
-     * sigreturn restorer is mapped NX, so growing for one would hand a
-     * stray jump a fresh frame and then fault again on its very first
-     * instruction -- one wasted page per wild jump, and no progress. */
+    /* A FETCH is never a stack access: every user page but the sigreturn
+     * restorer is NX, so growing for one would hand a stray jump a fresh
+     * frame and fault again on its first instruction. */
     if (f->err & 0x10) return false;
 
     struct task *t = current;
@@ -91,45 +62,37 @@ static bool stack_grow(struct intr_frame *f, u64 cr2)
     if (page < USER_STACK_TOP - USTACK_MAX_GROW) return false; /* too far: overflow/wild */
     if (page >= t->ustack_lo) return false;            /* already mapped (shouldn't fault) */
 
-    /* Must look like a STACK access: no further than STACK_GROW_WINDOW
-     * below the running user RSP.  f->ussp is the hardware-pushed user RSP
-     * (isr_common only offers us CPL3 faults), and a frame with no user RSP
-     * -- ktest builds its own -- has no reference point, so the check is
-     * skipped for it.  A deepening recursion drags RSP down with it and
-     * passes; a store aimed megabytes below the stack is refused here,
-     * before a single frame is taken. */
+    /* Must look like a STACK access: no further than STACK_GROW_WINDOW below
+     * the running user RSP (f->ussp; a frame with no user RSP -- ktest builds
+     * its own -- has none, so the check is skipped for it).  A deepening
+     * recursion drags RSP down and passes; a store aimed megabytes below is
+     * refused before a single frame is taken. */
     u64 rsp = f->ussp;
     if ((f->cs & 3) == 3 && rsp >= USER_BASE && rsp < USER_MAX_VMA &&
         cr2 + STACK_GROW_WINDOW < rsp)
         return false;
 
-    /* How many pages to add.  Both ends are page-aligned, so this is exact. */
+    /* Page-aligned at both ends, so this is exact. */
     u64 npages = (t->ustack_lo - page) / PAGE_SIZE;
 
-    /* Refuse BEFORE taking any frame: a plain user's whole address space --
-     * image + stack + restorer + heap -- is capped by cred_mem_quota().  This
-     * is the same ceiling sys_brk honours, so stack growth cannot be used to
-     * sidestep the 64 MiB limit. */
+    /* Refuse BEFORE taking any frame: cred_mem_quota() caps a plain user's
+     * whole address space, the same ceiling sys_brk honours, so stack growth
+     * cannot sidestep the limit. */
     u64 quota = cred_mem_quota(&t->cred);
     if (quota && t->mem_pages + npages > quota) return false;
 
-    /* Map page by page from the current low-watermark down to `page`.  Each
-     * page is zeroed (a fresh stack frame must not leak the previous
-     * occupant's bytes) and installed NX+user+writable: the stack is data,
-     * so a stray jump into it faults (every user page but the sigreturn
-     * restorer is non-executable). */
+    /* Map page by page down to `page`, each zeroed (a fresh stack frame must
+     * not leak the previous occupant's bytes) and installed NX+user+writable:
+     * the stack is data, so a stray jump into it faults. */
     u64 va = t->ustack_lo;
     while (va > page) {
         va -= PAGE_SIZE;
         u64 pa = pmm_alloc();
         if (!pa) {
-            /* Out of frames part-way.  Whatever was mapped stays mapped and
-             * accounted (the address space is torn down correctly on exit);
-             * the faulting page is still missing, so report failure and let
-             * the caller turn it into SIGSEGV rather than loop forever.
-             * Before that: the machine is dry, so somebody else's memory
-             * gives it back -- this task faulted, it is rarely the one that
-             * emptied the pool (mm/oom.c). */
+            /* Out of frames part-way: whatever was mapped stays mapped and
+             * accounted, the faulting page stays missing, so report failure and
+             * let the caller turn it into SIGSEGV.  Before that -- the machine
+             * is dry, so somebody else's memory gives it back (mm/oom.c). */
             oom_kill_largest();
             return false;
         }
@@ -148,17 +111,13 @@ static bool stack_grow(struct intr_frame *f, u64 cr2)
 /* ---- fixer: demand paging for mmap'd ranges (T-MMAP, T-FILE) ----
  *
  * mmap() only records a VMA (mm/vma.c); the frame arrives here, on first
- * touch.  What fills it is the VMA's own business: zeros for an anonymous
- * range (a fresh page never starts as a previous occupant's bytes), the
- * file's bytes for a file-backed one, and the SHARED frame of that file
- * page when the range says MAP_SHARED -- so two processes mapping the same
- * file at the same offset are handed the same physical page.  Whichever
- * kind it is, it is mapped with the VMA's protection and metered through
- * the same cred_mem_quota() ceiling brk and stack growth honour -- without
- * that, mmap would turn the 64 MiB cap into a suggestion and mapping a
- * large file would become a way to spend frames nobody accounts for.  A
- * range nobody touches costs nothing but one VMA node, which is the whole
- * point of the window being 64 GiB wide. */
+ * touch.  What fills it is the VMA's business: zeros for an anonymous range,
+ * the file's bytes for a file-backed one, and the SHARED frame of that file
+ * page under MAP_SHARED -- so two processes mapping the same file at the same
+ * offset get the same physical page.  Either way it is mapped with the VMA's
+ * protection and metered through cred_mem_quota(), the same ceiling brk and
+ * stack growth honour, so mmap cannot turn the cap into a suggestion.  An
+ * untouched range costs one VMA node and no frame. */
 static bool demand_page(struct intr_frame *f, u64 cr2)
 {
     if (f->err & 1) return false; /* present fault: not a missing page */
@@ -168,30 +127,25 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
 
     u64 page = cr2 & ~4095ULL;
 
-    /* The stack guard (types.h) belongs to nobody: the mmap window stops
-     * below it, so no VMA can cover it -- this is the belt to that brace,
-     * an overflow crossing the growth floor can never be claimed as a
-     * legit mmap touch even if a list somehow reached up here. */
+    /* The stack guard (types.h) belongs to nobody: the mmap window stops below
+     * it, so no VMA can cover it and an overflow can never claim to be an mmap
+     * touch. */
     if (page >= MMAP_TOP && page < USER_STACK_TOP - USTACK_MAX_GROW) return false;
 
     struct vma *v = vma_find(t, page);
     if (!v) return false; /* no mmap claims it -> stack_grow or kill */
 
-    /* The VMA is asked FIRST, before a single frame is taken -- the same
-     * order Linux settles faults in (access_error() runs ahead of
-     * handle_mm_fault()).  A store into a PROT_READ region or a fetch from
-     * a region without PROT_EXEC is going to be killed; allocating for it
-     * would only hand the doomed process a frame to its name.  (Reads are
-     * never refused: x86 cannot disable reading without PKU, so PROT_NONE
-     * degrades to read-only everywhere, as it does at mmap time.) */
+    /* The VMA is asked FIRST, before a single frame is taken -- the order
+     * Linux settles faults in (access_error() ahead of handle_mm_fault()).
+     * A store into a PROT_READ region or a fetch without PROT_EXEC will be
+     * killed, so allocating first would only hand the doomed process a frame.
+     * Reads are never refused (no PKU), so PROT_NONE degrades to read-only. */
     if ((f->err & 2) && !(v->prot & LNXRM_PROT_WRITE)) return false;
     if ((f->err & 0x10) && !(v->prot & LNXRM_PROT_EXEC)) return false;
 
-    /* Already there?  The hardware will not raise a not-present fault for
-     * a present page, but the dispatcher is also called directly (ktest)
-     * and a stale-TLB retry could bring the same cr2 back twice: without
-     * this guard the second pass would allocate a frame, "widen" the
-     * existing mapping (which ignores pa) and leak both the frame and a
+    /* Already there?  The dispatcher is also called directly (ktest) and a
+     * stale-TLB retry could bring the same cr2 back twice -- without this
+     * guard the second pass would allocate and leak a frame plus a
      * mem_pages increment. */
     if (vmm_user_pte(t->pml4, page)) return false;
 
@@ -201,40 +155,36 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
     u64 pa;
     if (v->file) {
         /* File-backed: the bytes come from the file at the offset this VMA
-         * names for this page, not from the zero page.  MAP_SHARED asks the
-         * cache for THE frame of that (file, offset) -- one frame per file
-         * page for the whole system, which is what makes one process's
-         * store visible to the next mapping and, at write-back, to the
-         * file.  MAP_PRIVATE gets a frame of its own instead: a private
-         * mapping's bytes belong to the process, so sharing them would let
-         * one writer see another's store, and the frame must be private
-         * for fork's copy-on-write to have something to copy. */
+         * names, not from the zero page.  MAP_SHARED asks the cache for THE
+         * frame of that (file, offset) -- one frame per file page system-wide,
+         * which is what makes one process's store visible to the next mapping
+         * and, at write-back, to the file.  MAP_PRIVATE gets a frame of its
+         * own, since private bytes belong to the process and fork's COW needs
+         * something to copy. */
         u64 off = v->file_off + (page - v->start);
         if (v->flags & LNXRM_MAP_SHARED) {
             pa = filepage_get(v->file, off);
             if (!pa) {
-                /* 0 means no frame came back: a dry buddy, a failed read or
-                 * a cache node that could not be allocated.  Only the first
-                 * is a shortage to kill over, and an empty buddy is the
-                 * evidence -- the other two must cost nobody a life. */
+                /* 0 means no frame came back: a dry buddy, a failed read or a
+                 * cache node that could not be allocated.  Only the first is a
+                 * shortage to kill over (mm/oom.c). */
                 if (!pmm_free_bytes()) oom_kill_largest();
                 return false;
             }
         } else {
             pa = pmm_alloc();
             if (!pa) {
-                /* Dry buddy inside a fault: before this fault is turned into
-                 * SIGSEGV, have the memory hog pay for the machine (mm/oom.c). */
+                /* Dry buddy: have the memory hog pay for the machine
+                 * (mm/oom.c) before this fault becomes SIGSEGV. */
                 oom_kill_largest();
                 return false;
             }
             memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
-            /* A SHORT read is normal: the file's last page is usually
-             * partial and the frame was zeroed first, so the tail reads as
-             * zeros exactly as the file's own bytes past EOF do.  A failed
-             * read (negative) is not a page -- hand the frame back and
-             * leave the fault unfixed rather than map zeros that pretend
-             * to be the file's contents. */
+            /* A SHORT read is normal: the file's last page is usually partial
+             * and the frame was zeroed first, so the tail reads as zeros
+             * exactly as the file's own bytes past EOF do.  A failed read
+             * (negative) is not a page -- hand the frame back rather than map
+             * zeros that pretend to be the file's contents. */
             if (vfs_pread(v->file, (void *)PHYS_TO_VIRT(pa), PAGE_SIZE, off) < 0) {
                 pmm_free(pa);
                 return false;
@@ -243,21 +193,17 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
     } else {
         pa = pmm_alloc();
         if (!pa) {
-            /* The anonymous first touch is the common case, and a dry buddy
-             * here is a real machine shortage: kill the biggest holder before
-             * refusing, so the frames this touch wanted exist for the next
-             * one (mm/oom.c). */
+            /* The common case, and a dry buddy here is a real shortage: kill
+             * the biggest holder first (mm/oom.c). */
             oom_kill_largest();
             return false;
         }
         memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
     }
-    /* PROT_READ is implicit (every present page is readable -- x86 has no
-     * read-disable without PKU), PROT_NONE therefore degrades to read-only;
-     * W and NX are exactly what the VMA asked for.  A shared file page gets
-     * W straight from here too: it is not a candidate for copy-on-write
-     * (vma_fork_shared keeps it writable across fork, and mprotect grants
-     * it W without marking PG_COW), so the next write must not trap. */
+    /* PROT_READ is implicit (no PKU), so PROT_NONE degrades to read-only; W and
+     * NX are exactly what the VMA asked for.  A shared file page gets W straight
+     * from here too -- it is not a COW candidate (vma_fork_shared keeps it
+     * writable across fork), so the next write must not trap. */
     if (vmm_map_user(t->pml4, page, pa, (v->prot & LNXRM_PROT_WRITE) != 0, true,
                      (v->prot & LNXRM_PROT_EXEC) != 0) < 0) {
         pmm_free(pa);
@@ -270,28 +216,24 @@ static bool demand_page(struct intr_frame *f, u64 cr2)
 
 /* ---- fixer: copy-on-write (T-COW) ----
  *
- * Break the sharing on `page` for address space `t`: clone the shared
- * frame, take it writable and clear PG_COW, then hand back THIS side's
- * reference to the old frame (pmm_free drops the count; the other sharer's
- * keeps the old frame alive until it breaks or unmaps too).
+ * Break the sharing on `page` for address space `t`: clone the shared frame,
+ * take it writable, clear PG_COW, then hand back THIS side's reference to the
+ * old frame (pmm_free drops the count; the other sharer's keeps it alive until
+ * it breaks or unmaps too).
  *
- * Ordering is what makes this race-free between two processes breaking the
- * same frame on two CPUs: copy FIRST, swap the PTE SECOND, drop our old
- * reference LAST.  Our reference alone pins the old frame's bytes until
- * our own copy is done, and the count reaches 0 only after every sharer
- * has copied -- so no copy can ever read a frame the buddy already gave
- * to someone else.
+ * Ordering makes this race-free when two processes break the same frame on two
+ * CPUs: copy FIRST, swap the PTE SECOND, drop our reference LAST.  Our
+ * reference alone pins the old frame's bytes until our own copy is done, and
+ * the count reaches 0 only after every sharer has copied -- so no copy can read
+ * a frame the buddy already gave away.
  *
  * Also the routine syscalls need BEFORE they store through a user pointer
- * (task.c user_ptr_writable): after fork, a writable page is PTE-read-only
- * on both sides, and copy_to_user's writability gate would otherwise reject
- * a perfectly legitimate write into the child's (or parent's) own memory.
- * Every kernel store path then gets COW resolution from one place.
- *
- * Returns true when the page is no longer blocking a write: it was never
- * COW (a plain read-only page -- the caller's own gate decides what that
- * means), or the break succeeded.  False = not present, or out of frames
- * (the page stays COW, the caller reports its own error). */
+ * (task.c user_ptr_writable): after fork a writable page is PTE-read-only on
+ * both sides, and copy_to_user's gate would otherwise reject a legitimate
+ * write into the child's own memory.  Returns true when the page no longer
+ * blocks a write (never COW, or the break succeeded); false when it is not
+ * present or the machine is out of frames (the page stays COW, the caller
+ * reports its own error). */
 bool page_cow_break(struct task *t, u64 page)
 {
     if (!t) return false;
@@ -306,9 +248,9 @@ bool page_cow_break(struct task *t, u64 page)
         oom_kill_largest();
         return false;
     }
-    /* Read the shared frame through the high-half alias, never through
-     * `page`: that would resolve against the LIVE cr3 (which may be another
-     * address space) and a user page would trip SMAP with no STAC window. */
+    /* Read through the high-half alias, never through `page`: that resolves
+     * against the LIVE cr3 (possibly another address space) and a user page
+     * would trip SMAP with no STAC window. */
     memcpy((void *)PHYS_TO_VIRT(npa), (void *)PHYS_TO_VIRT(pte & PTE_PA_MASK), PAGE_SIZE);
     u64 fresh = (pte & ~PTE_PA_MASK) | (npa & PTE_PA_MASK); /* same flags, new frame */
     fresh = (fresh | PG_W) & ~PG_COW;                       /* ours to write now */
@@ -324,13 +266,11 @@ bool page_cow_break(struct task *t, u64 page)
 static bool cow_fault(struct intr_frame *f, u64 cr2)
 {
     if (!(f->err & 1)) return false; /* not-present: demand/stack handled it */
-    /* Only a STORE breaks copy-on-write.  err bit 1 is the write; without
-     * this the NX case below would be fatal: a fetch from an NX page
-     * (err = P|I = 0x11) reaches here, finds PG_W or PG_COW, "resolves"
-     * the fault without changing a thing, and iretq retries the same
-     * instruction into the same #PF forever -- the process hangs instead
-     * of taking SIGSEGV.  Linux keeps that class out the same way, by
-     * testing the access against the VMA before any fixer runs. */
+    /* Only a STORE breaks copy-on-write (err bit 1).  Without this a fetch
+     * from an NX page (err = P|I = 0x11) would "resolve" the fault without
+     * changing a thing and iretq would retry the same instruction into the
+     * same #PF forever.  Linux keeps that class out the same way: test the
+     * access against the VMA before any fixer runs. */
     if (!(f->err & 2)) return false;
     struct task *t = current;
     if (!t) return false;
@@ -339,33 +279,30 @@ static bool cow_fault(struct intr_frame *f, u64 cr2)
     u64 page = cr2 & ~4095ULL;
     u64 pte = vmm_user_pte(t->pml4, page);
     if (!(pte & PG_P)) return false;
-    /* Already writable: the fault raced a COW break that has landed (the
-     * TLB still holds the read-only view).  Claim it and flush, or the
-     * retried store faults again on the same stale entry. */
+    /* Already writable: the fault raced a COW break that has landed (the TLB
+     * still holds the read-only view).  Claim it and flush, or the retried
+     * store faults again on the stale entry. */
     if (pte & PG_W) {
         vmm_user_pte_write(t->pml4, page, pte); /* rewrite == invlpg */
         return true;
     }
-    /* Present, read-only, NO COW mark: text/.rodata.  A genuine violation
-     * that must fall through to SIGSEGV -- page_cow_break() alone would
-     * answer "not COW, nothing to do" and the dispatcher would treat the
-     * fault as fixed, looping the faulting store forever. */
+    /* Present, read-only, NO COW mark: text/.rodata.  A genuine violation that
+     * must fall through -- page_cow_break() alone would answer "not COW" and
+     * the dispatcher would treat the fault as fixed, looping the store
+     * forever. */
     if (!(pte & PG_COW)) return false;
     return page_cow_break(t, page);
 }
 
 bool page_fault_try_fix(struct intr_frame *f, u64 cr2)
 {
-    /* Dispatch: offer the fault to each fixer in order.  Every fixer
-     * declares which faults it will even look at (err bit 0 above all), so
-     * the first claim wins and anything unclaimed keeps the safe default:
-     * report + SIGSEGV (user) or panic (kernel).
+    /* Dispatch: offer the fault to each fixer in order.  Every fixer declares
+     * which faults it will even look at (err bit 0 above all), so the first
+     * claim wins and anything unclaimed keeps the safe default: report +
+     * SIGSEGV (user) or panic (kernel).
      *   1. demand_page  -- not-present inside an mmap VMA
      *   2. stack_grow   -- not-present inside the stack growth window
-     *   3. cow_fault    -- write-protect fault on a PG_COW page
-     * A write-protect fault on a page with PG_W clear and no PG_COW is a
-     * genuine read-only violation (text/.rodata) and deliberately falls
-     * through to SIGSEGV. */
+     *   3. cow_fault    -- write-protect fault on a PG_COW page */
     if (demand_page(f, cr2)) return true;
     if (stack_grow(f, cr2)) return true;
     return cow_fault(f, cr2);

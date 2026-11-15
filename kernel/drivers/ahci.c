@@ -1,10 +1,7 @@
-/* ahci.c: Simplified AHCI/SATA driver — DMA transfers via a single-PRDT
- * command table, exposing the same blkdev interface as ide.c
- *
- * Pure C (rewritten from ahci.cpp 2026-10-17): the driver never used any
- * C++ feature beyond constexpr / [[gnu::packed]] / new / a default argument,
- * all four of which have direct C equivalents (see the notes at each site).
- * Same register programming, same probe sequence, same timeouts. */
+/* ahci.c: AHCI/SATA driver -- DMA transfers via a single-PRDT command table,
+ * exposing the same blkdev interface as ide.c.  Pure C: rewritten from
+ * ahci.cpp 2026-10-17, each of constexpr / [[gnu::packed]] / new / a default
+ * argument replaced by its direct C equivalent (see the notes at each site). */
 #include <pci.h>
 #include <io.h>
 #include <mm/mm.h>
@@ -48,17 +45,11 @@
 #define AHCI_CMD_WRITE    (1u << 6)
 #define IS_TFES           (1u << 30)
 
-/* ---- timeouts ----
- *
- * These used to be counts of `pause` instructions, which is a unit with no
- * relationship to time: 1e6 pauses is 3 ms on a Core2 and 50 ms on a Skylake,
- * so the pre-issue task-file gate that was "generous" in the QEMU log was in
- * reality a few milliseconds on real silicon -- long enough for everything
- * QEMU ever did, far too short for a drive that has just come out of link
- * training and is still spinning up.  On the one machine this driver has been
- * run on, every wait was silently a 10-100x tighter budget than the comment
- * claimed.  Deadlines are in milliseconds of calibrated TSC time instead, so
- * the numbers mean the same thing everywhere. */
+   /* ---- timeouts ----
+    *
+    * Deadlines are in milliseconds of calibrated TSC time, not counts of
+    * `pause`: a pause is not a unit of time (1e6 is 3 ms on a Core2, 50 ms on
+    * a Skylake), so the old counts ran 10-100x tighter on real silicon. */
 #define AHCI_LINK_TIMEOUT_MS 5000 /* PHY link training (DET==1) */
 #define AHCI_STOP_TIMEOUT_MS 100  /* CR / FR drain after ST/FRE clear */
 #define AHCI_TFD_TIMEOUT_MS  3000 /* device idle before a command */
@@ -89,7 +80,6 @@ static bool overdue(u64 deadline)
 {
     return rdtsc() >= deadline;
 }
-
 
 /* Command header — 32 bytes, all u32 fields to avoid packing issues.
  * typedef + __attribute__((packed)) replaces C++'s struct [[gnu::packed]]
@@ -131,15 +121,12 @@ struct AhciPort {
     volatile u64 irq_cnt;
 };
 
-/* ---- C49: interrupt-driven completion ----
- *
- * A command is issued by one CPU holding ahci_lock (taken with interrupts
- * off) and retired either by its interrupt or, when no interrupt can be
- * delivered, by the PxCI poll that was the only mechanism this driver ever
- * had.  The two sides share exactly the fields above -- never the lock: an
- * ISR that took ahci_lock would deadlock against the very CPU waiting for
- * it, and one that printed would take console_lock from a context that can
- * interrupt its holder. */
+   /* ---- C49: interrupt-driven completion ----
+    *
+    * One CPU issues holding io_lock (C10); the PxCI poll or the interrupt
+    * retires it.  The two share exactly the fields above, never the lock: an
+    * ISR taking io_lock would deadlock against the CPU waiting for it, and one
+    * printing would take console_lock from a context that can interrupt it. */
 static struct AhciPort *irq_ports[32]; /* ports with PxIM armed */
 static int irq_port_n;
 static int ahci_irq_line = -1;  /* routed GSI, -1 == polling only */
@@ -152,11 +139,9 @@ static inline u32 pxRd(volatile u8 *px, u32 off)
 static inline void pxWr(volatile u8 *px, u32 off, u32 v)
 { *(volatile u32 *)(px + off) = v; }
 
-/* The completion interrupt itself (C49): read PxIS, keep what it said,
- * write it back as W1C, count the event.  Nothing else -- the waiter's own
- * PxCI poll decides success or failure, so this handler only has to *end*
- * the condition that raised it, and a level-triggered PCI INTx stays
- * asserted until PxIS is cleared. */
+   /* The completion interrupt itself (C49): read PxIS, write it back as W1C,
+    * count the event, nothing else -- the waiter's own PxCI poll decides the
+    * verdict, and a level-triggered PCI INTx stays asserted until PxIS clears. */
 static void ahciIsr(struct intr_frame *f)
 {
     (void)f;
@@ -183,15 +168,12 @@ static int waitTfd(volatile u8 *px, int timeout)
     return -1;
 }
 
-/* Bring a port to a full stop in the order the specification gives: clear ST
- * and wait for CR to clear, then clear FRE and wait for FR.  The two engines
- * are stopped one at a time because they drain independently, and FRE must not
- * be cleared while CR is still set.
- *
- * Returns 0 only when both CR and FR are actually clear afterwards.  That
- * matters more than the ordering does: PxCLB/PxFB may be written exclusively
- * while the port is stopped, so a caller that cannot tell a real stop from a
- * timed-out one will hand its addresses to an engine that never took them. */
+      /* Bring a port to a full stop in spec order: clear ST, wait for CR, then
+       * clear FRE, wait for FR -- the engines drain independently and FRE must
+       * not be cleared while CR is set.  Returns 0 only when both are really
+       * clear: PxCLB/PxFB may be written exclusively while stopped, so a caller
+       * that cannot tell a real stop from a timed-out one hands its addresses to
+       * an engine that never took them. */
 static int ahciPortStop(volatile u8 *px)
 {
     u32 cmd = pxRd(px, P_CMD);
@@ -241,14 +223,11 @@ static int portStart(volatile u8 *px)
     return -1;
 }
 
-/* A command that never completes, or one that completes without moving a byte,
- * is the failure this driver cannot report through a return value: the caller
- * just sees "read failed" -- or worse, "read succeeded" -- and "the disk will
- * not mount" is where that ends up.  Dump the port once so it is a diagnosis:
- * CI still set means the doorbell never reached the HBA, TFD.BSY set means the
- * drive never accepted the command, IS set means the HBA took it and rejected
- * it, SSTS says what the link looks like.  Printed at most once, because every
- * command would otherwise repeat the same registers. */
+      /* A command that never completes (or completes without moving a byte)
+       * cannot be reported through a return value, so dump the port once:
+       * CI set = the doorbell never reached the HBA, TFD.BSY = the drive never
+       * accepted the command, IS = the HBA took it and rejected it, SSTS = the
+       * link.  Printed at most once, or every command repeats the registers. */
 static void ahciDumpPort(volatile u8 *px, int slot, const char *why)
 {
     static bool dumped;
@@ -291,21 +270,18 @@ static int issueCmd(struct AhciPort *port, int slot)
     port->irq_done = false;
     port->irq_is = 0;
 
-    /* C49: lift interrupts BEFORE the doorbell, not inside the poll below.
-     * Every caller holds ahci_lock through spin_lock_irqsave(), so IF is off
-     * here -- and QEMU retires a command synchronously inside the PxCI write
-     * and asserts its interrupt there and then.  An IF lifted only inside the
-     * poll would arrive after the first CI read had already seen it clear:
-     * the command would be counted as polled forever and the interrupt would
-     * never have been delivered at all.  With IF on before the write, the
-     * interrupt window opens on the instruction right after it.
-     *
-     * Re-enabling interrupts under a lock is safe for exactly two reasons,
-     * both structural: the ISR takes no lock and prints nothing, so it cannot
-     * deadlock against this CPU; and the only ring-0 preemption this kernel
-     * has is sched_maybe_preempt()'s idle (pid 0) case, which a post-boot
-     * disk wait never is -- during the boot self-tests no tick exists yet
-     * (the LAPIC timer starts after the first process is spawned). */
+          /* C49: lift interrupts BEFORE the doorbell, not inside the poll below.
+           * The drain holds io_lock through spin_lock_irqsave() (C10), so IF is
+           * off -- and QEMU retires a command synchronously inside the PxCI write
+           * and asserts its interrupt there and then.  An IF lifted only inside
+           * the poll would arrive after the first CI read had seen it clear: the
+           * command would be counted as polled forever and the interrupt never
+           * delivered.  With IF on before the write, the window opens on the
+           * instruction right after it.
+           *
+           * Safe because the ISR takes no lock and prints nothing, and the only
+           * ring-0 preemption is sched_maybe_preempt()'s idle case, which a
+           * post-boot disk wait never is (no tick exists during boot tests). */
     bool lift = (ahci_irq_line >= 0);
     if (lift) __asm__ volatile("sti" ::: "memory");
 
@@ -345,13 +321,12 @@ static int issueCmd(struct AhciPort *port, int slot)
                 ahci_irq_line, 32 + ahci_irq_line);
     }
 
-    /* C50: CI clear means the port finished, not that the drive succeeded.
-     * IS_TFES only fires on a task-file *fatal* error; an ATA command that
-     * was rejected sets PxTFD.ERR without it.  Neither of those catches the
-     * third outcome -- port finished, zero bytes moved -- which is what
-     * ahci_cmd_read()'s PRDBC check below is for.  Both PxIS reads are
-     * needed: the ISR W1C's PxIS (C49), so the error may only be left in the
-     * copy it took, and the two can be sampled at different moments. */
+          /* C50: CI clear means the port finished, not that the drive succeeded.
+           * IS_TFES fires only on a task-file *fatal* error and a rejected ATA
+           * command sets PxTFD.ERR without it; neither catches "port finished,
+           * zero bytes moved", which is what ahci_cmd_read()'s PRDBC check is for.
+           * Both PxIS reads are needed because the ISR W1C's PxIS (C49), so the
+           * error may only be left in the copy it took. */
     if ((pxRd(px, P_IS) | port->irq_is) & IS_TFES) return -1;
     if (pxRd(px, P_TFD) & 0x01) return -1; /* PxTFD.ERR */
     return 0;
@@ -378,23 +353,19 @@ static void buildH2dFis(u8 *cfis, u8 cmd, u64 lba, u16 count, u8 devReg)
     cfis[13] = (u8)(count >> 8);
 }
 
-/* ---------- CPU <-> device cache coherence ----------
- *
- * The command list, FIS receive area, command table and every data buffer
- * are touched by whichever side is not the CPU, through a physical address
- * the other side owns.  lnxrm programs neither MTRRs nor IA32_PAT, so all of
- * it lives as ordinary write-back memory: a store by the CPU sits in its
- * cache while the HBA -- which sees memory, never the cache -- reads the old
- * bytes, and a store by the HBA is invisible to a CPU whose line is still
- * valid.  QEMU models no caches whatsoever, so every one of these failures is
- * invisible in the default `make run` path.
- *
- * clflush is a write-back *and* an invalidate, so one sweep handles both
- * directions: dirty lines reach memory before the device reads them, and the
- * device's writes become visible to the CPU afterwards.  Rounding to 64-byte
- * boundaries is mandatory -- starting at an unaligned pointer would skip the
- * bytes between it and the next line, so a mid-line buffer's first bytes
- * would never be flushed. */
+      /* ---------- CPU <-> device cache coherence ----------
+       *
+       * The command list, FIS area, command table and every data buffer are
+       * touched by whichever side is not the CPU, through a physical address the
+       * other side owns.  lnxrm programs neither MTRRs nor IA32_PAT, so all of
+       * it is ordinary write-back memory: a CPU store sits in its cache while the
+       * HBA -- which sees memory, never the cache -- reads the old bytes, and an
+       * HBA store is invisible to a CPU whose line is still valid.  QEMU models
+       * no caches, so none of this shows in the default `make run`.
+       *
+       * clflush is a write-back *and* an invalidate, so one sweep covers both
+       * directions; 64-byte rounding is mandatory or a mid-line buffer's first
+       * bytes are skipped and never flushed. */
 static inline void dmaCoherent(const void *p, u32 bytes)
 {
     if (!bytes) return;
@@ -402,24 +373,23 @@ static inline void dmaCoherent(const void *p, u32 bytes)
     uptr e = ((uptr)p + bytes + 63UL) & ~63UL;
     for (uptr c = a; c < e; c += 64)
         __asm__ volatile("clflush (%0)" ::"r"(c) : "memory");
-    /* mfence rather than sfence.  Whether sfence orders clflush is one of the
-     * places the memory model has been tightened and re-tightened across
-     * families, and getting it wrong leaves a dirty line to be written back
-     * over the data the device just DMA'd -- a silent read of stale memory,
-     * with no error bit anywhere to point at it.  This runs a handful of times
-     * per command, so the stronger fence costs nothing worth measuring. */
+          /* mfence rather than sfence: whether sfence orders clflush is one of
+           * the places the memory model has been tightened across families, and
+           * getting it wrong leaves a dirty line written back over the data the
+           * device just DMA'd -- a silent read of stale memory with no error bit
+           * anywhere.  Runs a handful of times per command, so the stronger
+           * fence costs nothing worth measuring. */
     __asm__ volatile("mfence" ::: "memory");
 }
 
-/* AHCI 1.0 wants the command list 1 KiB-aligned, the FIS base 256-byte
- * aligned and each command table 128-byte aligned (§3.3).  kmalloc()
- * prefixes every block with an 8-byte header and returns base+8, so nothing
- * it hands out can satisfy even the loosest of those, and its slab size
- * classes are not multiples of 128 either.  QEMU never validates the
- * addresses it is given -- which is precisely why this went unnoticed --
- * while a real HBA masks PxCLB to its required alignment and then fetches
- * the command list from the wrong address.  A buddy page is aligned to its
- * own size, so a single order-0 frame satisfies all three rules at once. */
+      /* AHCI 1.0 wants the command list 1 KiB-aligned, the FIS base 256-byte
+       * aligned and each command table 128-byte aligned (§3.3).  kmalloc()
+       * prefixes every block with an 8-byte header and returns base+8, so
+       * nothing it hands out satisfies even the loosest of those, and its slab
+       * classes are not multiples of 128 either.  QEMU never validates the
+       * addresses it is given; a real HBA masks PxCLB and then fetches the
+       * command list from the wrong address.  A buddy page is aligned to its own
+       * size, so one order-0 frame satisfies all three rules at once. */
 static void *dmaAlloc(void)
 {
     u64 pa = pmm_alloc_order(0);
@@ -452,11 +422,10 @@ static int ahci_cmd_read_opts(volatile u8 *px, struct AhciPort *port, u8 cmd, u6
     memset(h, 0, sizeof(*h));
     memset(t, 0, sizeof(*t) + sizeof(PrdtEntry));
 
-    /* opts: FIS_len=5, PRDT_len=1, plus whatever the caller is testing.
-     * CLR_BUSY used to be OR'd in unconditionally here; it is now off by
-     * default because it is the one header bit whose spec-defined action is
-     * "on receipt of the PIO/DMA-in FIS, clear BSY and retire the command"--
-     * exactly the step that answered "0 of 512 bytes" on real hardware. */
+       /* opts: FIS_len=5, PRDT_len=1, plus whatever the caller is testing.
+        * CLR_BUSY is off by default: its spec-defined action is "on receipt of
+        * the PIO/DMA-in FIS, clear BSY and retire the command" -- exactly the
+        * step that answered "0 of 512 bytes" on real hardware. */
     h->opts = 5u | (1u << 16) | hdrExtra;
     h->prdbc = 0;
 
@@ -479,12 +448,12 @@ static int ahci_cmd_read_opts(volatile u8 *px, struct AhciPort *port, u8 cmd, u6
     dmaCoherent(h, sizeof(*h));
     dmaCoherent(t, sizeof(*t) + sizeof(PrdtEntry));
 
-    /* One-shot view of exactly what the HBA will fetch.  These reads happen
-     * *after* the flush-and-invalidate, so the lines are cold and the CPU has
-     * to pull them from memory -- the same memory the HBA's DMA reads.  A bug
-     * here is invisible from the CPU side: the structures look perfect in
-     * cache while the bus master is handed something else, and the only
-     * symptom is "command completed, zero bytes moved". */
+          /* One-shot view of exactly what the HBA will fetch, read *after* the
+           * flush-and-invalidate so the lines are cold and the CPU pulls them
+           * from the same memory the HBA's DMA reads.  A bug here is invisible
+           * from the CPU side -- the structures look perfect in cache while the
+           * bus master is handed something else, and the only symptom is
+           * "completed, zero bytes moved". */
     if (!dumpedDma) {
         dumpedDma = true;
         kprintf("[ahci] dma: buf phys=%#llx ct phys=%#llx clb phys=%#llx\n", bpa, ctPa,
@@ -504,17 +473,16 @@ static int ahci_cmd_read_opts(volatile u8 *px, struct AhciPort *port, u8 cmd, u6
 
     if (issueCmd(port, 0)) return -1;
 
-    /* Re-read the header through the flush-and-invalidate path so the byte
-     * count we look at is the one the HBA wrote, not our own zero from a line
-     * still sitting in cache.  PRDBC is how the HBA reports what it actually
-     * moved, and it is the only place the third failure mode shows up: the port
-     * finished, no error was set, and not one byte arrived.  CI-clear-plus-
-     * no-error is what the old code accepted unconditionally, which is how real
-     * hardware registered an IDENTIFY that had delivered nothing at all.  A
-     * count of 0 with a write pending also means the doorbell may simply never
-     * have latched -- there is no way to tell those two apart after the fact,
-     * and both mean the same thing downstream: the buffer still holds whatever
-     * was already in it. */
+          /* Re-read the header through the flush-and-invalidate path so the byte
+           * count is the one the HBA wrote, not our own zero from a line still
+           * in cache.  PRDBC is how the HBA reports what it actually moved, and
+           * it is the only place the third failure mode shows up: the port
+           * finished, no error was set, not one byte arrived -- what the old
+           * CI-clear-plus-no-error check accepted unconditionally, and how real
+           * hardware registered an IDENTIFY that had delivered nothing.  A count
+           * of 0 with a write pending also means the doorbell may never have
+           * latched, which is indistinguishable after the fact; both mean the
+           * buffer still holds whatever was already in it. */
     dmaCoherent(h, sizeof(*h));
     dmaCoherent(buf, bytes);
     if (h->prdbc != bytes) {
@@ -581,19 +549,16 @@ static int ahci_cmd_write(volatile u8 *px, struct AhciPort *port, u8 cmd, u64 lb
     return 0;
 }
 
-/* ATA FLUSH CACHE (E7): push what the drive holds in its write cache onto
- * the medium.  This is what makes write() durable, and it replaces the old
- * "read the sector back into a dummy buffer" stand-in, which only proved the
- * data had reached the *drive's* cache -- and cost a full round trip per
- * write on top of proving nothing about the medium.  A non-data command, so
- * the header carries PRDT_len=0 and there is no PRDT entry to describe.
- *
- * It is also the cheapest probe of the HBA's *non-data* command path: no
- * PRDT, no PIO, no DMA -- if this completes with TFD clean, the doorbell and
- * the completion logic work, and whatever fails next is one layer deeper.
- * `hdrExtra` exists so the port probe can A/B CLR_BUSY on that path too.
- * (C has no default arguments — the .cpp original wrote = 0 here — so both
- * call sites pass the value explicitly.) */
+      /* ATA FLUSH CACHE (E7): push what the drive holds in its write cache onto
+       * the medium -- this is what makes write() durable, and it replaces the old
+       * "read the sector back into a dummy buffer" stand-in, which only proved
+       * the data had reached the *drive's* cache.  A non-data command, so the
+       * header carries PRDT_len=0 and there is no PRDT entry to describe.
+       *
+       * Also the cheapest probe of the HBA's *non-data* path: no PRDT, no PIO,
+       * no DMA -- if this completes with TFD clean the doorbell and completion
+       * logic work, and whatever fails next is one layer deeper.  `hdrExtra`
+       * exists so the port probe can A/B CLR_BUSY on that path too. */
 static int ahciFlushCache(volatile u8 *px, struct AhciPort *port, u32 hdrExtra)
 {
     CmdHdr *h = &port->clb[0];
@@ -622,25 +587,23 @@ static int ahciFlushCache(volatile u8 *px, struct AhciPort *port, u32 hdrExtra)
     return rc;
 }
 
-/* ---------- port probe: three ATA protocols, tested separately ----------
- *
- * IDENTIFY DEVICE is a PIO data-in command: the device answers with a PIO
- * Setup FIS and the *HBA* is supposed to pull the 512 bytes out of the task
- * file and DMA them into our PRDT.  On the one real machine this driver has
- * run on, everything below that step had already proved itself -- PCI, ABAR,
- * port registers, link (SSTS=0x133), the doorbell (CI cleared), the device's
- * own answer (PxIS showed the PIO Setup FIS, TFD=0x50 = DRDY, no ERR) -- and
- * PRDBC still read 0.  A single "IDENTIFY failed" line cannot say which of
- * those layers broke, so probe them in order of increasing depth, each with
- * its own verdict line:
- *
- *   1/3 non-data  FLUSH CACHE 0xE7     doorbell + completion, no PRDT at all
- *   2/3 DMA       READ DMA EXT 0x25    the PRDT path every later read uses
- *   3/3 PIO       IDENTIFY 0xEC        the path IDENTIFY itself needs
- *
- * Steps 2 and 3 also A/B the two header choices this driver used to hard-code
- * -- CLR_BUSY and the LBA device register -- so one boot answers "does this
- * HBA need them?" instead of one boot per guess. */
+      /* ---------- port probe: three ATA protocols, tested separately ----------
+       *
+       * IDENTIFY DEVICE is a PIO data-in command: the device answers with a PIO
+       * Setup FIS and the *HBA* is supposed to pull the 512 bytes out of the
+       * task file and DMA them into our PRDT.  On the one real machine this
+       * driver has run on, every layer up to that point had already proved
+       * itself and PRDBC still read 0 -- and a single "IDENTIFY failed" line
+       * cannot say which layer broke, so probe them in order of increasing
+       * depth, each with its own verdict line:
+       *
+       *   1/3 non-data  FLUSH CACHE 0xE7     doorbell + completion, no PRDT
+       *   2/3 DMA       READ DMA EXT 0x25    the PRDT path every later read uses
+       *   3/3 PIO       IDENTIFY 0xEC        the path IDENTIFY itself needs
+       *
+       * Steps 2 and 3 also A/B the two header choices this driver used to
+       * hard-code (CLR_BUSY and the LBA device register), so one boot answers
+       * "does this HBA need them?" instead of one boot per guess. */
 struct CmdVariant {
     u32 extra; /* OR'd into the command header opts */
     u8 devReg; /* ATA device/head register in the CFIS */
@@ -667,14 +630,13 @@ static int ahciProbePort(volatile u8 *px, struct AhciPort *port, int pnum, u16 *
      * about to hand the HBA, not the ones whichever port ran first used. */
     dumpedDma = false;
 
-    /* A command that never completed wedges the port: PxCI stays set, so the
-     * next attempt cannot even be issued and would burn its own full five
-     * seconds to reach the same answer.  The ladder of protocol variants
-     * exists for devices that *reject* a command -- TFD.ERR in milliseconds,
-     * and each variant is worth trying -- not for ones that do not answer.
-     * Abandoning on the first timeout is what keeps a dead port from costing
-     * six timeouts: on q35, a phantom port behind the real disk took 30 of
-     * the kernel's 35 boot seconds that way. */
+          /* A command that never completed wedges the port: PxCI stays set, so
+           * the next attempt cannot even be issued and would burn its own full
+           * five seconds to reach the same answer.  The ladder of protocol
+           * variants exists for devices that *reject* a command (TFD.ERR in
+           * milliseconds), not for ones that do not answer -- abandoning on the
+           * first timeout keeps a dead port from costing six: on q35 a phantom
+           * port took 30 of the kernel's 35 boot seconds. */
 
     /* --- 1/3 non-data --- */
     int nd = ahciFlushCache(px, port, 0);
@@ -734,48 +696,44 @@ static int ahciProbePort(volatile u8 *px, struct AhciPort *port, int pnum, u16 *
 
 /* ---------- block device interface ---------- */
 
-/* Serialises CLB/CT setup + command issue so two CPUs can't interleave. */
-static spinlock_t ahci_lock = SPINLOCK_INIT;
+      /* C10 (2026-11-13): this driver used to serialise itself with `ahci_lock`,
+       * ONE global for every port -- two disks queued behind each other even
+       * though their engines are independent, and the ISR had to stay lock-free
+       * to avoid deadlocking against it.  Serialisation now lives one layer up:
+       * blk_cache.c holds the *device's* io_lock across the whole drain, so
+       * ahciBlkRead/ahciBlkWrite are only ever entered for one device at a time
+       * and need no lock of their own. */
 
-/* Sectors carried by ONE AHCI command.  A single PRDT entry can describe up to
- * 4 MiB and the ATA count field holds 65535, so 256 (128 KiB -- the usual
- * request size) sits far inside both limits; the constraint here is
- * throughput, not width.
- *
- * This driver used to issue one command per sector.  QEMU answers each of those
- * in microseconds, so every test passed while hiding what it costs on real
- * hardware: each command is a full non-NCQ round trip, 200 us-1 ms on a
- * physical drive.  fat_mount() reads the *entire* FAT into RAM up front
- * (fat32.c), which is a few hundred kilobytes on the 64 MiB test image but
- * hundreds of megabytes on a normal volume -- so the log stops at "trying
- * FAT32" and stays there for minutes with irqs held off.  That is what * "stuck
- * at mounting the disk" looks like: not a failure, just one-sector-at-a-time
- * I/O multiplied by a filesystem-sized number of sectors. */
+      /* Sectors carried by ONE AHCI command.  A single PRDT entry describes up
+       * to 4 MiB and the ATA count field holds 65535, so 256 (128 KiB -- the
+       * usual request size) sits far inside both; the constraint is throughput,
+       * not width.
+       *
+       * This driver used to issue one command per sector.  QEMU answers each in
+       * microseconds, so every test passed while hiding what it costs on real
+       * hardware: each command is a full non-NCQ round trip, 200 us-1 ms, and
+       * fat_mount() reads the *entire* FAT into RAM up front (fat32.c) -- so the
+       * log stopped at "trying FAT32" for minutes with irqs held off.  That is
+       * what "stuck at mounting the disk" looks like: not a failure, just
+       * one-sector-at-a-time I/O times a filesystem-sized number of sectors. */
 #define AHCI_MAX_CHUNK 256
 
 static int ahciBlkRead(struct blkdev *bd, u64 lba, u32 cnt, void *buf)
 {
     u8 *p = (u8 *)buf;
     struct AhciPort *port = (struct AhciPort *)bd->drv;
-    u64 flags;
-    spin_lock_irqsave(&ahci_lock, &flags);
     /* Same bound the old per-sector loop enforced: a request reaching past the
-     * end of the device fails as a whole rather than reading what it can. */
-    if (cnt && lba + cnt > bd->num_sectors) {
-        spin_unlock_irqrestore(&ahci_lock, flags);
-        return -1;
-    }
+     * end of the device fails as a whole rather than reading what it can.
+     * No lock here (C10): the caller is blk_drain_locked(), which holds this
+     * device's io_lock for the whole queue. */
+    if (cnt && lba + cnt > bd->num_sectors) return -1;
     while (cnt) {
         u32 n = cnt > AHCI_MAX_CHUNK ? AHCI_MAX_CHUNK : cnt;
-        if (ahci_cmd_read(port->mmio, port, 0x25, lba, n, p, n * 512)) {
-            spin_unlock_irqrestore(&ahci_lock, flags);
-            return -1;
-        }
+        if (ahci_cmd_read(port->mmio, port, 0x25, lba, n, p, n * 512)) return -1;
         lba += n;
         p += (uptr)n * 512;
         cnt -= n;
     }
-    spin_unlock_irqrestore(&ahci_lock, flags);
     return 0;
 }
 
@@ -783,25 +741,16 @@ static int ahciBlkWrite(struct blkdev *bd, u64 lba, u32 cnt, const void *buf)
 {
     struct AhciPort *port = (struct AhciPort *)bd->drv;
     const u8 *p = (const u8 *)buf;
-    u64 flags;
-    spin_lock_irqsave(&ahci_lock, &flags);
-    if (cnt && lba + cnt > bd->num_sectors) {
-        spin_unlock_irqrestore(&ahci_lock, flags);
-        return -1;
-    }
+    if (cnt && lba + cnt > bd->num_sectors) return -1;
     while (cnt) {
         u32 n = cnt > AHCI_MAX_CHUNK ? AHCI_MAX_CHUNK : cnt;
-        if (ahci_cmd_write(port->mmio, port, 0x35, lba, n, p, n * 512)) {
-            spin_unlock_irqrestore(&ahci_lock, flags);
-            return -1;
-        }
+        if (ahci_cmd_write(port->mmio, port, 0x35, lba, n, p, n * 512)) return -1;
         lba += n;
         p += (uptr)n * 512;
         cnt -= n;
     }
     /* The sectors reached the drive; now reach the medium. */
     (void)ahciFlushCache(port->mmio, port, 0);
-    spin_unlock_irqrestore(&ahci_lock, flags);
     return 0;
 }
 
@@ -815,16 +764,15 @@ static int ahciBlkWrite(struct blkdev *bd, u64 lba, u32 cnt, const void *buf)
 static char sd_names[8][4];
 static int sd_n;
 
-/* C49: PCI INTx -> IOAPIC, one line for the whole controller.
- *
- * The line is the one the device's configuration space names: offset 0x3C
- * is the Interrupt Line the firmware assigned, 0x3D the INTx wire it drives
- * (A..D).  Everything that makes the assignment unusable -- nothing there
- * (0xFF), an unset 0, or a line some other driver already owns -- leaves the
- * controller exactly where it was: polling PxCI, which every wait in this
- * file still does.  The handler slot is the conflict test rather than a
- * hard-coded list of IRQ numbers, because main.c claims IRQ1/4/12 and
- * arch/cpu.c claims IRQ0 as they come up. */
+      /* C49: PCI INTx -> IOAPIC, one line for the whole controller.
+       *
+       * The line is the one the device's configuration space names: offset 0x3C
+       * is the Interrupt Line the firmware assigned, 0x3D the INTx wire it
+       * drives (A..D).  Anything that makes the assignment unusable (0xFF, an
+       * unset 0, or a line another driver owns) leaves the controller polling
+       * PxCI, which every wait in this file still does.  The handler slot is the
+       * conflict test rather than a hard-coded IRQ list, because main.c claims
+       * IRQ1/4/12 and arch/cpu.c claims IRQ0 as they come up. */
 static int ahciRouteIrq(u8 bus, u8 dev, u8 fn)
 {
     u32 d = pci_read(bus, dev, fn, 0x3C);
@@ -855,16 +803,16 @@ static int ahciRouteIrq(u8 bus, u8 dev, u8 fn)
     return ahci_irq_line;
 }
 
-/* Give a port's whole allocation back.  Every "this port cannot be used"
- * path after the allocations ends here: with all ports probed rather than
- * only the first (C51), a skipped port is a normal outcome -- QEMU's q35
- * reports a phantom device on port 2 -- and each one used to leave its
- * command list, FIS and command table behind.
- *
- * `started` says whether the HBA may be fetching from OUR command list: if
- * it can be, the engine is stopped first, because DMA buffers handed back to
- * the allocator while the HBA still reads them are worse than any leak.  A
- * port that will not stop keeps everything on purpose. */
+      /* Give a port's whole allocation back.  Every "this port cannot be used"
+       * path after the allocations ends here: with all ports probed rather than
+       * only the first (C51), a skipped port is a normal outcome -- QEMU's q35
+       * reports a phantom device on port 2 -- and each one used to leave its
+       * command list, FIS and command table behind.
+       *
+       * `started` says whether the HBA may be fetching from OUR command list: if
+       * it can be, the engine is stopped first, because DMA buffers handed back
+       * to the allocator while the HBA still reads them are worse than any leak.
+       * A port that will not stop keeps everything on purpose. */
 static void ahciPortReclaim(volatile u8 *px, struct AhciPort *port, int pnum, bool started)
 {
     if (started && ahciPortStop(px)) {
@@ -877,15 +825,14 @@ static void ahciPortReclaim(volatile u8 *px, struct AhciPort *port, int pnum, bo
     kfree(port);
 }
 
-/* ---- one port's probe, in pieces ----
- *
- * ahciProbe() used to be a 334-line loop body with nine different "port
- * skipped" exits, each repeating the subset of dmaFree()/kfree()/reclaim
- * that happened to exist at that point -- a ladder where every new exit
- * path is another chance to leak the buffer the previous stage had just
- * allocated.  Everything a port acquires now lives in one struct and is
- * handed back by one function, so a stage only has to say "no" and the
- * single exit does the accounting. */
+      /* ---- one port's probe, in pieces ----
+       *
+       * ahciProbe() used to be a 334-line loop body with nine different "port
+       * skipped" exits, each repeating the subset of dmaFree()/kfree()/reclaim
+       * that happened to exist there -- every new exit path another chance to
+       * leak the buffer the previous stage had just allocated.  Everything a
+       * port acquires now lives in one struct handed back by one function, so a
+       * stage only has to say "no" and the single exit does the accounting. */
 struct ahci_port_res {
     volatile u8 *px;       /* this port's register block */
     int p;                 /* port number, for the messages */
@@ -899,14 +846,13 @@ struct ahci_port_res {
     bool keep;             /* published: port and its DMA buffers stay */
 };
 
-/* The one exit for the whole probe.  ident is ours even on success (the
- * old code freed it there too); bd is set only while nobody else owns it,
- * so a refusal to publish is the one place it still gets freed; and keep
- * suppresses the reclaim only after the device is registered -- from then
- * on the registry owns the port object and the buffers the HBA fetches
- * from.  With no port object yet the three DMA buffers are the whole
- * estate, and dmaFree() takes NULL for whichever ones were never handed
- * out. */
+      /* The one exit for the whole probe.  ident is ours even on success; bd is
+       * set only while nobody else owns it, so a refusal to publish is the one
+       * place it still gets freed; and keep suppresses the reclaim only after the
+       * device is registered -- from then on the registry owns the port object
+       * and the buffers the HBA fetches from.  With no port object yet the three
+       * DMA buffers are the whole estate, and dmaFree() takes NULL for whichever
+       * ones were never handed out. */
 static void ahciPortRelease(struct ahci_port_res *r)
 {
     dmaFree(r->ident);
@@ -921,14 +867,13 @@ static void ahciPortRelease(struct ahci_port_res *r)
     dmaFree(r->ct);
 }
 
-/* ABAR's register set runs 0x0000..0x10FF: the 0x100-byte generic header
- * followed by one 0x80-byte block per implemented port, up to 32 ports.
- * That is 0x1100 bytes -- past the first page, so mapping a single 4 KiB
- * page left every port register beyond offset 0xF00 reading whatever the
- * next page table entry happened to hold.  Also: PG_PCD alone selects
- * PAT[2] = UC-, which inherits the firmware's MTRRs (see mm.h); a
- * doorbell write that lands in the cache instead of on the bus is the
- * classic way an HBA hangs, so ask for UC outright. */
+      /* ABAR's register set runs 0x0000..0x10FF: the 0x100-byte generic header
+       * followed by one 0x80-byte block per port, up to 32 ports -- 0x1100 bytes,
+       * past the first page, so mapping a single 4 KiB page left every port
+       * register beyond 0xF00 reading whatever the next PTE happened to hold.
+       * Also: PG_PCD alone selects PAT[2] = UC-, which inherits the firmware's
+       * MTRRs (see mm.h); a doorbell write that lands in the cache instead of on
+       * the bus is the classic way an HBA hangs, so ask for UC outright. */
 static volatile u8 *ahciMapBar(u64 abar)
 {
     u64 abar0 = abar & ~4095UL;
@@ -948,21 +893,20 @@ static void ahciHbaReset(volatile u8 *mmio)
     }
 }
 
-/* Wait for the link instead of sampling it once.  SATA link training is
- * not instantaneous: PxSSTS.DET reads 1 (device detected, PHY not ready)
- * while the device negotiates, and only becomes 3 once communication is
- * established.  QEMU reports 3 immediately, so the old single sample
- * passed every test while being able to silently drop a real disk that
- * was still coming up -- and the symptom is indistinguishable from "no
- * disk": nothing else probes this port and vfs gives up.  Only DET==1 is
- * waited on; 0 (nothing attached) and 4 (PHY failure) are settled answers,
- * so the empty ports that make up most of the 32 cost nothing.
- *
- * Says it for EVERY unattached port, not just DET==1: DET==0 (link down --
- * needs a COMRESET this driver does not send) and DET==4 (PHY failure) used
- * to be skipped in total silence, so on the real machine that first failed
- * here "no disk" and "the disk's port never came up" produced
- * byte-identical logs. */
+      /* Wait for the link instead of sampling it once.  SATA link training is
+       * not instantaneous: PxSSTS.DET reads 1 (device detected, PHY not ready)
+       * while the device negotiates and only becomes 3 once communication is
+       * established.  QEMU reports 3 immediately, so a single sample passed
+       * every test while being able to silently drop a real disk still coming up
+       * -- and the symptom is indistinguishable from "no disk": nothing else
+       * probes this port and vfs gives up.  Only DET==1 is waited on; 0 (nothing
+       * attached) and 4 (PHY failure) are settled answers, so the empty ports
+       * that make up most of the 32 cost nothing.
+       *
+       * Says it for EVERY unattached port, not just DET==1: DET==0 (link down --
+       * needs a COMRESET this driver does not send) and DET==4 used to be
+       * skipped in silence, so on the real machine "no disk" and "the disk's
+       * port never came up" produced byte-identical logs. */
 static u32 ahciWaitLink(volatile u8 *px, int p)
 {
     u32 ssts = pxRd(px, P_SSTS);
@@ -982,12 +926,11 @@ static u32 ahciWaitLink(volatile u8 *px, int p)
     return ssts;
 }
 
-/* Allocate the port's DMA structures before the port object: an
- * allocation failure must skip *this* port, not take the machine with it
- * (T-004 -- and AHCI is optional, IDE still boots).  These are DMA
- * buffers, so they come from the buddy, not kmalloc(): the HBA's alignment
- * rules (1 KiB / 256 B / 128 B) cannot be met by a block that starts 8
- * bytes in. */
+   /* Allocate the port's DMA structures before the port object: an allocation
+    * failure must skip *this* port, not take the machine with it (T-004 -- and
+    * AHCI is optional, IDE still boots).  These are DMA buffers, so they come
+    * from the buddy, not kmalloc(): the HBA's alignment rules (1 KiB / 256 B /
+    * 128 B) cannot be met by a block that starts 8 bytes in. */
 static int ahciPortAlloc(struct ahci_port_res *r)
 {
     r->clb = (CmdHdr *)dmaAlloc();
@@ -997,18 +940,21 @@ static int ahciPortAlloc(struct ahci_port_res *r)
         kprintf("[ahci] port %d: out of memory, port skipped\n", r->p);
         return -1;
     }
-    /* The .cpp original used `new` here, which routed to kmalloc_or_panic
-     * -- i.e. it panicked on OOM, in a function whose own comment two
-     * paragraphs up says an allocation failure must skip *this* port and
-     * not take the machine with it (T-004).  kmalloc() + a NULL check
-     * makes the code do what that comment promises; the .cpp had the
-     * principle and the panic side by side. */
+       /* The .cpp original used `new` here, which routed to kmalloc_or_panic --
+        * i.e. it panicked on OOM in a function whose own comment says an
+        * allocation failure must skip *this* port (T-004).  kmalloc() + a NULL
+        * check makes the code do what that comment promises. */
     r->port = (struct AhciPort *)kmalloc(sizeof(*r->port));
     if (!r->port) {
         kprintf("[ahci] port %d: out of memory for port object, port skipped\n",
                 r->p);
         return -1;
     }
+    /* kmalloc does not zero: the C49 fields (irq_done/irq_is/irq_cnt) must
+     * start from a defined state -- irq_cnt is the baseline
+     * ahci_irq_selftest() subtracts -- and only this construction point may
+     * set them; a later re-init would reset a live port. */
+    memset(r->port, 0, sizeof(*r->port));
     r->port->mmio = r->px;
     r->port->clb = r->clb;
     r->port->fis = r->fis;
@@ -1024,18 +970,17 @@ static int ahciPortAlloc(struct ahci_port_res *r)
     return 0;
 }
 
-/* Stop the port, program its command list and FIS addresses, read them
- * back, start it.  AHCI sequences the stop -- ST first, wait for CR, then
- * FRE, wait for FR -- because PxCLB/PxFB may only be written while the port
- * is stopped.  Clearing both bits at once and then ignoring the result
- * (what this driver did) means a port whose FRE write has not taken yet
- * gets its addresses changed underneath a running engine.  QEMU stores the
- * CLB write unconditionally and clears CR/FR the instant the bits go, so
- * the sloppy order is invisible there.  On a real HBA the write is
- * dropped, the port keeps fetching command headers from the address the
- * firmware left behind, and every doorbell is answered "command complete"
- * with no data moved -- which is exactly how an 8 GB disk came up
- * registered as 0xCCCCCCCCCCCCCCCC sectors. */
+      /* Stop the port, program its command list and FIS addresses, read them
+       * back, start it.  AHCI sequences the stop -- ST first, wait for CR, then
+       * FRE, wait for FR -- because PxCLB/PxFB may only be written while the
+       * port is stopped.  Clearing both bits at once and ignoring the result
+       * meant a port whose FRE write had not taken yet had its addresses changed
+       * underneath a running engine.  QEMU stores the CLB write unconditionally
+       * and clears CR/FR the instant the bits go, so the sloppy order is
+       * invisible there; on a real HBA the write is dropped, the port keeps
+       * fetching from the firmware's address, and every doorbell is answered
+       * "command complete" with no data moved -- which is how an 8 GB disk came
+       * up registered as 0xCCCCCCCCCCCCCCCC sectors. */
 static int ahciPortProgram(struct ahci_port_res *r)
 {
     volatile u8 *px = r->px;
@@ -1049,11 +994,11 @@ static int ahciPortProgram(struct ahci_port_res *r)
         return -1;
     }
 
-    /* PxSCTL may still hold whatever the firmware or an Option ROM left in
-     * it -- including a forced DET value, which would pin the PHY in a
-     * state the link wait above can neither clear nor explain.  Only the
-     * DET sub-field is a "write to change" control, and 0 means "no forced
-     * state", so this is safe while the port is stopped. */
+       /* PxSCTL may still hold whatever the firmware or an Option ROM left in it
+        * -- including a forced DET value, which would pin the PHY in a state the
+        * link wait above can neither clear nor explain.  Only DET is a "write to
+        * change" control and 0 means "no forced state", so this is safe while the
+        * port is stopped. */
     pxWr(px, 0x2C /* PxSCTL */, 0);
 
     u64 clbPa = VIRT_TO_PHYS((uptr)r->port->clb);
@@ -1063,11 +1008,11 @@ static int ahciPortProgram(struct ahci_port_res *r)
     pxWr(px, P_FB, (u32)fisPa);
     pxWr(px, P_FBU, (u32)(fisPa >> 32));
 
-    /* Read the addresses back.  A write the HBA refused lands nowhere and
-     * reports nothing -- the doorbell still rings and the port still
-     * answers, against someone else's command list.  This is the one place
-     * where "did the setup actually happen" is knowable before trusting
-     * every later command to it. */
+       /* Read the addresses back.  A write the HBA refused lands nowhere and
+        * reports nothing -- the doorbell still rings and the port still answers,
+        * against someone else's command list.  This is the one place where "did
+        * the setup actually happen" is knowable before trusting every later
+        * command to it. */
     if (pxRd(px, P_CLB) != (u32)clbPa || pxRd(px, P_FB) != (u32)fisPa) {
         kprintf("[ahci] port %d: PxCLB/PxFB readback mismatch "
                 "(got %08x/%08x want %08x/%08x), port skipped\n",
@@ -1083,15 +1028,14 @@ static int ahciPortProgram(struct ahci_port_res *r)
     return 0;
 }
 
-/* IDENTIFY DEVICE -- reached only through ahciProbePort(), which has
- * already proven the DMA and PIO paths with a real 512-byte transfer.
- * A DMA allocation rather than a stack array: the destination address is
- * the one value this driver must get right by construction, not by luck of
- * where the stack happened to land, and pmm is the allocator that can
- * promise where the physical page is.
- *
- * On success `model` and *sectors_out are filled; on failure the caller
- * just releases -- ident is already recorded in the resource struct. */
+      /* IDENTIFY DEVICE -- reached only through ahciProbePort(), which has
+       * already proven the DMA and PIO paths with a real 512-byte transfer.  A
+       * DMA allocation rather than a stack array: the destination address is the
+       * one value this driver must get right by construction, and pmm is the
+       * allocator that can promise where the physical page is.
+       *
+       * On success `model` and *sectors_out are filled; on failure the caller
+       * just releases -- ident is already recorded in the resource struct. */
 static int ahciPortIdentify(struct ahci_port_res *r, char model[41],
                             u64 *sectors_out)
 {
@@ -1116,15 +1060,14 @@ static int ahciPortIdentify(struct ahci_port_res *r, char model[41],
         return -1;
     }
 
-    /* The port reported success and the buffer is still the 0xCC we seeded
-     * it with, byte for byte -- nothing was ever written to it.  This is
-     * not hypothetical: it is exactly what real hardware showed, an 8 GB
-     * disk registered as 14757395258967641292 sectors
-     * (0xCCCCCCCCCCCCCCCC, the prefill pattern) with an empty model,
-     * because CI cleared without a single byte of IDENTIFY data arriving.
-     * Refuse it here rather than hand a fabricated capacity to every
-     * bounds check downstream that trusts it -- and say so, since "the
-     * disk did not mount" is otherwise all the evidence there is. */
+          /* The port reported success and the buffer is still the 0xCC we seeded
+           * it with, byte for byte -- nothing was ever written to it.  Not
+           * hypothetical: it is exactly what real hardware showed, an 8 GB disk
+           * registered as 14757395258967641292 sectors (0xCCCCCCCCCCCCCCCC, the
+           * prefill pattern) with an empty model, because CI cleared without a
+           * single byte of IDENTIFY data arriving.  Refuse it rather than hand a
+           * fabricated capacity to every downstream bounds check -- and say so,
+           * since "the disk did not mount" is otherwise all the evidence. */
     bool untouched = true;
     for (u32 i = 0; i < 512; i++)
         if (((const u8 *)r->ident)[i] != 0xCC) {
@@ -1137,11 +1080,11 @@ static int ahciPortIdentify(struct ahci_port_res *r, char model[41],
         return -1;
     }
 
-    /* Capacity comes from words 60-61 (28-bit), with words 100-103 as the
-     * 48-bit answer -- see ata_total_sectors().  The old code fell back to
-     * words 100-103 only when words 60-61 were *zero*, but ATA's marker
-     * for "use the 48-bit field" is FFFFFFFFh, so the one value that meant
-     * 2097151 on the console was exactly the one that never fell back. */
+       /* Capacity comes from words 60-61 (28-bit), with words 100-103 as the
+        * 48-bit answer -- see ata_total_sectors().  The old code fell back to
+        * words 100-103 only when words 60-61 were *zero*, but ATA's marker for
+        * "use the 48-bit field" is FFFFFFFFh, so the one value that meant
+        * 2097151 on the console was exactly the one that never fell back. */
     u64 sectors = ata_total_sectors(r->ident);
     ata_model_string(r->ident, model);
 
@@ -1174,14 +1117,18 @@ static struct blkdev *ahciPortPublish(struct ahci_port_res *r, u64 sectors)
         return NULL;
     }
     r->bd = bd; /* the release frees it until the registry takes it */
+    /* kmalloc does not zero: the C10 io_lock/queue fields are born here
+     * (construction point -- blk_register() must not touch them, it could
+     * be handed an in-use object). */
+    memset(bd, 0, sizeof(*bd));
 
-    /* C51: every port that answers is a disk, not just the first one.  The
-     * old `return 1` after the first registration made "sda" the only name
-     * any AHCI port could ever have, so a second disk was invisible to
-     * diskinfo, to the mount probe and to every bound check downstream --
-     * and it stopped the probe from looking at the ports behind it.  Names
-     * are generated here because the registry stores the pointer (C28):
-     * they have to outlive the probe. */
+          /* C51: every port that answers is a disk, not just the first one.  The
+           * old `return 1` after the first registration made "sda" the only name
+           * any AHCI port could ever have, so a second disk was invisible to
+           * diskinfo, to the mount probe and to every bound check downstream --
+           * and it stopped the probe from looking at the ports behind it.  Names
+           * are generated here because the registry stores the pointer (C28):
+           * they have to outlive the probe. */
     if (sd_n >= (int)(sizeof(sd_names) / sizeof(sd_names[0]))) {
         kprintf("[ahci] port %d: device-name table full, port skipped\n", p);
         return NULL;
@@ -1207,11 +1154,11 @@ static struct blkdev *ahciPortPublish(struct ahci_port_res *r, u64 sectors)
     r->bd = NULL; /* the registry owns it now, not we */
     sd_n++;
 
-    /* C49, last: arm this port's interrupts.  Done only now -- PxIM is what
-     * lets PxIS reach GHC.IE, and until the device is registered there is no
-     * handler side of it: an interrupt raised over an unarmed port would sit
-     * on a level-triggered line forever.  PxIS is cleared first so the
-     * arming itself cannot count as a completion. */
+       /* C49, last: arm this port's interrupts.  Done only now -- PxIM is what
+        * lets PxIS reach GHC.IE, and until the device is registered there is no
+        * handler side of it: an interrupt raised over an unarmed port would sit
+        * on a level-triggered line forever.  PxIS is cleared first so the arming
+        * itself cannot count as a completion. */
     if (ahci_irq_line >= 0) {
         pxWr(r->px, P_IS, ~0u);
         pxWr(r->px, P_IM, 0xFFFFFFFFu);
@@ -1259,11 +1206,11 @@ static int ahciProbe(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid,
     if (((sub >> 16) & 0xFF) != 6) return 0;
 
     pci_enable_bm(bus, dev, fn);
-    /* C49: PCI Command bit 10 (Interrupt Disable) is a firmware-set kill
-     * switch for the device's INTx wire -- it stays set across our
-     * enable-BM, and with it set nothing below can raise anything.  Cleared
-     * whether or not the line turns out to be usable, so the register reads
-     * the same either way. */
+       /* C49: PCI Command bit 10 (Interrupt Disable) is a firmware-set kill
+        * switch for the device's INTx wire -- it stays set across our enable-BM
+        * and with it set nothing below can raise anything.  Cleared whether or
+        * not the line turns out to be usable, so the register reads the same
+        * either way. */
     u32 pcicmd = pci_read(bus, dev, fn, 0x04);
     if (pcicmd & (1u << 10)) {
         pci_write(bus, dev, fn, 0x04, pcicmd & ~(1u << 10));
@@ -1280,11 +1227,10 @@ static int ahciProbe(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor, u16 devid,
 
     ahciHbaReset(mmio);
 
-    /* Enable AHCI mode; enable the HBA's global interrupt only when the
-     * line above could actually be routed (C49).  With GHC.IE off, or on
-     * with every PxIM still zero, nothing reaches the PCI wire -- which is
-     * why the ports arm their masks one at a time, after their device is
-     * registered. */
+       /* Enable AHCI mode; enable the HBA's global interrupt only when the line
+        * above could actually be routed (C49).  With GHC.IE off, or on with every
+        * PxIM still zero, nothing reaches the PCI wire -- which is why the ports
+        * arm their masks one at a time, after their device is registered. */
     *(volatile u32 *)(mmio + AHCI_GHC) = GHC_ARE | (irqline >= 0 ? GHC_IE : 0);
     __asm__ volatile("mfence");
 
@@ -1309,17 +1255,17 @@ void ahci_init(void)
 }
 
 #ifdef CONFIG_KTEST
-/* C49: is the completion interrupt *delivered*, not merely routed?
- *
- * Routing printed a line and that is all it proved.  This drives one real
- * transfer and counts what ahciIsr() actually retired.  Returns the number
- * of interrupts the transfer produced (>0 is the pass), 0 when the command
- * completed with no interrupt at all (a real failure: the route exists and
- * the port is armed), -1 when there is no AHCI disk to command and -2 when
- * no interrupt line could be routed -- the two skips, since neither says
- * anything about the mechanism.  The sti/pause/cli afterwards lets a
- * still-pending interrupt into the LAPIC before the count is read: QEMU
- * raises it synchronously with the doorbell, but issueCmd() ends with cli. */
+      /* C49: is the completion interrupt *delivered*, not merely routed?
+       *
+       * Routing printed a line and that is all it proved.  This drives one real
+       * transfer and counts what ahciIsr() actually retired.  Returns the number
+       * of interrupts the transfer produced (>0 is the pass), 0 when the command
+       * completed with no interrupt at all (a real failure: the route exists and
+       * the port is armed), -1 when there is no AHCI disk to command and -2 when
+       * no line could be routed -- the two skips, since neither says anything
+       * about the mechanism.  The sti/pause/cli afterwards lets a still-pending
+       * interrupt into the LAPIC before the count is read: QEMU raises it
+       * synchronously with the doorbell, but issueCmd() ends with cli. */
 int ahci_irq_selftest(void)
 {
     if (ahci_irq_line < 0) return -2;
@@ -1329,6 +1275,11 @@ int ahci_irq_selftest(void)
     u64 before = p->irq_cnt;
     static u8 buf[512];
 
+       /* Deliberately NOT blk_io_read(): the point of this call is to observe the
+        * completion interrupt for one raw command, and ktest runs it on the BSP
+        * alone (LATE, before smp_init, IF off) -- so bypassing the C10 queue's
+        * io_lock is exactly as safe here as the old direct ahci_lock acquisition
+        * was. */
     if (irq_bd->read(irq_bd, 0, 1, buf) != 0) return -1;
     __asm__ volatile("sti; pause; pause; cli" ::: "memory");
 

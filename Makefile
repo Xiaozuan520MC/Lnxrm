@@ -1,7 +1,7 @@
 CROSS   :=
 CC      := $(CROSS)clang
-LD      := $(CROSS)ld
-OBJCOPY := $(CROSS)objcopy
+LD      := $(CROSS)ld.lld
+OBJCOPY := $(CROSS)llvm-objcopy
 NASM    := nasm -w-implicit-abs-deprecated
 PYTHON3 := python3
 
@@ -30,6 +30,10 @@ KTEST_DIR  :=
 KTEST_DEFS :=
 endif
 
+OBJDIR := $(BUILD)/obj$(KTEST)
+
+MODE_MARK := $(BUILD)/.mode-$(KTEST)
+
 BASEFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
              -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
              -Os -g $(WARN) -Iinclude -I. -Iktest/include -MMD -MP \
@@ -43,26 +47,26 @@ KASM_ALL := $(shell find arch -name '*.S' 2>/dev/null)
 KASM     := $(filter-out arch/trampoline.S,$(KASM_ALL))
 
 ARCH_SRC_C  := $(shell find arch -name '*.c' 2>/dev/null)
-ARCH_C_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(ARCH_SRC_C))
-ARCH_S_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(KASM))
+ARCH_C_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(ARCH_SRC_C))
+ARCH_S_OBJS := $(patsubst %.S,$(OBJDIR)/%.o,$(KASM))
 
 KERN_SRC_C  := $(shell find kernel -name '*.c' 2>/dev/null)
 KTEST_SRC_C := $(if $(KTEST_DIR),$(shell find $(KTEST_DIR) -name '*.c' 2>/dev/null))
 
-KERN_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(KERN_SRC_C))
-KTEST_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KTEST_SRC_C))
+KERN_OBJS  := $(patsubst %.c,$(OBJDIR)/%.o,$(KERN_SRC_C))
+KTEST_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(KTEST_SRC_C))
 
 USER_PROGS := $(notdir $(basename $(wildcard userland/bin/*.c)))
 USER_ELFS  := $(addprefix $(BUILD)/user/,$(USER_PROGS))
 
 # ---- kernel rules -------------------------------------------------------
-$(BUILD)/%.o: %.c | $(BUILD)
+$(OBJDIR)/%.o: %.c | $(OBJDIR)
 	@mkdir -p $(dir $@)
 	@printf "  CC      $(SHORT)\n"
 	@$(CC) $(KERNFLAGS) -MMD -MP -c -o $@ $<
 
 # ---- architecture rules -------------------------------------------------
-$(BUILD)/arch/%.o: arch/%.S | $(BUILD)
+$(OBJDIR)/arch/%.o: arch/%.S | $(OBJDIR)
 	@mkdir -p $(dir $@)
 	@printf "  NASM    $(SHORT)\n"
 	@$(NASM) -f elf64 -F dwarf -g -o $@ $<
@@ -71,7 +75,7 @@ $(BUILD)/trampoline.bin: arch/trampoline.S | $(BUILD)
 	@printf "  NASM    $(SHORT)\n"
 	@$(NASM) -f bin -o $@ $<
 
-$(BUILD)/trampoline.o: $(BUILD)/trampoline.bin | $(BUILD)
+$(OBJDIR)/trampoline.o: $(BUILD)/trampoline.bin | $(OBJDIR)
 	@printf "  OBJCOPY $(SHORT)\n"
 	@$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
 	  --rename-section .data=.trampoline $< $@ \
@@ -79,24 +83,16 @@ $(BUILD)/trampoline.o: $(BUILD)/trampoline.bin | $(BUILD)
 	  --redefine-sym _binary_build_trampoline_bin_end=trampoline_end \
 	  --redefine-sym _binary_build_trampoline_bin_size=trampoline_size
 
-# Print targets relative to the build dir (short, cwd-independent).
-SHORT = $(patsubst $(BUILD)/%,%,$@)
+SHORT = $(patsubst $(BUILD)/%,%,$(patsubst $(OBJDIR)/%,%,$@))
 
 KOBJ_C   := $(KERN_OBJS) $(ARCH_C_OBJS) $(KTEST_OBJS)
-KOBJ_ASM := $(ARCH_S_OBJS) $(BUILD)/trampoline.o
+KOBJ_ASM := $(ARCH_S_OBJS) $(OBJDIR)/trampoline.o
 KOBJ     := $(KOBJ_C) $(KOBJ_ASM)
 
 INITRAMFS ?=
 ifneq ($(INITRAMFS),)
 KOBJ += $(BUILD)/initramfs.o
 endif
-
-KTEST_STAMP := $(BUILD)/.ktest-mode-$(KTEST)
-$(KTEST_STAMP):
-	@mkdir -p $(BUILD)
-	@rm -f $(BUILD)/.ktest-mode-*
-	@touch $@
-$(KOBJ): $(KTEST_STAMP)
 
 user:
 	@$(MAKE) -C userland BUILD=$(abspath $(BUILD))
@@ -106,6 +102,13 @@ $(USER_ELFS): $(BUILD)/user/%: userland/bin/%.c userland/lib/ulib.c userland/lib
 
 $(BUILD):
 	@mkdir -p $@
+
+$(OBJDIR):
+	@mkdir -p $@
+
+$(MODE_MARK): | $(BUILD)
+	@rm -f $(BUILD)/.mode-*
+	@touch $@
 
 $(BUILD)/ifsrc/.stamp: $(USER_ELFS) $(BUILD)/README.md | $(BUILD)
 	@rm -rf $(BUILD)/ifsrc
@@ -124,11 +127,10 @@ $(BUILD)/initramfs.o: $(INITRAMFS) | $(BUILD)
 
 initramfs: $(BUILD)/initramfs.cpio
 
-$(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld
+$(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld $(MODE_MARK)
 	@printf "  LD      $(SHORT)\n"
 	@$(LD) -T $(ARCHDIR)/kernel.ld --gc-sections -o $@ $(KOBJ) \
-	      -Map $(BUILD)/vmlinux.map \
-	      --no-warn-rwx-segments
+	      -Map $(BUILD)/vmlinux.map
 
 $(BUILD)/vmlinux.bin: $(BUILD)/vmlinux.elf
 	@printf "  OBJCOPY $(SHORT)\n"
@@ -149,7 +151,7 @@ $(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/vmlinux.bin
 
 clean:
 	@rm -rf $(BUILD)
-	@echo Done!
+	@echo DONE!
 
 help:
 	@echo make

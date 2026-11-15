@@ -1,48 +1,47 @@
 /* T-007 (C24) and T-008 (C26): what the block cache promises.
  *
  * T-007 -- the victim.  The cache used to choose its victim with a single
- * `used` bit that a hit set and nothing ever cleared per entry.  Once all 64
- * slots were "used" the only move left was to clear every bit and take slot
- * 0, so a working set larger than the cache recycled the same slots forever
- * no matter which sector had been touched a microsecond ago.  Two cases pin
- * the replacement policy down:
+ * `used` bit a hit set and nothing cleared, so once all 64 slots were "used"
+ * the only move was to clear every bit and take slot 0: a working set larger
+ * than the cache recycled the same slots forever.  Two cases pin the policy:
  *
  *   test_lru_victim_is_the_least_recently_used
- *       fills all 64 slots, touches one of them, asks for a 65th sector and
- *       checks that the *oldest untouched* one went and the touched one
- *       stayed.  Slot 0 is the touched one here, so the old policy fails this
- *       case outright.
+ *       fills all 64 slots, touches one, asks for a 65th sector and checks
+ *       that the *oldest untouched* one went and the touched one stayed.
  *   test_hot_sectors_survive_a_cold_stream
  *       rewrites 8 sectors 6 times while streaming 96 others past them.
- *       Staging a sector that is already resident costs nothing; only an
- *       eviction of a dirty sector costs a device write.  So "no sector
- *       reached the device more than once" (<= 8 + slack writebacks) is
- *       exactly "the hot set was never evicted", which the old victim choice
- *       could not deliver (it wrote the hot set back every round).
+ *       Staging a resident sector costs nothing and only evicting a dirty one
+ *       costs a device write, so "<= 8 + slack writebacks" is exactly "the hot
+ *       set was never evicted".
  *
  * The write-back cache is measured, not asserted about: blk_cache_stats()
  * counts hits, misses, evictions, writebacks and the transfers that really
  * reached a driver.
  *
- * T-008 -- coherence.  C26 claimed the read path bypassed the cache while
- * the write path did not, so a read could return what was on disk before the
- * write.  That particular split is gone (reads go through fat_read_sector ->
- * blk_cache_read), but the underlying rule is worth a test rather than a
+ * T-008 -- coherence.  C26 claimed the read path bypassed the cache while the
+ * write path did not, so a read could return what was on disk before the
+ * write.  That split is gone, but the rule deserves a test rather than a
  * comment: a value written through the cache must come back identical, both
- * while it is still resident and after the cache has been thrown away and
- * the bytes are re-read from the device.  The other half of the rule is that
- * each region of the disk uses exactly one path -- the FAT is written
- * straight to the device (so an allocation is durable before the directory
- * entry that names the cluster) and read from m->fat_pages, never from the
- * cache; if a FAT sector ever became resident, those two answers could
- * disagree.
+ * while resident and after the cache has been thrown away.  The other half is
+ * that each region uses exactly one path -- the FAT is written straight to the
+ * device and read from m->fat_pages, never from the cache; if a FAT sector
+ * ever became resident the two answers could disagree.
  *
  * Everything here is destructive only on sectors the case itself created, or
- * read-only, and every case leaves the cache empty of its own traffic. */
+ * read-only, and every case leaves the cache empty of its own traffic.
+ *
+ * C7 (2026-11-13) -- the lock itself.  cache_lock used to be held across the
+ * whole device transfer on both paths, stacked under fat_fs_lock, so one slow
+ * disk held up every CPU touching the cache or the filesystem.
+ * test_cache_lock_is_released_across_device_io below asks the cache, at the
+ * instant it is about to run a transfer, whether it still owns its own lock --
+ * the claim is measured rather than read off the code, and the probe answers
+ * with a plain flag read so a wrong answer fails instead of spinning. */
 #include <sys/ktest.h>
 #include <console.h>
 #include <disk.h>
 #include <fat32.h>
+#include "kblk.h"
 
 /* The mounted volume, or a skip if there is none (same rule as t_ioerr.c). */
 static struct fat_mount *mnt_or_skip(const char *who)
@@ -394,9 +393,84 @@ static void test_sync_hands_dirty_sectors_to_the_device(void)
             s1.writebacks);
 }
 
+/* ---- C7: cache_lock is a metadata lock, not a transfer lock ------------
+ * Two paths in this file perform a device transfer: a FILL (blk_cache_read
+ * on a resident miss) and a WRITEBACK (blk_cache_flush / sync / purge of a
+ * staged sector).  Both used to run it while holding cache_lock, which sat
+ * under fat_fs_lock -- so one slow disk reached the whole machine instead
+ * of one device.  The fix reserves the slot and drops the lock for the
+ * transfer; this case verifies that by asking, at the instant the transfer
+ * is about to start, rather than by trusting the shape of the code.
+ *
+ * blk_cache_set_io_probe() installs a callback at every such point.  It
+ * answers with blk_cache_lock_is_free() -- a plain read of the flag, not a
+ * trylock -- so a regression that puts the lock back around the transfer
+ * makes the count non-zero and fails, instead of deadlocking the self-test
+ * against a lock this same CPU already holds.  Staging (blk_cache_write)
+ * is pure metadata and must NOT probe; that is asserted too, so the probe
+ * count means "transfers" and nothing else. */
+static int c7_probes;
+static int c7_probes_locked;
+
+static void c7_probe(void)
+{
+    c7_probes++;
+    if (!blk_cache_lock_is_free()) c7_probes_locked++;
+}
+
+static void test_cache_lock_is_released_across_device_io(void)
+{
+    struct kblk *k = kblk_make("kblkc7", 64, 64);
+    K_ASSERT(k != NULL);
+    /* Empty the whole cache first, not just this device's part of it: the
+     * probe is about to be armed, and an unrelated dirty sector found by
+     * the victim choice would fire it for a reason this case cannot name.
+     * Done before arming, so this purge's own traffic cannot count either. */
+    K_ASSERT_EQ(blk_cache_purge(NULL), 0);
+
+    c7_probes = 0;
+    c7_probes_locked = 0;
+    blk_cache_set_io_probe(c7_probe);
+
+    /* (1) WRITEBACK path: stage a sector, then push it out. */
+    u8 page[CACHE_SECTOR_SIZE];
+    memset(page, 0x37, sizeof(page));
+    K_ASSERT_EQ(blk_cache_write(&k->dev, 0, page), 0);
+    K_EXPECT_EQ(c7_probes, 0);   /* staging is metadata: no transfer yet */
+    K_EXPECT_EQ(k->writes, 0u);  /* ... so nothing reached the device */
+    K_ASSERT_EQ(blk_cache_flush(&k->dev), 0);
+    int after_writeback = c7_probes;
+    K_EXPECT(after_writeback >= 1); /* the flush really probed */
+    K_EXPECT_EQ(k->writes, 1u);     /* and really wrote */
+
+    /* (2) FILL path: a sector that is not resident, so the read has to go
+     *     to the device.  Purge drops the one above without a transfer (it
+     *     is clean now), which keeps the read count exact. */
+    K_ASSERT_EQ(blk_cache_purge(&k->dev), 0);
+    K_EXPECT_EQ(blk_cache_lookup(&k->dev, 5), -1);
+    u8 out[CACHE_SECTOR_SIZE];
+    K_ASSERT_EQ(blk_cache_read(&k->dev, 5, out), 0);
+    K_EXPECT(c7_probes > after_writeback); /* the fill probed as well */
+    K_EXPECT_EQ(k->reads, 1u);
+    K_EXPECT(blk_cache_lookup(&k->dev, 5) >= 0); /* and installed it */
+    K_EXPECT_EQ(out[0], 0); /* kblk zeroes what it backs: readable bytes */
+
+    blk_cache_set_io_probe(NULL);
+
+    /* What the case is here for: every transfer outside the lock, none in. */
+    K_EXPECT(c7_probes >= 2);
+    K_EXPECT_EQ(c7_probes_locked, 0);
+
+    K_ASSERT_EQ(blk_cache_purge(&k->dev), 0);
+    kblk_free(k);
+    kprintf("[blk_cache] C7: %d transfers ran with cache_lock released, "
+            "%d found it held\n", c7_probes, c7_probes_locked);
+}
+
 KTEST("blkcache", KTEST_LATE, test_lru_victim_is_the_least_recently_used);
 KTEST("blkcache", KTEST_LATE, test_a_200_sector_file_costs_one_writeback_each);
 KTEST("blkcache", KTEST_LATE, test_hot_sectors_survive_a_cold_stream);
 KTEST("blkcache", KTEST_LATE, test_write_readback_is_coherent);
 KTEST("blkcache", KTEST_LATE, test_fat_region_is_never_cached);
 KTEST("blkcache", KTEST_LATE, test_sync_hands_dirty_sectors_to_the_device);
+KTEST("blkcache", KTEST_LATE, test_cache_lock_is_released_across_device_io);

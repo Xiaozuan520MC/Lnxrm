@@ -203,6 +203,13 @@ int mbr_get_partition(struct mbr_info *mbr, int index, struct blkdev *out_dev,
     out_dev->read = part_read;
     out_dev->write = part_write;
     out_dev->drv = pd;
+    /* C10: the caller's storage may be fresh kmalloc (vfs.c's mount probe)
+     * -- never assume it is zero.  The per-device lock and queue are born
+     * HERE, at the one place this object is built; blk_register() must not
+     * reset them, it can be handed an object that is already in use. */
+    memset(&out_dev->io_lock, 0, sizeof(out_dev->io_lock));
+    out_dev->req_head = NULL;
+    out_dev->req_tail = NULL;
 
     kprintf("[mbr] partition %d: start_lba=%u size_sectors=%u -> %s\n", index, pd->start_lba,
             pd->size_sectors, pd->name);

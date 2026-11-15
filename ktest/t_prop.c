@@ -1,8 +1,7 @@
 /* T-013: property tests -- randomised inputs, fixed seed, no panic, no overrun.
  *
  * T-011/T-012 pin *hand-picked* inputs.  The defects this file exists for are
- * the ones a hand-written list does not reach: C16 (nclus truncation, since
- * closed by a tagged direct ktest), C30
+ * the ones a hand-written list does not reach: C16 (nclus truncation), C30
  * (overflow), C31 (buffer), C32 (fat_entries overflow), C33 (interval
  * semantics) are all "wrong at an offset nobody thought to type", and those
  * are exactly what random input walks into by accident.
@@ -16,15 +15,13 @@
  *      a boot timeout, so this one needs no assertion of its own: it is the
  *      absence of one.
  *   2. NOTHING OVERRUNS.  Every buffer a callee may write into is bracketed by
- *      canary bytes which are scanned afterwards.  The GAP_ANALYSIS asks for a
- *      "canary page" around the buffer; these buffers live on the stack or in
- *      a local struct rather than on a page of their own, so the guard is the
- *      same idea expressed as surrounding fill bytes.
+ *      canary bytes scanned afterwards.  The GAP_ANALYSIS asks for a "canary
+ *      page"; these buffers live on the stack or in a local struct, so the
+ *      guard is the same idea expressed as surrounding fill bytes.
  *   3. THE ANSWER MATCHES AN ORACLE.  Each case carries a second
  *      implementation of the contract, written from the header comments
- *      (types.h, mm/mm.h, fs/vfs.c, fat32.h, elf.h) and answered by
- *      walking the page tables itself -- never by calling the function under
- *      test.
+ *      (types.h, mm/mm.h, fs/vfs.c, fat32.h, elf.h) and answered by walking
+ *      the page tables itself -- never by calling the function under test.
  *
  * REPRODUCIBILITY.  PROP_SEED is a constant and every case derives its own
  * stream from it (prop_mix(case_id)), so a case's inputs do not depend on the
@@ -33,8 +30,8 @@
  * regenerates the same inputs byte for byte.
  *
  * A violation is counted, not raised per iteration: 10 000 iterations must
- * never be able to flood the serial log, so only the first offender of a case
- * prints its details and every case ends with K_EXPECT_EQ(prop_bad, 0). */
+ * never flood the serial log, so only the first offender of a case prints its
+ * details and every case ends with K_EXPECT_EQ(prop_bad, 0). */
 #include <sys/ktest.h>
 #include <console.h>
 #include <mm/mm.h>

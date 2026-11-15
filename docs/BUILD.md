@@ -5,13 +5,15 @@ x86-64 freestanding 内核（C + NASM），构建链零警告。本文覆盖：�
 ## 1. 依赖
 
 ```sh
-sudo apt install make clang binutils nasm python3 \
+sudo apt install make clang lld llvm binutils nasm python3 \
                  dosfstools mtools qemu-system-x86 gdb
 ```
 
 可选：`grub-pc-bin` + `xorriso`（`make imageiso`）、`fsck.vfat`/`mdir`（smoke 检查，缺则 SKIP）、`g++`（构建不用，但 smoke 工具链检查要求在 PATH）。
 
-不钉版本；已验证 clang 21 / binutils 2.46 / nasm 3.01 / python 3.14 / QEMU 10.x。`CROSS` 前缀同时作用于 `CC`/`LD`/`OBJCOPY`，如 `CROSS=x86_64-linux-gnu-` 可换整套交叉工具链。
+`binutils` 仍要装：编译/链接/取 payload 已经全走 LLVM（`clang` → `ld.lld` → `llvm-objcopy`），但 `scripts/patch_setup_jmp.py` 用 `nm` 查 `_start32/64`，且 smoke 的工具链检查把 `ld`/`objcopy` 列为必需，缺则整个 smoke 起不来。
+
+不钉版本；已验证 clang 21 / lld 21 / LLVM objcopy 21 / binutils 2.46 / nasm 3.01 / python 3.14 / QEMU 10.x。`CROSS` 前缀同时作用于 `CC`/`LD`/`OBJCOPY`，如 `CROSS=x86_64-linux-gnu-` 可换整套交叉工具链——注意此时 `LD` 解析成 `<prefix>ld.lld`、`OBJCOPY` 成 `<prefix>llvm-objcopy`，要求同前缀的 LLVM 链接器与 objcopy 在 PATH。
 
 ## 2. make 目标与变量
 
@@ -27,7 +29,7 @@ sudo apt install make clang binutils nasm python3 \
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `KTEST=1` | `0` | 编入 `ktest/` 自测；翻转会触发全量重编，防两模式对象混装 |
+| `KTEST=1` | `0` | 编入 `ktest/` 自测；对象按模式分目录（`build/obj0` / `build/obj1`），两模式并存，切换只重链约 0.2 s、零重编 |
 | `DISK=0` | `1` | 不挂盘，快速看早期启动日志 |
 | `MACHINE` / `KVM` | `q35` / 自动探测 | QEMU 机型；`/dev/kvm` 可用即加 `--enable-kvm` |
 | `INITRAMFS` | 空 | cpio 路径，编进内核 |
@@ -38,10 +40,10 @@ sudo apt install make clang binutils nasm python3 \
 ### 3.1 流程
 
 ```
-kernel/**.c, arch/*.c ──cc──► build/**/*.o ─┐
-arch/*.S ──nasm──► build/arch/*.o           │
-trampoline.S ─nasm─► bin ─objcopy─► .o      ├─ ld -T arch/kernel.ld --gc-sections ─► vmlinux.elf
-ktest/*.c（仅 KTEST=1）──cc──► .o           │      └─ objcopy -O binary ─► vmlinux.bin ─┐
+kernel/**.c, arch/*.c ──cc──► build/obj<N>/**/*.o ─┐
+arch/*.S ──nasm──► build/obj<N>/arch/*.o    │
+trampoline.S ─nasm─► bin ─llvm-objcopy─► .o  ├─ ld.lld -T arch/kernel.ld --gc-sections ─► vmlinux.elf
+ktest/*.c（仅 KTEST=1）──cc──► .o           │      └─ llvm-objcopy -O binary ─► vmlinux.bin ─┐
 setup.asm ─nasm─► 补零 2 KiB 整数倍 ─patch_setup_jmp.py─► setup.bin ────────────────┴─ cat ─► patch_bzimage.py ─► bzImage
 
 userland/bin/*.c + crt0.S + ulib.c ─► build/user/<名>（静态 ELF）
@@ -49,9 +51,12 @@ build/user/* + README.md ──mkfs.vfat/mcopy──► build/disk.img
 ```
 
 - 源文件用 `find`/`wildcard` 自动发现：新增内核 `.c` 或 `userland/bin/*.c` 不用改 Makefile；头依赖由 `-MMD -MP` 的 `.d` 跟踪。
+- 对象按 `KTEST` 分目录（`build/obj0` / `build/obj1`），两种模式并存，`make` ↔ `make KTEST=1` 切换只重链一次（0.2 s、零 `CC`），不再全量重编 70 个 TU——旧的 `build/.ktest-mode-<n>` stamp 因此删除。**模式标记 `build/.mode-<n>` 必须挂在 `vmlinux.elf` 上、不能挂在对象上**：翻转后每个 `.o` 都比 elf 旧，标记不挂链上，`make` 就会认定上一模式的 `bzImage` 仍最新，把 `KTEST=1` 的内核当 `KTEST=0` 发给你；挂回对象上则又变回全量重编。**该规则还必须排在 `all:` 之后**——它是 Makefile 里第一个不以 `.` 开头的目标，写在 `all:` 前面会夺走默认目标，`make` 从此只检查这个标记、再也不建 `bzImage`。产物一律仍在 `build/` 根（`smoke_test.py` 硬编码 `bzImage`/`vmlinux.elf`/`setup.bin`/`disk.img`/`user/`），`make clean` 照旧整个删。
 - 关键标志：`-ffreestanding -fno-stack-protector -mno-red-zone -mno-sse* -mcmodel=kernel -O2 -g -ffunction-sections -fno-pic`；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`，链接 `-nostdlib -nostartfiles -static`（链接专用开关单独放 `USERLDFLAGS`，混进编译命令会被 clang 报 `-Wunused-command-line-argument`），链接在 `0x7f8000400000`。
 - `vmlinux.elf` 查符号：`grep <sym> build/vmlinux.map` 或 `nm build/vmlinux.elf`。
-- `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；`setup.bin` 依赖 `vmlinux.elf` 只为 `nm` 查 `_start32/64` 回填跳转；`patch_bzimage.py` 填 boot protocol 头并断言 `HdrS`/`0x55AA`/对齐。
+- `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；它在 `arch/kernel.ld` 里**显式摆成 `.trampoline` 段**（VMA = `.image` 末尾、LMA 紧随其后），不能留作孤儿段——GNU ld 与 ld.lld 对孤儿段的摆放不同，lld 会因 `.trampoline` 压在 `.bss` 负载地址上直接报 `load address range overlaps with .bss` 而拒链。`setup.bin` 依赖 `vmlinux.elf` 只为 `nm` 查 `_start32/64` 回填跳转；`patch_bzimage.py` 填 boot protocol 头并断言 `HdrS`/`0x55AA`/对齐。
+- 链接器与对象工具是 LLVM 一套（2026-11-14 换链：`ld` → `ld.lld`、`objcopy` → `llvm-objcopy`）。几个坑：lld 不认 GNU 的 `--no-warn-rwx-segments`（它本身也没有 RWX 段警告，直接删）；link map 要写成 `-Map <file>`（空格形式），`-Map=<file>` 不产文件。
+- 换链后 `nm`/`strings` 逐字节比对 GNU 产物会看到差异，属预期而非回归：lld 对 `.rodata.str1.1` 这类 `SHF_MERGE|SHF_STRINGS` 段会做尾串合并并**裁掉无人引用的死串**（如无调用者的 `kmalloc_or_panic` 的 panic 格式串），GNU ld 留着；段内布局随之位移，`.text` 里 `mov rdi, imm32` 的 rodata 地址、以及 data 段的对齐填充（GNU `nop` / lld `int3`）都会不同。判定口径是**符号表 + 运行时**，不是 payload 字节。
 - 可复现：设 `SOURCE_DATE_EPOCH` 后 `bzImage` SHA256 稳定。
 - `make -j$(nproc)` 安全；改了 `_start32/64` 相对位置而启动跳错：`rm -f build/setup.bin build/bzImage && make`。
 
@@ -100,10 +105,14 @@ qemu-system-x86_64 [--enable-kvm] -machine q35 -m 256 -smp 2 \
 make smoke                          # 270/270 checks
 make smoke SMOKE_FLAGS="--smp 1"    # 单 CPU 必须用这个，不用 --qemu-args
 make smoke SMOKE_FLAGS="--no-build" # 复用现有 build/
+make smoke SMOKE_FLAGS="--repeat 2" # 连跑抖动门（OBS-1）：boot+shell 与伪造盘
+                                    # 各跑 2 轮，失败轮串口留档 serial-fail-<i>.log
+make smoke SMOKE_FLAGS="--timeout 900"  # 主机高负载时加宽每次等待（默认 420 s）：
+                                    # TCG 下 enospc 填 62 MiB 实测可达 504 s，判据不变
 ```
 
 - 单/双 CPU 标记集不同（双 CPU 要求 AP 行、2 CPUs online；单 CPU 反之），所以单 CPU 必须走 `--smp 1` 换标记集。
-- 日志：`build/smoke/serial.log`（`--smp 1` → `serial-smp1.log`，伪造盘 → `serial-forged-*.log`）；阶段 6 用副本 `forged.img`，不碰 `disk.img`。
+- 日志：`build/smoke/serial.log`（`--smp 1` → `serial-smp1.log`，伪造盘 → `serial-forged-*.log`，`--repeat` 失败轮 → `serial-fail-<i>.log`）；阶段 6 用副本 `forged.img`，不碰 `disk.img`。
 - 手动判据：`[boot] ready in N ms` + `[ktest] selftest PASS`，无 `[PANIC]`、无三重故障。
 
 ## 5. 磁盘镜像与 GRUB ISO
@@ -171,6 +180,7 @@ qemu-system-x86_64 -machine q35 -m 2048 -smp 2 -cpu qemu64,+smep,+smap \
 | 无 framebuffer | GRUB 没设 `gfxpayload` | 内核回退 VGA；要 32 bpp 补 5.2 配置 |
 | `imageiso` 报 `grub-mkrescue not found` | 缺工具 | 装 `grub-pc-bin` + `xorriso` |
 | smoke 阶段 4 卡在 AP 标记 | 用 `--qemu-args "-smp 1"` 关了 CPU 但标记仍是双 CPU 集 | 用 `SMOKE_FLAGS="--smp 1"` 换标记集 |
+| smoke 在 enospc 填盘段撞等待超时（阶段 4 等 `late selftest` 超时、阶段 6 forged 无 prompt），串口停在 `vfs/test_enospc_on_full_volume` | `test_enospc_on_full_volume` 静默填满 62 MiB——实测主机 load≈6.7 时 TCG 需 **504 s**，超过默认 420 s 门（forged 是整个 boot 一次预算，余量最薄）；上一轮若被杀在中途留下 `ENOSPC.T` 残留（`mdir -i build/disk.img ::` 可见），O_TRUNC 重填翻倍更必超 | 主机降载后重跑，或 `SMOKE_FLAGS="--timeout 900"`（判据不变、只放宽等待）；有残留先 `rm build/disk.img && make build/disk.img`（`fsck.vfat -n` 应显示 `374/128046 clusters`） |
 | smoke 阶段 1 报缺 `g++` | 工具链检查仍列了它 | 装 `g++`（不影响构建） |
 | gdb 与串口抢终端 | 都用 stdio | 调试时 `-serial null` |
 | 真机闪一下就重启 | 三重故障（`panic` 只挂死不复位） | `-m 2048` 复现（`-m 256` 走不到窗口上界），配 `-no-reboot -d int` 按 6 节定位 |
