@@ -11,6 +11,7 @@
 #include <sys/acpi.h>
 #include <sys/percpu.h>
 #include <sys/smp.h>
+#include <sys/klog.h>
 #ifdef CONFIG_KTEST
 #include <sys/ktest.h>
 #endif
@@ -164,8 +165,8 @@ static void boot_read_vbe(void)
         memset(f, 0, sizeof(*f));
         return;
     }
-    kprintf("[fb] lfb %dx%d %u bpp phys=0x%lx pitch=%u mode=0x%x\n", f->width, f->height, depth,
-            f->phys_addr, f->pitch, f->mode);
+    klogf(LOG_DEBUG, "[fb] lfb %dx%d %u bpp phys=0x%lx pitch=%u mode=0x%x\n", f->width,
+          f->height, depth, f->phys_addr, f->pitch, f->mode);
 }
 
 /* PS/2 keyboard: controller init + IOAPIC IRQ1 (vector 33) routing. */
@@ -257,7 +258,8 @@ void start_kernel(void)
         else if (e->type == 3) kind = "ACPI reclaim";
         else if (e->type == 4) kind = "ACPI NVS";
         else if (e->type == 5) kind = "bad";
-        kprintf("[mem] e820 %d: 0x%lx..0x%lx %s\n", i, e->addr, e->addr + e->size - 1, kind);
+        klogf(LOG_DEBUG, "[mem] e820 %d: 0x%lx..0x%lx %s\n", i, e->addr,
+              e->addr + e->size - 1, kind);
         if (e->type == E820_RAM)
             e820_ram += e->size;
         else if (e->addr < 0x100000000UL)
@@ -269,14 +271,20 @@ void start_kernel(void)
 
     boot_read_vbe();
     boot_read_cmdline();
+    /* `loglevel=<0..3>` (QEMU -append / GRUB `linux`) may silence the
+     * detail lines below; the banner above already printed at the
+     * default LOG_INFO, klog_init is the earliest point that can see the
+     * loader's string. */
+    klog_init();
     if (bootinfo.cmdline[0])
-        kprintf("[boot] cmdline='%s'\n", bootinfo.cmdline);
+        klogf(LOG_DEBUG, "[boot] cmdline='%s'\n", bootinfo.cmdline);
 
     /* Kernel footprint: .image + .bss (incl. boot stack), physical range. */
     extern char __kernel_start[], __bss_end[];
     u64 klo = VIRT_TO_PHYS((uptr)__kernel_start);
     u64 khi = ALIGN_UP(VIRT_TO_PHYS((uptr)__bss_end), PAGE_SIZE);
-    kprintf("[boot] kernel image phys 0x%lx..0x%lx (%lu KiB)\n", klo, khi, (khi - klo) >> 10);
+    klogf(LOG_DEBUG, "[boot] kernel image phys 0x%lx..0x%lx (%lu KiB)\n", klo, khi,
+          (khi - klo) >> 10);
 
 #ifdef CONFIG_KTEST
     /* Self-test stage 1 of 3: everything that needs nothing but the console

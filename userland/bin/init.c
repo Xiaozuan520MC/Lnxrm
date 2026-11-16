@@ -36,10 +36,10 @@ int main(int argc, char **argv)
      * pid 1 still exists to reparent orphans. */
     long pid = kfork();
     if (pid == 0) {
-        char *sh_argv[] = {"/bin/sh", 0};
+        char *lsh_argv[] = {"/bin/lsh", 0};
         char *envp[] = {0};
-        if (kexecve("/bin/sh", sh_argv, envp) < 0) {
-            xputs("init: exec /bin/sh failed\n");
+        if (kexecve("/bin/lsh", lsh_argv, envp) < 0) {
+            xputs("init: exec /bin/lsh failed\n");
             kexit(1);
         }
     }

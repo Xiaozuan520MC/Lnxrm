@@ -17,6 +17,11 @@ KVM ?= $(shell test -r /dev/kvm && test -w /dev/kvm && echo --enable-kvm)
 MACHINE ?= q35
 GRUB_TIMEOUT ?= 0
 
+CMDLINE ?=
+ifneq ($(CMDLINE),)
+RUN_APPEND := -append "$(CMDLINE)"
+endif
+
 WARN    := -Wall -Wextra -Wno-unused-parameter
 MAKEFLAGS += --no-print-directory
 .DELETE_ON_ERROR:
@@ -34,7 +39,7 @@ OBJDIR := $(BUILD)/obj$(KTEST)
 
 MODE_MARK := $(BUILD)/.mode-$(KTEST)
 
-BASEFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+BASEFLAGS := -ffreestanding -fno-stack-protector -fno-omit-frame-pointer -fno-pic -fno-pie \
              -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
              -Os -g $(WARN) -Iinclude -I. -Iktest/include -MMD -MP \
              -ffunction-sections -fdata-sections $(KTEST_DEFS)
@@ -170,7 +175,7 @@ endif
 
 run: user build/bzImage $(RUN_DEPS)
 	@qemu-system-x86_64 $(KVM) -machine $(MACHINE) -m 256 -smp 2 -cpu qemu64,+smep,+smap \
-	  -kernel build/bzImage $(RUN_DRIVE) \
+	  -kernel build/bzImage $(RUN_APPEND) $(RUN_DRIVE) \
 	  -serial stdio -no-reboot -d int -D build/qemu.log
 ahci: run
 

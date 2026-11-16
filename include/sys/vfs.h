@@ -79,6 +79,17 @@ struct file {
     struct file_ops *ops;
     u64 pos;
     void *priv; /* vnode / device private */
+    /* Descriptor-private state for a flavour with NO backing vnode (the
+     * `private_data` of Linux's struct file): a pipe end points at its
+     * struct pipe, and the two ends of one pipe share it.  It sits apart
+     * from `priv` because `priv` names a struct vnode for the regular and
+     * directory flavours, and vfs_file_size()/vn_size_now()/mmap read
+     * vnode fields straight out of it -- a pipe's object is not a vnode,
+     * so reading it as one dereferences whatever bytes happen to sit at
+     * `ops`'s offset.  NULL for every other flavour, which is also what
+     * keeps C42's rule ("no vnode -> size 0") true at a glance: the only
+     * way to get a non-NULL `drv` is to have no `priv`. */
+    void *drv;
     bool is_dir;
     int flags;
     int refcnt;
@@ -174,6 +185,13 @@ long sys_stat(const char *path, struct lnxrm_stat *buf);
 /* C27: make every cached dirty sector durable before returning. */
 long sys_sync(void);
 long sys_rename(const char *uold, const char *unew);
+/* chdir(49): move the caller's cwd (kernel path, like sys_mkdir).  The
+ * target must exist and be a directory; "." and ".." are resolved
+ * lexically before the filesystem is asked anything. */
+long sys_chdir(const char *path);
+/* getcwd(50): the caller's cwd into ubuf, NUL-terminated.  0 on success,
+ * LNXRM_ERANGE when len cannot hold the whole answer. */
+long sys_getcwd(char *ubuf, size_t len);
 
 /* Capacity from an ATA IDENTIFY DEVICE data block, in 512-byte sectors.
  *

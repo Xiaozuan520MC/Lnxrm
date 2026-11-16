@@ -601,6 +601,10 @@ struct task *task_alloc_slot(void)
                 memset(task_table[i].sig_masks, 0, sizeof(task_table[i].sig_masks));
                 memset(&task_table[i].saved_tf, 0, sizeof(task_table[i].saved_tf));
                 task_table[i].sig_fault_rip = 0;
+                /* ...and never the previous occupant's working directory:
+                 * every task starts at "/" (sys_chdir is the only writer
+                 * of this field). */
+                strcpy(task_table[i].cwd, "/");
                 /* T-030: recycled slots start unprivileged.  Callers that
                  * know better overwrite this at once (fork inherits, spawn
                  * is root, idle is kxld) -- but a slot must never hand a

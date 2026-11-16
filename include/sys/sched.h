@@ -62,6 +62,13 @@ struct task {
     enum task_state state;
     char name[TASK_NAME_LEN];
     struct cred cred; /* T-030: privilege tier + uid (fork copies it) */
+    /* Working directory for relative paths (chdir 49 writes it, vfs.c's
+     * abs_path() reads it): absolute and lexically normalised, so "."
+     * and ".." never reach the filesystem.  Starts "/" -- a slot claim
+     * resets it (sched.c), fork copies it, exec keeps it (it describes
+     * the process, not the image).  A task that has none yet (early boot,
+     * before any claim) reads as "/" at the use site. */
+    char cwd[128];
 
     struct intr_frame *tf; /* points into kstack while in kernel */
     struct cpu_ctx ctx;

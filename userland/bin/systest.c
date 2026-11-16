@@ -1,6 +1,6 @@
 /* End-to-end coverage of every number in include/abi/lnxrm_syscalls.def.
  *
- * Live calls (45, numbered 0..44 with no holes), all exercised below:
+ * Live calls (51, numbered 0..50 with no holes), all exercised below:
  *    0 read      1 write     2 open      3 close     4 lseek     5 brk
  *    6 getdent   7 dup2      8 nanosleep 9 getpid   10 fork    11 execve
  *   12 exit     13 wait4    14 kill     15 uname    16 sigaction 17 sigprocmask
@@ -9,9 +9,16 @@
  *   28 unlink   29 rmdir    30 rename   31 setuid
  *   32 fb_flip  33 sync     34 kbd_get  35 kbd_inject 36 kbd_info
  *   37 mouse_get 38 mouse_info 39 input_pop 40 input_info 41 input_wait
- *   42 mmap     43 munmap   44 mprotect
+ *   42 mmap     43 munmap   44 mprotect 45 stat    46 gettimeofday 47 pipe
  *
- * Numbers above LNXRM_SYSCALL_LAST (44) are not in the table and must
+ * The three numbers appended 2026-11-15 are deliberately NOT called here:
+ * 48 reboot resets the machine on success (a self-test that worked would
+ * end the test), and 49 chdir / 50 getcwd belong to the shell's cd/pwd
+ * builtins -- driving them from inside this file would move THIS
+ * process's cwd out from under every step after it.  They are hand-
+ * driven from lsh instead.
+ *
+ * Numbers above LNXRM_SYSCALL_LAST (50) are not in the table and must
  * answer LNXRM_ENOSYS (-38) -- checked at the end.
  *
  * Expected values are printed as tag=value for an out-of-tree checker.
@@ -1215,6 +1222,38 @@ static void t_stat_time(void)
     say("time.bothnull", kgettimeofday(0, 0)); /* nothing asked: -22 */
 }
 
+/* ---- pipe 47: one round trip each way, then what each end's close
+ * promises -- EPIPE on the writer when the readers are gone, EOF on the
+ * reader once the writers are.  Nothing here can block: every write fits
+ * in the empty 4096-byte ring and every read finds bytes or a closed
+ * writer (the blocking paths are covered by ktest/t_pipe.c, which cannot
+ * park either -- the LAPIC timer is not running at that stage). ---- */
+static void t_pipe(void)
+{
+    int pf[2];
+    char pbuf[8];
+
+    say("pipe.ret", kpipe(pf));
+    say("pipe.ends", pf[0] >= 0 && pf[1] >= 0 && pf[0] != pf[1]);
+    say("pipe.write", kwrite(pf[1], "PI", 2));
+    say("pipe.read", kread(pf[0], pbuf, 4)); /* short read: 2 of 4 asked */
+    say("pipe.data", pbuf[0] == 'P' && pbuf[1] == 'I');
+
+    /* readers gone first: the next write answers EPIPE (no SIGPIPE number
+     * exists in this kernel's signal table) */
+    say("pipe.rdclose", kclose(pf[0]));
+    say("pipe.epipe", kwrite(pf[1], "X", 1) == LNXRM_EPIPE);
+    say("pipe.wrclose", kclose(pf[1]));
+
+    /* writer gone first: the reader drains what is there, then 0 = EOF */
+    say("pipe.ret2", kpipe(pf));
+    say("pipe.write2", kwrite(pf[1], "AB", 2));
+    say("pipe.wrclose2", kclose(pf[1]));
+    say("pipe.drain", kread(pf[0], pbuf, 4));
+    say("pipe.eof", kread(pf[0], pbuf, 4));
+    say("pipe.rdclose2", kclose(pf[0]));
+}
+
 /* ---- true-colour card: one swatch per named FB_CLR_* colour plus an
  * RGB gradient.  Colours are 0x00RRGGBB (never palette indices), so a
  * screendump of this band must match the table byte for byte. ---- */
@@ -1295,6 +1334,7 @@ int main(int argc, char **argv)
     t_mmap_surface();
     t_mmap_file();
     t_stat_time();
+    t_pipe();
 
     say("systest.done", 1);
     t_fb_swatch();

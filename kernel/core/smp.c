@@ -2,6 +2,7 @@
 #include <sys/apic.h>
 #include <sys/acpi.h>
 #include <sys/percpu.h>
+#include <sys/klog.h>
 #include <mm/mm.h>
 #include <sys/cpu.h>
 #include <console.h>
@@ -193,7 +194,7 @@ void smp_init(void)
     ipi_handler_install(IPI_VECTOR_RESCHEDULE, reschedule_ipi_handler);
     ipi_handler_install(IPI_VECTOR_STOP, stop_ipi_handler);
 
-    kprintf("[smp] BSP online, APIC ID=%u\n", apic_get_id());
+    klogf(LOG_DEBUG, "[smp] BSP online, APIC ID=%u\n", apic_get_id());
 
     s_next_cpu_id = 1;
     s_online_count = 1;
@@ -327,7 +328,7 @@ void ap_main(u32 ap_id)
 
     lapic_timer_start(32, HZ);
 
-    kprintf("[smp] AP%u online (APIC ID=%u)\n", ap_id, c->apic_id);
+    klogf(LOG_DEBUG, "[smp] AP%u online (APIC ID=%u)\n", ap_id, c->apic_id);
 
     /* Same idle protocol as the BSP: schedule first (picks up any task
      * already queued for us), then sti;hlt until the next IPI/tick. */

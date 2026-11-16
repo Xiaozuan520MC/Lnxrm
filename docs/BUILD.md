@@ -33,6 +33,7 @@ sudo apt install make clang lld llvm binutils nasm python3 \
 | `DISK=0` | `1` | 不挂盘，快速看早期启动日志 |
 | `MACHINE` / `KVM` | `q35` / 自动探测 | QEMU 机型；`/dev/kvm` 可用即加 `--enable-kvm` |
 | `INITRAMFS` | 空 | cpio 路径，编进内核 |
+| `CMDLINE` | 空 | `make run` 传给 QEMU `-append` 的内核命令行（内核解析 `loglevel=<0..3>`、`ktest=off\|continue`）；**空则不加 `-append`**，与不带它的旧行为逐位一致 |
 | `SMOKE_FLAGS` | 空 | 原样传给 `scripts/smoke_test.py`，如 `--smp 1` |
 
 ## 3. 构建流程与产物
@@ -52,7 +53,7 @@ build/user/* + README.md ──mkfs.vfat/mcopy──► build/disk.img
 
 - 源文件用 `find`/`wildcard` 自动发现：新增内核 `.c` 或 `userland/bin/*.c` 不用改 Makefile；头依赖由 `-MMD -MP` 的 `.d` 跟踪。
 - 对象按 `KTEST` 分目录（`build/obj0` / `build/obj1`），两种模式并存，`make` ↔ `make KTEST=1` 切换只重链一次（0.2 s、零 `CC`），不再全量重编 70 个 TU——旧的 `build/.ktest-mode-<n>` stamp 因此删除。**模式标记 `build/.mode-<n>` 必须挂在 `vmlinux.elf` 上、不能挂在对象上**：翻转后每个 `.o` 都比 elf 旧，标记不挂链上，`make` 就会认定上一模式的 `bzImage` 仍最新，把 `KTEST=1` 的内核当 `KTEST=0` 发给你；挂回对象上则又变回全量重编。**该规则还必须排在 `all:` 之后**——它是 Makefile 里第一个不以 `.` 开头的目标，写在 `all:` 前面会夺走默认目标，`make` 从此只检查这个标记、再也不建 `bzImage`。产物一律仍在 `build/` 根（`smoke_test.py` 硬编码 `bzImage`/`vmlinux.elf`/`setup.bin`/`disk.img`/`user/`），`make clean` 照旧整个删。
-- 关键标志：`-ffreestanding -fno-stack-protector -mno-red-zone -mno-sse* -mcmodel=kernel -O2 -g -ffunction-sections -fno-pic`；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`，链接 `-nostdlib -nostartfiles -static`（链接专用开关单独放 `USERLDFLAGS`，混进编译命令会被 clang 报 `-Wunused-command-line-argument`），链接在 `0x7f8000400000`。
+- 关键标志：`-ffreestanding -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone -mno-sse* -mcmodel=kernel -Os -g -ffunction-sections -fno-pic`（优化档是 **`-Os`** 而非 -O2；`-fno-omit-frame-pointer` 是 PP2 backtrace 的前提——`-Os` 下 clang 默认丢 rbp，帧指针走链会当场断掉）；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`，链接 `-nostdlib -nostartfiles -static`（链接专用开关单独放 `USERLDFLAGS`，混进编译命令会被 clang 报 `-Wunused-command-line-argument`），链接在 `0x7f8000400000`。
 - `vmlinux.elf` 查符号：`grep <sym> build/vmlinux.map` 或 `nm build/vmlinux.elf`。
 - `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；它在 `arch/kernel.ld` 里**显式摆成 `.trampoline` 段**（VMA = `.image` 末尾、LMA 紧随其后），不能留作孤儿段——GNU ld 与 ld.lld 对孤儿段的摆放不同，lld 会因 `.trampoline` 压在 `.bss` 负载地址上直接报 `load address range overlaps with .bss` 而拒链。`setup.bin` 依赖 `vmlinux.elf` 只为 `nm` 查 `_start32/64` 回填跳转；`patch_bzimage.py` 填 boot protocol 头并断言 `HdrS`/`0x55AA`/对齐。
 - 链接器与对象工具是 LLVM 一套（2026-11-14 换链：`ld` → `ld.lld`、`objcopy` → `llvm-objcopy`）。几个坑：lld 不认 GNU 的 `--no-warn-rwx-segments`（它本身也没有 RWX 段警告，直接删）；link map 要写成 `-Map <file>`（空格形式），`-Map=<file>` 不产文件。
@@ -85,6 +86,7 @@ qemu-system-x86_64 [--enable-kvm] -machine q35 -m 256 -smp 2 \
 ```
 
 - `-cpu` 必须显式 `+smep,+smap`：基础 qemu64 没有，内核 CPUID 门控会直接跳过这两项。
+- 要带内核命令行（如 `CMDLINE='loglevel=3'`）就用 `make run CMDLINE='…'`——它以 QEMU `-append` 传入；不设 `CMDLINE` 时不加该参数，启动输出与旧版一致。
 - `-m 256` 够用；要覆盖 2 GiB 管理窗口（`PMM_WINDOW_TOP`）的高地址路径需 `-m 2048`。
 - 无头环境加 `-display none`；AHCI 测试改 `if=ahci,id=ahci0`（已知问题见 GAP_ANALYSIS）。
 

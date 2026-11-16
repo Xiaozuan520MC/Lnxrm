@@ -1,11 +1,13 @@
 /* System call dispatch (int 0x80, nr in rax, args in rdi rsi r10). */
 #include <sys/vfs.h>
+#include <sys/pipe.h>
 #include <sys/sched.h>
 #include <sys/cpu.h>
 #include <sys/input.h>
 #include <sys/protect.h>
 #include <sys/rtc.h>
 #include <console.h>
+#include <io.h> /* reboot(48): the reset-line outb()s */
 #include <mm/mm.h>
 #include <mm/vma.h>
 #include <framebuffer.h>
@@ -814,6 +816,10 @@ static long h_getdent(struct intr_frame *f, u64 a3)
     return sys_getdent((int)f->rdi, (void *)f->rsi, a3);
 }
 static long h_dup2(struct intr_frame *f, u64 a3) { return sys_dup2((int)f->rdi, (int)f->rsi); }
+/* pipe is the one call whose single argument is a pointer to TWO slots the
+ * kernel fills, so it reads rdi and never touches a3 -- the register
+ * contract every other row already has. */
+static long h_pipe(struct intr_frame *f, u64 a3) { return sys_pipe((int *)f->rdi); }
 static long h_nanosleep(struct intr_frame *f, u64 a3)
 {
     return sys_nanosleep(f->rdi, (struct lnxrm_timespec *)a3);
@@ -932,6 +938,40 @@ static long h_input_wait(struct intr_frame *f, u64 a3)
     return sys_input_wait((struct lnxrm_input_event *)f->rdi, (u64)f->rsi);
 }
 
+/* ---- reboot(48): flush, then reset the machine ----
+ *
+ * The CAP_SYS_ADMIN gate lives on the dispatch ROW (GATE_ADMIN below), so
+ * only root ever reaches this function -- everything else gets -EACCES
+ * with the usual "[cap] denied" receipt, and lsh (which runs as root)
+ * sails through.
+ *
+ * Two reset doors, in the order the hardware offers them: 0x64/0xFE
+ * pulses the 8042 keyboard controller's reset line (QEMU and anything
+ * AT-compatible answers it), then 0xCF9 = 0x06 asks the chipset for a
+ * full reset (the port a box with no 8042 actually has).  If NEITHER
+ * answers, the CPU stops with interrupts off rather than returning: a
+ * reboot command that fell back to "carry on running" would be lying
+ * about having reset anything.  No path returns on success -- the gate
+ * is the only refusal a caller can ever see. */
+static long sys_reboot(void)
+{
+    kprintf("[sys] reboot: pid %u requested a reset\n", (unsigned)current->pid);
+    sys_sync(); /* FAT32 writes sit in blk_cache; a reset would drop them */
+    outb(0x64, 0xFE);  /* 8042: pulse the CPU reset line */
+    outb(0xCF9, 0x06); /* chipset: reset-request + full-reset bits */
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+/* chdir(49) / getcwd(50): what the shell's cd/pwd builtins call. */
+static long h_chdir(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, sys_chdir); }
+static long h_getcwd(struct intr_frame *f, u64 a3)
+{
+    return sys_getcwd((char *)f->rdi, (size_t)f->rsi);
+}
+/* reboot(48): by the time this runs the row's gate has already said yes,
+ * and the machine is on its way out instead of back here. */
+static long h_reboot(struct intr_frame *f, u64 a3) { return sys_reboot(); }
+
 /* The table itself, in lnxrm_syscalls.def order.  Rows are complete on
  * purpose: clang's -Wmissing-field-initializers (under -Wextra) flags a
  * partial one, so the two zero fields are spelled out rather than left. */
@@ -983,6 +1023,10 @@ static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
     [SYS_mprotect]  = { h_mprotect, 0, NULL },
     [SYS_stat]      = { h_stat, 0, NULL },
     [SYS_gettimeofday] = { h_gettimeofday, 0, NULL },
+    [SYS_pipe]      = { h_pipe, 0, NULL },
+    [SYS_reboot]    = { h_reboot, GATE_ADMIN, "reboot" },
+    [SYS_chdir]     = { h_chdir, 0, NULL },
+    [SYS_getcwd]    = { h_getcwd, 0, NULL },
 };
 
 /* Look the row up, refuse what the gates refuse, then run it.  Register

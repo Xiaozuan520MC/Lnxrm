@@ -174,6 +174,34 @@ static inline long kgettimeofday(struct lnxrm_timeval *tv, struct lnxrm_timezone
 static inline long ksync(void)
 { return syscall1(SYS_sync, 0); }
 
+/* reboot(48): flush the disk cache and reset the machine.  Gated
+ * CAP_SYS_ADMIN in the dispatch table, so a plain process gets -EACCES;
+ * the success path in the kernel does not return. */
+static inline long kreboot(void)
+{ return syscall1(SYS_reboot, 0); }
+
+/* chdir(49): move THIS task's working directory.  A shell's `cd` is a
+ * builtin because of exactly this: a forked child would chdir its own
+ * copy and take it along on exit, leaving the parent where it was. */
+static inline long kchdir(const char *path)
+{ return syscall1(SYS_chdir, (long)path); }
+
+/* getcwd(50): the cwd, NUL-terminated, into buf.  0 on success,
+ * LNXRM_ERANGE when len is too small to hold it. */
+static inline long kgetcwd(char *buf, size_t len)
+{ return syscall2(SYS_getcwd, (long)buf, (long)len); }
+
+/* pipe 47: a unidirectional byte stream.  Writes fds[0] (read end) and
+ * fds[1] (write end) and answers 0, or a negative errno (EFAULT when
+ * `fds` is not a writable user address, EMFILE when fewer than two
+ * descriptor slots are free, ENOMEM when the pipe cannot be allocated).
+ * read() on the write end and write() on the read end are EBADF.  A read
+ * on an empty pipe waits for a writer and answers 0 once every write end
+ * is closed; a write whose readers are all gone answers EPIPE (this
+ * kernel has no SIGPIPE number to raise alongside it). */
+static inline long kpipe(int fds[2])
+{ return syscall1(SYS_pipe, (long)fds); }
+
 /* keyboard 34-36: get drains one buffered key (EAGAIN when empty),
  * inject types bytes on the console's behalf -- both CAP_SYS_ADMIN;
  * info is the open counter reader (32-byte struct, see lnxrm_abi.h) */

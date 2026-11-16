@@ -1,7 +1,8 @@
 /* /bin/mv -- move a file or directory into another directory, or to a new
  * name when the destination is not a directory.  This is the usual mv
  * behaviour; the path join (destdir/<basename>) happens here, so the kernel
- * only ever sees SYS_rename. */
+ * only ever sees SYS_rename.  A plain rename is this same call with a
+ * destination that is not a directory, so one command covers both uses. */
 #include "ulib.h"
 
 /* Does `path` exist and is it a directory?  sys_getdent() rejects

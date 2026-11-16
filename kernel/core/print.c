@@ -2,6 +2,9 @@
 #include <sys/cpu.h>
 #include <io.h>
 #include <sys/spinlock.h>
+#include <sys/klog.h> /* klog_record / klog_shown: every message is filtered
+                       * and recorded here, in print.c, where the console
+                       * lock and the shared format buffer already live */
 #include <disk.h> /* C27: the panic door flushes staged sectors */
 #include <framebuffer.h> /* console_out_unlock ends each batch with fb_console_flush() */
 
@@ -391,17 +394,26 @@ static void putstr_unlocked(const char *s)
     while (*s) console_putc(*s++);
 }
 
-/* Format `fmt` and push it to the console WITHOUT taking print_lock.
- * vsnprintf does the formatting and console_putc is itself lock-free, so
- * the only thing skipped here is the serialization.  This is what panic()
- * must use: if the caller already holds print_lock (e.g. a BUG inside the
- * console path itself), taking it again would spin forever with interrupts
- * off instead of halting -- the exact self-deadlock T-002 describes. */
-void kvprintf_unlocked(const char *fmt, __builtin_va_list ap)
+/* Format `fmt` and push it to the console WITHOUT taking print_lock,
+ * tagging the message `lvl` for the klog ring.  vsnprintf does the
+ * formatting and console_putc is itself lock-free, so the only thing
+ * skipped here is the serialization -- and also the klog console filter:
+ * the unlocked path exists for emergencies (panic's message, the T-002
+ * probe), which must reach the console whatever loglevel says.  Taking
+ * print_lock here would spin forever with interrupts off whenever the
+ * caller already holds it (e.g. a BUG inside the console path itself) --
+ * the exact self-deadlock T-002 describes. */
+static void kvprintf_unlocked_lvl(int lvl, const char *fmt, __builtin_va_list ap)
 {
     static char kbuf[1024];
     vsnprintf(kbuf, sizeof(kbuf), fmt, ap);
+    klog_record(lvl, kbuf);
     for (char *s = kbuf; *s; s++) console_putc(*s);
+}
+
+void kvprintf_unlocked(const char *fmt, __builtin_va_list ap)
+{
+    kvprintf_unlocked_lvl(LOG_INFO, fmt, ap);
 }
 
 void kprintf_unlocked(const char *fmt, ...)
@@ -412,14 +424,35 @@ void kprintf_unlocked(const char *fmt, ...)
     __builtin_va_end(ap);
 }
 
-void kvprintf(const char *fmt, __builtin_va_list ap)
+/* The kprintf backend, with a level: format under print_lock (the shared
+ * kbuf needs it), hand the message to the ring, then emit only if the
+ * level clears the console filter -- the ring gets it either way.  The
+ * record goes in before the emit on purpose: its window is a plain
+ * memcpy, so a wedged UART down in console_putc can never be observed
+ * holding klog_lock. */
+static void kvprintf_lvl(int lvl, const char *fmt, __builtin_va_list ap)
 {
     static char kbuf[1024];
     u64 flags;
     console_out_lock(&flags);
     vsnprintf(kbuf, sizeof(kbuf), fmt, ap);
-    for (char *s = kbuf; *s; s++) console_putc(*s);
+    klog_record(lvl, kbuf);
+    if (klog_shown(lvl))
+        for (char *s = kbuf; *s; s++) console_putc(*s);
     console_out_unlock(flags);
+}
+
+void kvprintf(const char *fmt, __builtin_va_list ap) { kvprintf_lvl(LOG_INFO, fmt, ap); }
+
+/* Level-tagged printf (include/sys/klog.h).  Lives here rather than in
+ * klog.c because it needs print_lock and the format buffer -- klog.c owns
+ * the ring, print.c owns the console path. */
+void klogf(int lvl, const char *fmt, ...)
+{
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    kvprintf_lvl(lvl, fmt, ap);
+    __builtin_va_end(ap);
 }
 
 void kprintf(const char *fmt, ...)
@@ -449,12 +482,24 @@ __attribute__((noreturn)) void panic(const char *fmt, ...)
 
     /* Unlocked, bold-red path: works even if the caller holds print_lock.
      * Output may interleave with another CPU's print, but the machine is
-     * dying anyway -- halting beats a clean transcript. */
+     * dying anyway -- halting beats a clean transcript.  Logged at LOG_ERR:
+     * the ring's last record before the halt is the panic itself. */
     putstr_unlocked("\033[1;31m[PANIC] "); /* bold red */
     __builtin_va_start(ap, fmt);
-    kvprintf_unlocked(fmt, ap);
+    kvprintf_unlocked_lvl(LOG_ERR, fmt, ap);
     __builtin_va_end(ap);
     putstr_unlocked("\033[0m\n"); /* reset color */
+
+    /* Post-mortem (PP2): the ring tail first -- it is pre-crash history
+     * and must be read before anything below appends to the ring -- then
+     * the frame-pointer walk.  Both stay on the lock-free path (T-002:
+     * this may run with print_lock held), and the backtrace lines are
+     * recorded only after the dump, so they cannot pollute the tail. */
+    klog_dump(16);
+    uptr bt[16];
+    int n = backtrace(bt, 16);
+    kprintf_unlocked("[panic] backtrace: %d frame(s), resolve with `nm build/vmlinux.elf`\n", n);
+    for (int i = 0; i < n; i++) kprintf_unlocked("[panic]   #%d %p\n", i, bt[i]);
 
     /* The panic text sits in the back surface like any other console
      * output, and no tick will ever present it: interrupts are off and

@@ -22,6 +22,15 @@ enum lnxrm_errno {
     LNXRM_EINVAL = -22,
     LNXRM_EMFILE = -24,
     LNXRM_ENOSPC = -28,
+    /* write(2) to a pipe whose read end is gone.  Linux pairs it with
+     * SIGPIPE (13) -- this kernel's 13 is SIGSTOP and LNXRM_NR_SIGNALS is
+     * 14, so there is no signal number left to deliver: the call answers
+     * EPIPE and nothing is raised.  The number matches Linux so a program
+     * ported here can compare it literally. */
+    LNXRM_EPIPE = -32,
+    /* getcwd(50) asked for a buffer too small to hold the answer: Linux
+     * says ERANGE for exactly that, and -34 is Linux's number for it. */
+    LNXRM_ERANGE = -34,
     LNXRM_ENAMETOOLONG = -36,
     LNXRM_ENOSYS = -38,
     LNXRM_ENOTEMPTY = -39
@@ -43,7 +52,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  46
+#define LNXRM_SYSCALL_LAST  50
 
 /* mmap() protection bits (same values as Linux PROT_*, shared here so the
  * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */

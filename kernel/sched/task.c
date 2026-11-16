@@ -124,6 +124,7 @@ int sys_fork(void)
     ch->parent_pid = current->pid;
     ch->parent_gen = current->generation;
     ch->cred = current->cred; /* T-030: fork inherits the parent's tier */
+    strcpy(ch->cwd, current->cwd); /* cwd follows the process, like fds */
     ch->state = T_EMBRYO;
     ch->pml4 = vmm_new_user_aspace();
     if (!ch->pml4) { /* T-004: no frame for the root -> fork fails, not panics */

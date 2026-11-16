@@ -15,6 +15,7 @@
 #include <sys/apic.h>
 #include <sys/acpi.h>
 #include <sys/cpu.h>
+#include <sys/klog.h>
 #include <io.h>
 #include <mm/mm.h>
 #include <console.h>
@@ -123,8 +124,8 @@ void apic_init(void)
     apic_write(LAPIC_LVT_LINT1, 0x10000);
     apic_write(LAPIC_LVT_ERROR, 0x10000);
 
-    kprintf("[apic] %s base=%p ID=%u\n", s_x2apic ? "x2APIC MSR" : "MMIO",
-            (void *)phys, apic_get_id());
+    klogf(LOG_DEBUG, "[apic] %s base=%p ID=%u\n", s_x2apic ? "x2APIC MSR" : "MMIO",
+          (void *)phys, apic_get_id());
 }
 
 /* ---- IPI ---- */
@@ -192,8 +193,8 @@ void ioapic_init(void)
     u32 ver = ioapic_read(IOAPIC_VER);
     u32 max = (ver >> 16) & 0xFF;
     if (max == 0) max = 23;
-    kprintf("[ioapic] base=%p version=%u max_irq=%u\n",
-            (void *)(u64)phys, ver & 0xFF, max);
+    klogf(LOG_DEBUG, "[ioapic] base=%p version=%u max_irq=%u\n", (void *)(u64)phys,
+          ver & 0xFF, max);
 
     /* mask all IRQ lines */
     for (u32 i = 0; i <= max; i++) ioapic_mask_irq(i);

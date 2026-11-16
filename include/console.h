@@ -17,8 +17,11 @@ void console_out_unlock(u64 flags);
 
 /* Lock-free print path (T-002).  Formats and emits via console_putc WITHOUT
  * taking print_lock, so it works from a context that already holds the lock
- * -- a nested kprintf would deadlock.  panic() uses this; the ktest
- * test_panic_path_survives_held_lock pins the contract. */
+ * -- a nested kprintf would deadlock.  panic() uses this (its message goes
+ * through the same path at LOG_ERR); the ktest case
+ * test_unlocked_print_survives_held_lock pins the contract.  The unlocked
+ * path never applies the klog console filter: it exists for emergencies,
+ * which must be heard whatever the threshold is. */
 void kvprintf_unlocked(const char *fmt, __builtin_va_list ap);
 void kprintf_unlocked(const char *fmt, ...);
 
@@ -27,6 +30,13 @@ void kprintf_unlocked(const char *fmt, ...);
 int in_panic(void);
 
 void panic(const char *fmt, ...) __attribute__((noreturn));
+
+/* Frame-pointer backtrace (kernel/core/backtrace.c): fills `frames` with
+ * return addresses, newest first, and returns how many (0 = no walkable
+ * chain here).  Raw kernel text addresses -- resolve against
+ * `nm build/vmlinux.elf`.  Requires -fno-omit-frame-pointer (BASEFLAGS);
+ * panic() prints the result as part of its post-mortem. */
+int backtrace(uptr *frames, int max);
 
 /* ---- assertion infrastructure (T-010, live in kernel/core/selftest.c) ----
  * Three macros, one set of counters, one machine-readable verdict:

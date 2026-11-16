@@ -22,6 +22,7 @@
  * old or exotic firmware) is never fatal; it only means the caller keeps
  * its probe fallback. */
 #include <sys/acpi.h>
+#include <sys/klog.h>
 #include <console.h>
 #include <mm/mm.h> /* vmm_map_kernel_page, PG_P/PG_W */
 
@@ -267,10 +268,9 @@ void acpi_init(void)
         return;
     }
     parse_madt((const struct sdt_hdr *)s_madt);
-    kprintf("[acpi] RSDP %p rev %u, MADT @ %p: %u local APIC%s, IOAPIC @ %p\n",
-            (void *)r, r->revision, (void *)madt_pa, s_ap_count,
-            s_ap_count >= MAX_CPUS ? "s (capped)" : "s",
-            (void *)(u64)s_ioapic_base);
+    klogf(LOG_DEBUG, "[acpi] RSDP %p rev %u, MADT @ %p: %u local APIC%s, IOAPIC @ %p\n",
+          (void *)r, r->revision, (void *)madt_pa, s_ap_count,
+          s_ap_count >= MAX_CPUS ? "s (capped)" : "s", (void *)(u64)s_ioapic_base);
 }
 
 u32 acpi_collect_ap_ids(u32 *ids, u32 max)

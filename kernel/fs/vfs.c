@@ -160,9 +160,13 @@ int vfs_umount(const char *prefix)
 { return umount_prefix(prefix, "umount"); }
 
 /* Normalise a path: absolute paths pass through untouched (same pointer),
- * relative ones get '/' prefixed into `buf`.  A path that does not fit is
- * refused (NULL) rather than cut short -- a truncated path is a *different*
- * path, so the kernel would look up a file the caller never named (C46).
+ * relative ones are prefixed with the task's cwd into `buf` -- cwd + '/'
+ * + path, which is just '/' + path when the cwd is the root (the value
+ * every task starts at, and the only value possible before a task exists,
+ * so that is the shape the boot self-test pins).  A path that does not fit
+ * is refused (NULL) rather than cut short -- a truncated path is a
+ * *different* path, so the kernel would look up a file the caller never
+ * named (C46).
  * NULL means "no room": every caller turns it into LNXRM_ENAMETOOLONG.
  * `bufsz < 2` cannot hold "/" plus its terminator, which is the same
  * refusal; nothing is written in that case (every real caller passes
@@ -172,13 +176,26 @@ int vfs_umount(const char *prefix)
 static const char *abs_path(const char *path, char *buf, size_t bufsz)
 {
     if (path[0] == '/') return path;
-    if (bufsz < 2) return NULL;
-    buf[0] = '/';
-    size_t i;
-    for (i = 1; i < bufsz - 2 && path[i - 1]; i++) buf[i] = path[i - 1];
-    buf[i] = 0;
-    /* the loop stopped at the buffer, not at the end of the path -> no room */
-    if (i >= bufsz - 2 && path[i - 1]) return NULL;
+    const char *cwd = (current && current->cwd[0]) ? current->cwd : "/";
+    if (cwd[0] == '/' && cwd[1] == 0) {
+        /* cwd is "/": '/' + path, byte-for-byte what ktest/t_fs.c and
+         * t_prop.c pin (they run before any chdir could move a cwd). */
+        if (bufsz < 2) return NULL;
+        buf[0] = '/';
+        size_t i;
+        for (i = 1; i < bufsz - 2 && path[i - 1]; i++) buf[i] = path[i - 1];
+        buf[i] = 0;
+        /* the loop stopped at the buffer, not at the end of the path -> no room */
+        if (i >= bufsz - 2 && path[i - 1]) return NULL;
+        return buf;
+    }
+    /* cwd elsewhere: cwd + '/' + path under the same refusal rule (the
+     * fit test before any write, so a refusal leaves buf alone). */
+    size_t cl = strlen(cwd), plen = strlen(path);
+    if (cl + plen + 2 >= bufsz) return NULL;
+    memcpy(buf, cwd, cl);
+    buf[cl] = '/';
+    memcpy(buf + cl + 1, path, plen + 1);
     return buf;
 }
 
@@ -613,11 +630,88 @@ static long vfs_rename_path(const char *oldpath, const char *newpath)
 long sys_rename(const char *oldpath, const char *newpath)
 { return vfs_rename_path(oldpath, newpath); }
 
+/* ---- cwd: chdir(49) / getcwd(50) ----
+ *
+ * One field in struct task (sched.h) is the whole story: abs_path() above
+ * prepends it to every relative path, and chdir is the only writer.
+ * "." and ".." are resolved HERE, lexically, so the filesystem never sees
+ * them: fat_resolve_path() matches names with strcasecmp and has no idea
+ * what ".." means -- the dot records it writes exist for rmdir's emptiness
+ * scan, not as a path language.  The flip side, spelled out because it is
+ * a real behaviour: "/nope/.." is collapsed to "/" without ever proving
+ * /nope existed.  Whatever survives the walk is checked with a regular
+ * stat before the cwd moves, so you can only stand in a directory that
+ * exists and really is one. */
+long sys_chdir(const char *path)
+{
+    char abuf[128], nbuf[128];
+    struct vfs_attr a;
+
+    if (!path || !path[0]) return LNXRM_ENOENT; /* POSIX: "" is ENOENT */
+    const char *abs = abs_path(path, abuf, sizeof(abuf));
+    if (!abs) return LNXRM_ENAMETOOLONG;
+
+    /* lexical walk: skip "." and empty components, pop on "..", copy the
+     * rest -- each component arrives as '/' + name, so the answer is a
+     * normalised absolute path even when the input was not. */
+    size_t nl = 0;
+    nbuf[0] = 0;
+    const char *p = abs;
+    for (;;) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        size_t clen = (size_t)(p - s);
+        if (clen == 1 && s[0] == '.') continue;
+        if (clen == 2 && s[0] == '.' && s[1] == '.') {
+            while (nl > 0 && nbuf[nl - 1] != '/') nl--; /* drop the name */
+            if (nl > 0) nl--;                           /* and its '/' */
+            nbuf[nl] = 0;
+            continue;
+        }
+        if (nl + 1 + clen + 1 > sizeof(nbuf)) return LNXRM_ENAMETOOLONG;
+        nbuf[nl++] = '/';
+        memcpy(nbuf + nl, s, clen);
+        nl += clen;
+        nbuf[nl] = 0;
+    }
+    if (nl == 0) { nbuf[0] = '/'; nbuf[1] = 0; nl = 1; } /* ".", ".." at "/" */
+
+    long err = vfs_stat_path(nbuf, &a);
+    if (err < 0) return err;              /* ENOENT / EIO, as stat says */
+    if (a.type != V_DIR) return LNXRM_ENOTDIR;
+
+    memcpy(current->cwd, nbuf, nl + 1); /* nl counts the text, +1 the NUL */
+    return 0;
+}
+
+/* getcwd(50): the cwd back to user space, NUL-terminated.  Answers 0 on
+ * success (the kernel's usual "no news is good news") rather than Linux's
+ * byte count, and LNXRM_ERANGE when the caller's buffer cannot hold the
+ * whole answer -- a cwd never has a reason to exceed 127 bytes (chdir
+ * refuses the walk above at exactly that), so one 128-byte buffer always
+ * fits it. */
+long sys_getcwd(char *ubuf, size_t len)
+{
+    const char *cwd = (current && current->cwd[0]) ? current->cwd : "/";
+    size_t n = strlen(cwd);
+
+    if (!ubuf) return LNXRM_EFAULT;
+    if (n + 1 > len) return LNXRM_ERANGE;
+    if (copy_to_user(ubuf, cwd, n + 1) < 0) return LNXRM_EFAULT;
+    return 0;
+}
+
 long sys_read(int fd, void *ubuf, size_t n)
 {
     struct file *f = fd_get(fd);
     if (!f) return LNXRM_EBADF;
     if (f->is_dir) return LNXRM_EFAIL;
+    /* A descriptor whose flavour has no read door (the write end of a
+     * pipe) says EBADF before any pointer is touched -- the fd gate runs
+     * first, exactly as it does for a bad fd. */
+    if (!f->ops->read) return LNXRM_EBADF;
       /* Per-syscall stack buffer: a static kbuf would be shared by all tasks and
        * break under concurrent reads (SMP + preemption). */
     char kbuf[4096];
@@ -637,6 +731,9 @@ long sys_write(int fd, const void *ubuf, size_t n)
 {
     struct file *f = fd_get(fd);
     if (!f) return LNXRM_EBADF;
+    /* Symmetric with sys_read: no write door (the read end of a pipe) is
+     * EBADF, not a NULL call and not a silent success. */
+    if (!f->ops->write) return LNXRM_EBADF;
     char kbuf[4096];
     if (n > sizeof(kbuf)) n = sizeof(kbuf);
     if (copy_from_user(kbuf, ubuf, n) < 0) return LNXRM_EFAULT;
