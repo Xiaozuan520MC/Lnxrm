@@ -43,6 +43,15 @@
  * it runs from the table before the wrapper does, and the success path
  * resets the machine instead of returning.  A cwd lives in struct task
  * (sched.h); chdir is the only writer of it.
+ * shm_open/shm_unlink took 51/52 (2026-11-16, S0): named shared-memory
+ * objects.  Arity is three (shm_open(name, flags, size) -> fd) and one
+ * (shm_unlink(name)); both take the USER address of the name, so the row
+ * copies it with copy_user_str() exactly as open/unlink do, and neither
+ * carries a gate -- any process may share memory with any other.  The
+ * whole point of a SEPARATE number pair (rather than folding this into
+ * open/unlink) is that these names live in their own table, not on the
+ * volume: shm_open never touches the filesystem and shm_unlink never
+ * takes a path, so neither can be spelled as an ordinary file by mistake.
  *
  * Numbers are not the whole ABI: the ARITY of a call is too.  mmap (42)
  * grew from mmap(addr, len, prot) to the six-argument Linux shape
@@ -103,3 +112,5 @@ LNXRM_SYS(pipe, 47)
 LNXRM_SYS(reboot, 48)
 LNXRM_SYS(chdir, 49)
 LNXRM_SYS(getcwd, 50)
+LNXRM_SYS(shm_open, 51)
+LNXRM_SYS(shm_unlink, 52)

@@ -1,6 +1,6 @@
 /* End-to-end coverage of every number in include/abi/lnxrm_syscalls.def.
  *
- * Live calls (51, numbered 0..50 with no holes), all exercised below:
+ * Live calls (53, numbered 0..52 with no holes), all exercised below:
  *    0 read      1 write     2 open      3 close     4 lseek     5 brk
  *    6 getdent   7 dup2      8 nanosleep 9 getpid   10 fork    11 execve
  *   12 exit     13 wait4    14 kill     15 uname    16 sigaction 17 sigprocmask
@@ -18,7 +18,17 @@
  * process's cwd out from under every step after it.  They are hand-
  * driven from lsh instead.
  *
- * Numbers above LNXRM_SYSCALL_LAST (50) are not in the table and must
+ * The two appended 2026-11-16 (51 shm_open / 52 shm_unlink) are deliberately
+ * NOT called here either, for a milder version of the same reason: they
+ * publish state in a table of their own, so a tag this file printed about
+ * them would be a claim about an object OUTLIVING the process that made it
+ * -- and which of the two ends a later run's shell inherits is not this
+ * file's to promise.  Their behaviour (one struct file per name, both ends
+ * on one frame, unlink taking the name and not the object) is asserted
+ * kernel-side in ktest/t_shm.c instead, where the frame identity can be
+ * read directly rather than inferred from a printout.
+ *
+ * Numbers above LNXRM_SYSCALL_LAST (52) are not in the table and must
  * answer LNXRM_ENOSYS (-38) -- checked at the end.
  *
  * Expected values are printed as tag=value for an out-of-tree checker.

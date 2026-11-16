@@ -60,6 +60,11 @@ struct file_ops {
 #define O_WRONLY  1
 #define O_RDWR    2
 #define O_CREAT   0100
+/* shm_open(51)'s "fail if it already exists".  The value is Linux's, and
+ * LNXRM_O_CREAT / LNXRM_O_EXCL in abi/lnxrm_abi.h spell the same two
+ * numbers for userland (which cannot include this header) -- kernel/
+ * fs/shm.c asserts they agree. */
+#define O_EXCL    0200
 #define O_TRUNC   01000
 #define O_APPEND  02000
 #define O_CLOEXEC 010000
@@ -155,6 +160,16 @@ long vfs_read_file(struct file *f, void *buf, size_t n);
 long vfs_pread(struct file *f, void *buf, size_t n, u64 off);
 long vfs_pwrite(struct file *f, const void *buf, size_t n, u64 off);
 void vfs_close_file(struct file *f);
+/* C40's release door for the REGULAR flavour: hand the node back through
+ * fs_ops->close_node, then free the ~48-byte vnode copy the open took.
+ * vfs_close_file() calls it exactly once, from behind its refcount gate.
+ *
+ * Exported for kernel/fs/shm.c, whose descriptors share reg_fops' close
+ * but not its read/write doors -- a shared-memory object has no byte cursor
+ * for read()/write() to move (see shm_fops there).  It is a door, not an
+ * implementation detail: every caller must already hold the LAST reference,
+ * which is the only thing that makes "close_node runs exactly once" true. */
+int reg_close(struct file *f);
 
 /* What stat(2) needs from a path, gathered without leaving a descriptor (or
  * anything else) behind: one lookup, the numbers copied out, the filesystem's

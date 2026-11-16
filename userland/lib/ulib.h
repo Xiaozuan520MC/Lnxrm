@@ -202,6 +202,36 @@ static inline long kgetcwd(char *buf, size_t len)
 static inline long kpipe(int fds[2])
 { return syscall1(SYS_pipe, (long)fds); }
 
+/* shm_open(51): a NAMED shared-memory object, returned as an ordinary
+ * descriptor.  Pass LNXRM_O_CREAT|LNXRM_O_EXCL to create-or-fail, `size`
+ * (bytes, rounded up to a page) only when creating -- 0 on an existing
+ * object is the normal way to attach to one -- and nothing to attach.
+ *
+ *   kmmap_file(size, PROT_READ|PROT_WRITE, LNXRM_MAP_SHARED, fd, 0)
+ *
+ * then gives the mapping, and EVERY descriptor of one object maps to the
+ * SAME physical frames: a store through one mapping is visible through the
+ * other and through every fork of either.  O_RDONLY/O_WRONLY/O_RDWR are
+ * accepted and ignored (an object has one mode, O_RDWR, for everybody);
+ * any other flag bit is EINVAL.  Returns the descriptor, or -EINVAL (empty
+ * name, size 0, interior '/'), -ENAMETOOLONG (32 bytes or more), -ENOENT
+ * (no such object, no O_CREAT), -EEXIST (O_CREAT|O_EXCL and it exists),
+ * -ENOMEM (size above 1 GiB), -ENOSPC (64 objects already exist) or
+ * -EMFILE (no free slot).
+ *
+ * The object lives until kshm_unlink(): closing every descriptor does not
+ * destroy it, so the two ends of a rendezvous never have to overlap.  Note
+ * that read()/write() on this descriptor are EBADF by design -- the bytes
+ * live in the mapping, not behind a cursor. */
+static inline long kshm_open(const char *name, int flags, size_t size)
+{ return sys_call3(SYS_shm_open, (long)name, flags, (long)size); }
+
+/* shm_unlink(52): drop the NAME now; the object stays alive for whoever
+ * still holds a descriptor or a mapping of it.  0, or -ENOENT when no such
+ * name is in the table (already unlinked, or never created). */
+static inline long kshm_unlink(const char *name)
+{ return syscall1(SYS_shm_unlink, (long)name); }
+
 /* keyboard 34-36: get drains one buffered key (EAGAIN when empty),
  * inject types bytes on the console's behalf -- both CAP_SYS_ADMIN;
  * info is the open counter reader (32-byte struct, see lnxrm_abi.h) */

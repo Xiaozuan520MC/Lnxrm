@@ -28,10 +28,10 @@ kernel/                main.c(start_kernel 编排)
   irq/                 isr.c(分发/异常/IPI) apic.c acpi.c
   mm/                  pmm.c(buddy+帧引用计数) kheap.c vmm.c(三槽地址空间+W^X) vma.c pagefault.c
                        filepage.c(文件映射共享页缓存) oom.c(OOM killer)
-  fs/                  vfs.c pipe.c blk_cache.c mbr.c initramfs.c
+  fs/                  vfs.c pipe.c shm.c blk_cache.c mbr.c initramfs.c
   fs/fat32/            fat32.c fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
   drivers/             pci.c ide.c ahci.c uart.c ps2mouse.c framebuffer.c input_event.c
-ktest/                 启动自测：ktest.c 框架 + 28 个 t_*.c + include/（在仓库根）
+ktest/                 启动自测：ktest.c 框架 + 31 个 t_*.c + include/（在仓库根）
 userland/              Makefile + bin/ 16 个程序（lsh 解析 `|` 与 `<`/`>`、内建 cd/pwd；mv 兼做改名；cat 无参数读 stdin；ls 无参时 kgetcwd 取当前目录）+ lib/(crt0.S + ulib.c)
 scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_test.py
 ```
@@ -45,7 +45,8 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | `MAX_CPUS`/`NR_TASKS`/`NR_FDS` | 8/64/16 | `include/types.h` | `MAX_ORDER`/`MIN_ORDER_BITS` | 11/12（buddy 最大 4 MiB） | `pmm.c` |
 | `KSTACK_SIZE` | 32768 | `sys/sched.h` | `PMM_WINDOW_TOP` | `0x80000000`（2 GiB） | `mm/mm.h` |
 | `LNXRM_NR_SIGNALS` | 14（编号 1..13） | `lnxrm_abi.h` | `RESV_MAX`/`KHEAP_NBINS` | 8/9 | `pmm.c`/`mm.h` |
-| `LNXRM_SYSCALL_LAST` | 50（共 51 个） | `lnxrm_abi.h` | `CRED_USER_MEM_QUOTA_PAGES` | 64 MiB/4 KiB | `sys/cred.h` |
+| `LNXRM_SYSCALL_LAST` | 52（共 53 个） | `lnxrm_abi.h` | `CRED_USER_MEM_QUOTA_PAGES` | 64 MiB/4 KiB | `sys/cred.h` |
+| `LNXRM_SHM_MAX_SIZE`/`MAX_OBJECTS` | 1 GiB/64 | `sys/shm.h` | `LNXRM_SHM_NAME_MAX` | 32（含 NUL） | `sys/shm.h` |
 | `CACHE_ENTRIES`/`MAX_MOUNTS` | 64/4 | `disk.h`/`vfs.c` | `HZ`/`AP_STARTUP_TIMEOUT_MS` | 100/100 | `sys/cpu.h`/`sys/smp.h` |
 
 ## 2. 启动
@@ -110,7 +111,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 - 门：`GATE_ADMIN` 8 个 / `GATE_FB` 5 个，拒绝回 `EACCES=-13` 并打日志；**先能力门、后 `fb_owner_gate` 归属门**（顺序是硬的），`fb_info` 两道门都不过。走字符串的经 `copy_user_str`，走指针的调用方自校验——**没有统一前置检查**。
 - ABI 结构体（`lnxrm_abi.h`）：23 个 errno、信号号、`lnxrm_timespec` 16B / `utsname` 320B / `ps_entry` 48B / `dirent` 72B / `fb_info` 16B，`_Static_assert` 锁布局；**ABI 一改用户态必须全量重编**。
 
-### 51 项总表（编号 0–50，连续无空洞）
+### 53 项总表（编号 0–52，连续无空洞）
 
 | # | 名字 | 要点 | 实现 |
 |---|---|---|---|
@@ -133,15 +134,17 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 | 45–46 | `stat/gettimeofday` | 56 字节路径元数据（`st_dev` 槽从 1 起，`ino` 与 getdent 同号）；`tv` 微秒（CMOS 一次 + TSC 演进，单调）、`tz` 恒 0 | `core/syscall.c`+`fs/vfs.c`+`core/rtc.c` |
 | 47 | `pipe` | 单向字节流：4096 B 环 + 等待队列（空环读者/满环写者 park，close 末端产 EOF/EPIPE）；`file->drv` 存 `struct pipe *`，两端各一个 `file_ops` | `fs/pipe.c`+`fs/vfs.c` |
 | 48–50 | `reboot/chdir/getcwd` | 重启（`GATE_ADMIN`）；改 `task.cwd[128]`（≤127 字节，超 `ENAMETOOLONG`）即相对路径基准；把 cwd 拷回用户缓冲，装不下 `ERANGE` | `core/syscall.c`（48）+`fs/vfs.c`（49/50） |
+| 51–52 | `shm_open/shm_unlink` | **命名共享内存对象**：名字表项持唯一一个 `struct file`，所有 opener 同指针 ⇒ 共享页缓存天然一帧、MM 层零改动；entry 引用只由 unlink 放，`close_node` 恒在其后无条件 `kfree`（内容跨 close 存活）；mode 固定 `O_RDWR`、无 gate、`<32` 字节名 / 1 GiB / 64 对象 | `fs/shm.c`（+`include/sys/shm.h`） |
 
 统一输入队列（39–41）把两生产者的已解码结果合成一条流：`KEY` 只出自 IRQ1 解码（`kbd_inject` 不进队列），`REL/BTN/WHEEL` 出自 aux 包尾；34–38 的环与门原样保留。
 
 ## 6. 文件系统
 
-层次：`vfs.c`（vnode/file/fd 表/路径解析/挂载）→ `blk_cache.c`（64 项时间戳 LRU + `blk_io_*` **唯一驱动调用点**，C10 起还负责每设备请求队列）→ `mbr.c`/`initramfs.c` → `fat32/`（挂载/目录/文件/元数据/redo journal）。`pipe.c` 不在层次里——它没有 vnode、不走路由，直接挂在 fd 表上（见下）。
+层次：`vfs.c`（vnode/file/fd 表/路径解析/挂载）→ `blk_cache.c`（64 项时间戳 LRU + `blk_io_*` **唯一驱动调用点**，C10 起还负责每设备请求队列）→ `mbr.c`/`initramfs.c` → `fat32/`（挂载/目录/文件/元数据/redo journal）。`pipe.c` 与 `shm.c` 都不在层次里——前者没有 vnode、直接挂在 fd 表上，后者连路径都不走（名字在它自己的表里），见下。
 
 - **VFS 对象**：`vnode` 每次 open 在栈上创建拷贝（无持久 inode，两 fd 的 `pos` 独立，`ino/dev/ro` 供 `stat`）；`file` 走 kmalloc + CAS 引用计数（不回绕、不二次 free），**`priv` 与 `drv` 分开**——`priv` 是 `struct vnode *`（`vfs_file_size`/`vn_size_now`/`sys_mmap` 都解引用它），`drv` 是无 vnode flavour 的私有对象（`pipe` 端点存 `struct pipe *`），两者不会同时非 NULL；`fs_ops` 12 钩子（`size` 供 `O_APPEND`、`close_node` 由 fs 决定释放方式）。
 - **pipe（47，`fs/pipe.c`）**：`struct pipe` = 自旋锁 + 4096 B 环 + `rd/wr/used` + `nreaders/nwriters`（计**文件描述**，dup2/fork 共享一份、refcnt 归零才轮到 close 递减）+ `rwait/wwait`；两端各一个 `file_ops`（读端只有 `read`、写端只有 `write`，缺门回 `EBADF`）。等待队列前插单链复用 `task->wait_next`（与 input_event 的 evq 同字段，同一时刻只 park 一处）：push/unlink/detach 持 pipe 锁、**wake 必须锁外**（`sched_wake_task` 取 `runq_lock`，全仓不嵌套），每方向**唤醒全部**；park 协议同 `input_event_wait`（锁内入队 + `T_SLEEPING` + 出队 → `schedule()` → 锁内 unlink + 恢复 `T_RUNNING` → 重查条件）。写入醒读者、读腾空间醒写者、末端 close 悟醒对侧（EOF/EPIPE），**先 wake 再 `kfree`**；整笔写放得下才一次锁内落盘（`sys_write` 已钳 4096 = `PIPE_SZ`）。
+- **shm（51/52，`fs/shm.c` + `include/sys/shm.h`）**：32 桶名字哈希表（`shm_lock` irqsave），每个 `struct shm_ent` 持**唯一的一个 `struct file`**——`shm_open` 对已存在的名字只 `refcnt++` 交出同一指针。这一条选择让三件事自动成立、**MM 层零改动**：`mm/filepage.c` 以 file 指针作键故两个 opener 必然命中同一帧、`sys_mmap` 的 `!priv`/`V_REG` 门开、`vma_fork_shared` 复制的还是同一个 file。vnode 是合成的 `V_REG` 走 **`priv` 不走 `drv`**（C42 与 pipe 的标记不冲突）：`fs_ops.size` 是创建时页对齐**定死**的值、`read` 补零（首触那一页 `filepage` 要读）、`write` **返回 n 却不存字节**（让 `vma_writeback` 清 `PG_D` 而不是无限重试）；`file_ops` 只有 `.close = reg_close`（与常规文件共用 C40 那一扇门），`read/write/getdent = NULL` ⇒ `sys_read/write` 回 `EBADF`（所有 opener 共享一个游标，写也没有落点）。**生命周期两条线**：entry 自持一份 file 引用、**只有 `shm_unlink` 放**，故 `close_node` 必然发生在 unlink 之后，里面无条件 `kfree(ent)`（仍 named 则先摘表 + 警告）；副带**内容跨 close 存活**（POSIX，会合两端不必重叠 open 窗口）。两个顺序坑：`shm_unlink` 必须「锁内摘表置 `linked=false` → **解锁** → 才 `vfs_close_file`」（锁内触发 `close_node` 即自死锁）；`kmalloc` 放锁外、拿回后**二次查表**，输的那支直接 `kfree` 包装不走 `vfs_close_file`（否则会 close 一个 `shm_live` 没数过的 entry）。名字去前导 `/`、拒空与内部 `/`、`<32` 字节（`ENAMETOOLONG`）；`O_RDONLY/WRONLY/RDWR` 接受并忽略（mode 恒 `O_RDWR`，这样 `MAP_SHARED|PROT_WRITE` 谁开的都过写门），只认 `O_CREAT|O_EXCL`、其余位 `EINVAL`；1 GiB（`ENOMEM`）、64 对象（`ENOSPC`）、**无 gate**。51/52 不进 systest（`SYSTEST_TAGS` 173 条、smoke 总数不变），只落 `t_shm.c` 三例（全不阻塞）。
 - **路由**：`fs_for_path` 按**最长前缀 + 组件边界**选唯一挂载项（`"/"` 不吞 `/alt`），`ops` 与 `priv` 成对取自它；`vfs_umount` 只动路由**不 free priv**；跨挂载 `rename` 回 `EXDEV`；挂载入口只有 `vfs_mount_fs`/`vfs_umount`（**非 syscall**）。
 - **cwd（49/50）**：`struct task.cwd[128]` 是所有路径解析的基准——`abs_path()` 把相对路径拼在它之后（slot claim 置 `"/"`、`fork` 复制、`execve` 保留），故 open/stat/unlink/mkdir/… 无需逐个改动；`chdir` 解析存在性后整段替换，`getcwd` 只读拷回。`abs_path` **不折叠 `.`/`..`**（点段交给 `fat_resolve_path`，FAT 根无点记录故根上 `ls .` 仍 `ENOENT`，见 GAP 第 6 节）。
 - **错误契约**：`blk_io_*` 驱动非 0 原样上抛 → `fat_*_sector` 只有 0 或 `LNXRM_EIO` → 目录扫描三态 `1/0/负` → 语义层负数一路上传不被改写（对外 `[fat32] I/O error` + `-5`）。
@@ -172,18 +175,20 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 
 ## 9. 自测
 
-**ktest（`KTEST=1`；`make smoke` 强制，直跑 `smoke_test.py` 会绕过）**：框架 + 29 个 `t_*.c`，`KTEST(suite, stage, fn)` 注册，按 `EARLY/MM/LATE` 三阶段跑。当前判据（2026-11-15 `make smoke` 实测，pc + TCG）：
+**ktest（`KTEST=1`；`make smoke` 强制，直跑 `smoke_test.py` 会绕过）**：框架 + 31 个 `t_*.c`，`KTEST(suite, stage, fn)` 注册，按 `EARLY/MM/LATE` 三阶段跑。当前判据（2026-11-16 `make smoke` 实测，pc + TCG）：
 
 | 阶段 | cases | checks | failed |
 |---|---|---|---|
-| early | 25 | 389 | 0 |
+| early | 25 | 399 | 0 |
 | mm | 18 | 462 | 0 |
-| late | 112 | 3787 | 0 |
-| **合计** | **155** | **4638** | **0**（3 skipped、1 刻意 warn） |
+| late | 115 | 3893 | 0 |
+| **合计** | **158** | **4754** | **0**（3 skipped、1 刻意 warn） |
 
-35 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap klog ktest lib lock mbr mmap mouse oom pipe pmm prop stat syscall task usercopy vfs vmm`（含 late 的 `klog` 3 例、`pipe` 4 例；q35 档最近一次为 2026-11-13 的 148/4561）。重点钉点：OOM killer 四例、**W^X 逐段逐页**、`t_mmap` 十一例、`t_stat` 三例、**块队列 FIFO/每设备锁**、调度 FIFO/RR（由钉 LIFO 的旧用例改写）、**C7 锁外 I/O**、`t_klog` 三例、`t_pipe` 四例（**全不阻塞**——LAPIC timer 未起，park 即挂 boot）、AHCI 中断自测（无设备即 skip）。`MACHINE=pc` 同判据 0 failed。
+相对上一基线（155/4638）的 **+116 checks**：`shm` 三例 **+106**（late 3787→3893）、S0 的 51/52 让 `t_abi` 的 `.def` 逐项循环 **+4**、early 的 **+6** 是 2026-11-15 syscall 轮（48/49/50）当时只做编译层验证、未回写的账（389→395→399）。三轮（主跑 + 两轮 forged）late 在 3893/3894 间有 **±1** 的运行期条件检查波动。
 
-**smoke（`make smoke`，六阶段）**：`toolchain → build → artifacts → boot（21 条有序 marker）→ shell（串口驱动 /bin/lsh + systest 173 条 `SYSTEST_TAGS`）→ forged FAT`。ABI 常量从 `lnxrm_abi.h` **现读**（`abi_define()`，`past.*` 按 `SYSCALL_LAST` 现算），判据一律 `br""`、负面判据禁 `WARN(`/`[PANIC]`；**程序名从不进判据**——按 `userland/bin/*.c` 现场发现、shell 只认 `root@lnxrm$ ` 提示符，故 `sh`→`lsh`、`rn`→并入 `mv` 零影响（`smoke_test.py` 头注释里的 `/bin/sh` 是红线不可改的过时描述）。当前 **270/270**（2026-11-15 两轮复验），transcript 在 `build/smoke/serial.log`；高负载下 TCG boot 可超 420 s 等待门，配 `--timeout 900` **只放宽等待、判据不变**；`--repeat N` 连跑门（失败轮留档 `serial-fail-<i>.log`）**`--repeat 2` = 487/487**。已知偶发（重跑即绿）：IDE `0xE7` FLUSH 瞬时失败 → 按 C55 报 EIO → 启动期 `blkcache` panic，**早于任何用户态**，判据与驱动都不该为此改。
+36 个 suite：`abi ahci blk blkcache blkio boot console cpu cred draw elf fat32 fatfile fb input jrn kbd kheap klog ktest lib lock mbr mmap mouse oom pipe pmm prop shm stat syscall task usercopy vfs vmm`（含 late 的 `klog` 3 例、`pipe` 4 例、`shm` 3 例；q35 档最近一次为 2026-11-13 的 148/4561）。重点钉点：OOM killer 四例、**W^X 逐段逐页**、`t_mmap` 十一例、`t_stat` 三例、**块队列 FIFO/每设备锁**、调度 FIFO/RR（由钉 LIFO 的旧用例改写）、**C7 锁外 I/O**、`t_klog` 三例、`t_pipe` 四例（**全不阻塞**——LAPIC timer 未起，park 即挂 boot）、`t_shm` 三例（**全不阻塞**；两次独立 `shm_open` 必须同 `struct file` 同帧、unlink 只走名字、内容跨 close 存活）、AHCI 中断自测（无设备即 skip）。`MACHINE=pc` 同判据 0 failed。
+
+**smoke（`make smoke`，六阶段）**：`toolchain → build → artifacts → boot（21 条有序 marker）→ shell（串口驱动 /bin/lsh + systest 173 条 `SYSTEST_TAGS`）→ forged FAT`。ABI 常量从 `lnxrm_abi.h` **现读**（`abi_define()`，`past.*` 按 `SYSCALL_LAST` 现算），判据一律 `br""`、负面判据禁 `WARN(`/`[PANIC]`；**程序名从不进判据**——按 `userland/bin/*.c` 现场发现、shell 只认 `root@lnxrm$ ` 提示符，故 `sh`→`lsh`、`rn`→并入 `mv` 零影响（`smoke_test.py` 头注释里的 `/bin/sh` 是红线不可改的过时描述）。当前 **270/270**（2026-11-16 S0 轮实测，`past.53/54/55` 自动前移），transcript 在 `build/smoke/serial.log`；高负载下 TCG boot 可超 420 s 等待门，配 `--timeout 900` **只放宽等待、判据不变**；`--repeat N` 连跑门（失败轮留档 `serial-fail-<i>.log`）**`--repeat 2` = 487/487**（2026-11-15 实测，S0 轮未复跑）。已知偶发（重跑即绿）：IDE `0xE7` FLUSH 瞬时失败 → 按 C55 报 EIO → 启动期 `blkcache` panic，**早于任何用户态**，判据与驱动都不该为此改。
 
 **systest（`userland/systest.c`）**：按 syscall 编号分节的全量自检（38 个 `t_*` 函数 + 54 行 main），末尾 `systest.done=1`，由 smoke 的 shell 阶段驱动。
 
@@ -209,6 +214,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py mkinitramfs.py smoke_
 - 信号只在 `iretq` 前带 ring-3 守卫处投递，一次一帧；**`current->tf` 只发布 ring-3 帧**；restorer 页是唯一 `exec=true` 的用户页。
 - `blk_io_read/write` 是全内核唯一调 `dev->read/write` 的地方（ktest-only 的 AHCI 中断自测除外）；驱动函数只在 `blk_drain_locked()` 持**该设备** `io_lock` 时执行，嵌套恒为「分区 → 父盘」；**FAT 区永不进块缓存**，一个扇区只走一条读写路，FAT 表只走三个 helper。
 - 路径路由只认**最长前缀 + 组件边界**，`ops`/`priv` 成对取自它；`vfs_close_file` 只减真有的引用；`vfs_umount` 不 free priv；`blk_register` 满槽大声拒绝且表不变。
+- shm 是两条线一扇门：表项那份 file 引用**只由 `shm_unlink` 放**，故 `close_node` 恒在 unlink **之后**触发并无条件 `kfree(ent)`；`shm_unlink` 必须「锁内摘表 → **解锁** → `vfs_close_file`」，`kmalloc` 必须在锁外并**二次查表**（输者直接 `kfree`，不走 `vfs_close_file`）。
 - IDE 与 AHCI 的写都以 `0xE7` CACHE FLUSH 收尾并**检查返回值**。
 - journal `commit` 第 ④ 步失败必须**保留 COMMIT**；失败路径也必须 commit。
 - EOI 必须在 handler **之前**写；IPI 向量必须显式盖过 catch-all。

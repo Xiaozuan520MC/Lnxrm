@@ -875,8 +875,9 @@ static int dir_close(struct file *f)
 /* C40: a regular file's close releases everything the open took: the fs
  * node (the fs decides how, via close_node) and the ~48-byte vnode copy
  * here.  The refcount gate in vfs_close_file guarantees this runs exactly
- * once. */
-static int reg_close(struct file *f)
+ * once.  Exported (include/sys/vfs.h) for kernel/fs/shm.c, which shares
+ * this door but not reg_fops' read/write. */
+int reg_close(struct file *f)
 {
     struct vnode *vn = f->priv;
     if (vn && vn->ops && vn->ops->close_node)

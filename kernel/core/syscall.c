@@ -1,6 +1,7 @@
 /* System call dispatch (int 0x80, nr in rax, args in rdi rsi r10). */
 #include <sys/vfs.h>
 #include <sys/pipe.h>
+#include <sys/shm.h>
 #include <sys/sched.h>
 #include <sys/cpu.h>
 #include <sys/input.h>
@@ -972,6 +973,20 @@ static long h_getcwd(struct intr_frame *f, u64 a3)
  * and the machine is on its way out instead of back here. */
 static long h_reboot(struct intr_frame *f, u64 a3) { return sys_reboot(); }
 
+/* shm_open(51) / shm_unlink(52): the name arrives as a USER address, so it
+ * is copied out here exactly as open(2)/unlink(2) copy theirs -- copy_user_str
+ * answers EFAULT for a pointer ring 3 could not have named, and truncates a
+ * too-long one rather than failing it, which sys_shm_open's own bound then
+ * answers ENAMETOOLONG for (31 usable bytes is far inside its 128).  shm_unlink
+ * is one argument and a plain path function, so it reuses path_syscall. */
+static long h_shm_open(struct intr_frame *f, u64 a3)
+{
+    char name[128];
+    if (copy_user_str(name, f->rdi, sizeof(name)) != 0) return LNXRM_EFAULT;
+    return sys_shm_open(name, (int)f->rsi, a3);
+}
+static long h_shm_unlink(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, sys_shm_unlink); }
+
 /* The table itself, in lnxrm_syscalls.def order.  Rows are complete on
  * purpose: clang's -Wmissing-field-initializers (under -Wextra) flags a
  * partial one, so the two zero fields are spelled out rather than left. */
@@ -1027,6 +1042,12 @@ static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
     [SYS_reboot]    = { h_reboot, GATE_ADMIN, "reboot" },
     [SYS_chdir]     = { h_chdir, 0, NULL },
     [SYS_getcwd]    = { h_getcwd, 0, NULL },
+    /* 51/52: no gate.  Sharing memory is not a privileged act, and unlike
+     * open/unlink these never name anything on a volume -- the table they
+     * look in is their own (kernel/fs/shm.c), so there is no path a caller
+     * could aim at /etc to worry about. */
+    [SYS_shm_open]  = { h_shm_open, 0, NULL },
+    [SYS_shm_unlink] = { h_shm_unlink, 0, NULL },
 };
 
 /* Look the row up, refuse what the gates refuse, then run it.  Register

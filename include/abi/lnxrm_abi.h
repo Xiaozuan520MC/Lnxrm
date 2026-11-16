@@ -52,7 +52,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  50
+#define LNXRM_SYSCALL_LAST  52
 
 /* mmap() protection bits (same values as Linux PROT_*, shared here so the
  * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */
@@ -75,6 +75,22 @@ enum lnxrm_syscall_number {
 #define LNXRM_MAP_SHARED  0x01
 #define LNXRM_MAP_PRIVATE 0x02
 #define LNXRM_MAP_FLAGS   (LNXRM_MAP_SHARED | LNXRM_MAP_PRIVATE)
+
+/* shm_open(51) flags -- the POSIX/O_CREAT pair, at their POSIX (== Linux)
+ * values.  They live here rather than in sys/vfs.h because sys/vfs.h is a
+ * kernel header userland cannot include (it drags in the spinlock), and
+ * the two flags a shared-memory object understands are part of the ABI
+ * every program links against.  kernel/fs/shm.c pins this pair to sys/
+ * vfs.h's own O_CREAT/O_EXCL with a static assertion, so the two spellings
+ * cannot drift apart.
+ *
+ * O_RDONLY/O_WRONLY/O_RDWR are accepted by shm_open and IGNORED: an object
+ * has one access mode, O_RDWR, shared by every opener -- which is what lets
+ * mmap(MAP_SHARED|PROT_WRITE) pass sys_mmap's "is this descriptor open for
+ * writing?" gate no matter who created it.  Anything else in `flags` is
+ * EINVAL rather than silently dropped. */
+#define LNXRM_O_CREAT 0100
+#define LNXRM_O_EXCL  0200
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
