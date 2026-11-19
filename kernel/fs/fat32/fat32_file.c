@@ -394,8 +394,7 @@ u64 fat_size_impl(void *mnt, void *node)
 }
 
 /* C40: the fs node a lookup handed out is the fs's to release -- the VFS
- * close path calls this instead of guessing at heap ownership (an
- * initramfs node, for instance, is a slice of one array). */
+ * close path calls this instead of guessing at heap ownership. */
 void fat_close_node_impl(void *mnt, void *node)
 {
     (void)mnt;

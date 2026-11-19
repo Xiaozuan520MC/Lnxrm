@@ -52,7 +52,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  52
+#define LNXRM_SYSCALL_LAST  55
 
 /* mmap() protection bits (same values as Linux PROT_*, shared here so the
  * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */
@@ -91,6 +91,22 @@ enum lnxrm_syscall_number {
  * EINVAL rather than silently dropped. */
 #define LNXRM_O_CREAT 0100
 #define LNXRM_O_EXCL  0200
+
+/* dipc_recv(54) / dipc_send(55) flags (S1).  LNXRM_DIPC_NONBLOCK is the
+ * one bit dipc_recv understands: an empty channel answers -EAGAIN instead
+ * of parking the caller.  dipc_open takes no flags at all (anything but 0
+ * is EINVAL) and dipc_send takes none either -- a sink has no ordering
+ * mode to choose -- so this is the whole flag surface.
+ *
+ * LNXRM_DIPC_RING_SIZE is here rather than in sys/dipc.h because both
+ * sides of the channel compile against it: the kernel that owns the ring
+ * and the ring3 driver (.km) that maps the very same page.  It is exactly
+ * one frame, which is what lets the whole ring live in one shared page and
+ * one file offset -- kernel/ipc/dipc.c pins that equality with a static
+ * assertion.  Capacity is one byte less (a full ring is `next(wr) == rd`),
+ * spelled LNXRM_DIPC_CAPACITY in sys/dipc.h. */
+#define LNXRM_DIPC_NONBLOCK  0x01
+#define LNXRM_DIPC_RING_SIZE 4096
 
 /* Compile-time guard: every number in the .def must fit in [FIRST, LAST].
  * `1 / (cond)` is a constant expression, so a stale LNXRM_SYSCALL_LAST
@@ -199,15 +215,14 @@ LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_timespec) == 16, "timespec ABI");
  *             is mounted).  Two paths sharing a st_dev share a volume.
  *  - st_ino:  a number stable for this file across reboots on the same
  *             volume -- FAT32 packs (containing cluster, byte offset of
- *             its 8.3 record), initramfs its archive slot, 0 only where
- *             the node is not backed by a record at all (a mount root,
- *             a synthesised device).
+ *             its 8.3 record), 0 only where the node is not backed by a
+ *             record at all (a mount root, a synthesised device).
  *  - st_mode: LNXRM_S_IF* | permission bits.  FAT32 has no mode bits, so
  *             the type is what the directory entry says and the
  *             permissions are the FILE's read-only attribute widened to
  *             the usual owner/group/other triple (0555 read-only, 0755
  *             otherwise); a synthesised device node reports 0666.
- *  - st_nlink: always 1 here -- neither FAT32 nor initramfs has hard
+ *  - st_nlink: always 1 here -- FAT32 has no hard
  *             links, and reporting 0 would tell every caller the file is
  *             already gone.
  *  - st_uid/st_gid: always 0 for now: this kernel has no per-file owner
@@ -451,7 +466,7 @@ struct lnxrm_ps_entry {
     int32_t ppid;
     int32_t cpu;   /* -1 when the task is not running anywhere */
     int32_t state; /* enum lnxrm_task_state */
-    char name[16];
+    char name[24]; /* >= TASK_NAME_LEN, or ps truncates what exec stored */
     int32_t kind; /* enum lnxrm_cred_kind (T-030) */
     int32_t uid;
     /* T-032: what the task's user space costs right now, and the largest
@@ -463,7 +478,7 @@ struct lnxrm_ps_entry {
     int32_t peak_kib;
 };
 
-LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_ps_entry) == 48, "ps ABI");
+LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_ps_entry) == 56, "ps ABI");
 
 struct lnxrm_dirent {
     uint64_t d_ino; /* filesystem object id; 0 only if the fs has none */

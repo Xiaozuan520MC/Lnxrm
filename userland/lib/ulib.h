@@ -232,6 +232,37 @@ static inline long kshm_open(const char *name, int flags, size_t size)
 static inline long kshm_unlink(const char *name)
 { return syscall1(SYS_shm_unlink, (long)name); }
 
+/* dipc_open(53): attach to a driver channel that the KERNEL created --
+ * there is no dipc_create call, because which drivers exist is a kernel
+ * decision, not a process's, and eight channels is the whole table.
+ * `flags` must be 0 (a channel has no mode or creation flag to choose).
+ *
+ * Returns the descriptor, or -EACCES (this row carries CAP_SYS_ADMIN, and
+ * root holds it by construction), -ENOENT (no such channel), -EINVAL (empty
+ * name, interior '/', a non-zero flag), -ENAMETOOLONG (32 bytes or more) or
+ * -EMFILE.  The descriptor is an ordinary one: kmmap_file() maps the
+ * channel's ring page, fork() hands it along, close() releases it -- and
+ * read()/write() on it are EBADF, because the bytes live in the ring, not
+ * behind a cursor. */
+static inline long kdipc_open(const char *name, long flags)
+{ return syscall2(SYS_dipc_open, (long)name, flags); }
+
+/* dipc_recv(54): take up to `len` bytes (1..LNXRM_DIPC_RECV_MAX) out of the
+ * channel and into buf.  Returns the count (>= 1), -EAGAIN when the ring is
+ * empty and LNXRM_DIPC_NONBLOCK was passed, -EINTR when an actionable signal
+ * cut the wait short, or -EINVAL (len 0 or too large, an unknown flag),
+ * -EFAULT (buf not writable), -EBADF (not a channel).  Blocking on an empty
+ * channel is the default -- the driver's main loop lives here. */
+static inline long kdipc_recv(int fd, void *buf, size_t len, long flags)
+{ return sys_call6(SYS_dipc_recv, fd, (long)buf, (long)len, flags, 0, 0); }
+
+/* dipc_send(55): the driver's answer -- `len` bytes (1..1024) handed to the
+ * sink this channel was created with, which is kernel code.  Returns what
+ * the sink returned, or -EINVAL (len 0 or too large, a flag, or a channel
+ * with no sink), -EFAULT, -EBADF.  Flags must be 0. */
+static inline long kdipc_send(int fd, const void *buf, size_t len, long flags)
+{ return sys_call6(SYS_dipc_send, fd, (long)buf, (long)len, flags, 0, 0); }
+
 /* keyboard 34-36: get drains one buffered key (EAGAIN when empty),
  * inject types bytes on the console's behalf -- both CAP_SYS_ADMIN;
  * info is the open counter reader (32-byte struct, see lnxrm_abi.h) */

@@ -344,9 +344,6 @@ void start_kernel(void)
 
     vfs_init();
 
-    /* try IDE first (QEMU built-in), then AHCI */
-    extern void ide_init(void);
-    ide_init();
     ahci_init();
     /* C51: three outcomes, and they are not two -- a disk that mounted but
      * carries no /bin/init is placed at /mnt..., which is neither "we boot
@@ -358,10 +355,6 @@ void start_kernel(void)
     else
         kprintf("[vfs] no disk found\n");
 
-    if (!vfs_root_ready() || !vfs_file_exists("/bin/init")) {
-        if (vfs_mount_initramfs() == 0) kprintf("[vfs] initramfs mounted at /\n");
-    }
-
     do_global_ctors();
 
     sched_init();
@@ -370,6 +363,23 @@ void start_kernel(void)
     ktest_run(KTEST_LATE);
     ktest_summary();
 #endif
+
+    /* S1b: bind the raw input streams to the ring3 readers in /mod.
+     *
+     * Placed HERE rather than next to ps2_kbd_init()/ps2_mouse_init() on
+     * purpose.  Each channel would otherwise take one of the eight dipc
+     * slots, and t_dipc's capacity valve measures exactly those eight (it
+     * fills the table to LNXRM_DIPC_MAX and expects the ninth to answer
+     * ENOSPC) -- creating them earlier turns that case into a red herring
+     * instead of a test.  This is also after every allocator the channels
+     * need (kmalloc, the ring frames) is up and before pid 1, so init's
+     * /mod scan finds channels that already answer.
+     *
+     * Until these lines dipc_push_if_listening("kbd")/("mouse") answer
+     * false: no channel of that name exists, so the IRQ stubs decode
+     * locally and nothing is lost -- there was no ring3 reader yet. */
+    kbd_decode_init();
+    mouse_decode_init();
 
     if (kernel_spawn("/bin/init") < 0) {
         kprintf("\033[34mStop!\033[0m\n");

@@ -12,7 +12,7 @@
  *    shift/capslock state as flags.  Break codes and shift/capslock
  *    themselves produce nothing, and the kbd_inject 35 path types console
  *    bytes only -- synthetic terminal input is not a keystroke.
- *  - ms_feed_byte (ps2mouse.c): one packet becomes at most three events,
+ *  - ms_feed_byte (ps2-mouse.c): one packet becomes at most three events,
  *    in the order BTN, REL, WHEEL: a BTN only when the button mask
  *    changed (a packet that repeats a held button is not a click), a REL
  *    only when the packet moved, a WHEEL only when it scrolled.  A packet

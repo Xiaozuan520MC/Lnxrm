@@ -45,7 +45,7 @@ BASEFLAGS := -ffreestanding -fno-stack-protector -fno-omit-frame-pointer -fno-pi
              -ffunction-sections -fdata-sections $(KTEST_DEFS)
 KERNFLAGS := $(BASEFLAGS) -std=gnu11
 
-.PHONY: all clean run user smoke imageiso initramfs help
+.PHONY: all clean run user mod smoke imageiso help
 all: $(BUILD)/bzImage
 
 KASM_ALL := $(shell find arch -name '*.S' 2>/dev/null)
@@ -63,6 +63,10 @@ KTEST_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(KTEST_SRC_C))
 
 USER_PROGS := $(notdir $(basename $(wildcard userland/bin/*.c)))
 USER_ELFS  := $(addprefix $(BUILD)/user/,$(USER_PROGS))
+
+MOD_PROGS := $(notdir $(basename $(wildcard userland/mod/*.c)))
+
+MOD_ELFS  := $(addprefix $(BUILD)/mod/,$(addsuffix .km,$(MOD_PROGS)))
 
 # ---- kernel rules -------------------------------------------------------
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
@@ -94,15 +98,16 @@ KOBJ_C   := $(KERN_OBJS) $(ARCH_C_OBJS) $(KTEST_OBJS)
 KOBJ_ASM := $(ARCH_S_OBJS) $(OBJDIR)/trampoline.o
 KOBJ     := $(KOBJ_C) $(KOBJ_ASM)
 
-INITRAMFS ?=
-ifneq ($(INITRAMFS),)
-KOBJ += $(BUILD)/initramfs.o
-endif
-
 user:
 	@$(MAKE) -C userland BUILD=$(abspath $(BUILD))
 
+mod:
+	@$(MAKE) -C userland BUILD=$(abspath $(BUILD)) mod
+
 $(USER_ELFS): $(BUILD)/user/%: userland/bin/%.c userland/lib/ulib.c userland/lib/crt0.S | user
+	@test -f $@
+
+$(MOD_ELFS): $(BUILD)/mod/%.km: userland/mod/%.c userland/lib/ulib.c userland/lib/crt0.S | mod
 	@test -f $@
 
 $(BUILD):
@@ -114,23 +119,6 @@ $(OBJDIR):
 $(MODE_MARK): | $(BUILD)
 	@rm -f $(BUILD)/.mode-*
 	@touch $@
-
-$(BUILD)/ifsrc/.stamp: $(USER_ELFS) $(BUILD)/README.md | $(BUILD)
-	@rm -rf $(BUILD)/ifsrc
-	@mkdir -p $(BUILD)/ifsrc/bin
-	@cp $(USER_ELFS) $(BUILD)/ifsrc/bin/
-	@cp $(BUILD)/README.md $(BUILD)/ifsrc/
-	@touch $@
-
-$(BUILD)/initramfs.cpio: $(BUILD)/ifsrc/.stamp scripts/mkinitramfs.py
-	@$(PYTHON3) scripts/mkinitramfs.py $@ $(BUILD)/ifsrc
-
-$(BUILD)/initramfs.o: $(INITRAMFS) | $(BUILD)
-	@printf "  OBJCOPY $(SHORT) (initramfs %s)\n" "$$(stat -c%s $< 2>/dev/null || echo '?') bytes"
-	@$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
-	  --rename-section .data=.initramfs,alloc,load,readonly,data,contents $< $@
-
-initramfs: $(BUILD)/initramfs.cpio
 
 $(BUILD)/vmlinux.elf: $(KOBJ) $(ARCHDIR)/kernel.ld $(MODE_MARK)
 	@printf "  LD      $(SHORT)\n"
@@ -162,10 +150,11 @@ help:
 	@echo make
 	@echo make clean
 	@echo make user
+	@echo make mod
 	@echo make run
 	@echo make smoke
 	@echo make imageiso
-	@echo make INITRAMFS=build/initramfs.cpio
+	@echo make mod
 
 DISK ?= 1
 ifeq ($(DISK),1)
@@ -179,10 +168,12 @@ run: user build/bzImage $(RUN_DEPS)
 	  -serial stdio -no-reboot -d int -D build/qemu.log
 ahci: run
 
+SMOKE_QEMU_ARGS ?= -machine q35
+
 smoke:
 	@echo "smoke: forcing KTEST=1 (self-test markers are what it checks)"
 	@MAKEFLAGS="$(filter-out KTEST=%,$(MAKEFLAGS))" KTEST=1 \
-	  $(PYTHON3) scripts/smoke_test.py $(SMOKE_FLAGS)
+	  $(PYTHON3) scripts/smoke_test.py --qemu-args "$(SMOKE_QEMU_ARGS)" $(SMOKE_FLAGS)
 
 imageiso: $(ISO)
 
@@ -215,7 +206,7 @@ $(ISO): $(ISO_KRN) $(ISO_CFG)
 	@grub-mkrescue -o $@ $(ISO_TREE) >$(BUILD)/iso.log 2>&1 || { \
 	  cat $(BUILD)/iso.log >&2; exit 1; }
 
-$(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
+$(BUILD)/disk.img: Makefile $(BUILD)/README.md $(USER_ELFS) $(MOD_ELFS)
 	@printf "  DISK    $(SHORT)\n"
 	@dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
 	@# -R 1024: reserve 1024 sectors (512 KiB).  FAT32 leaves the reserved
@@ -228,6 +219,18 @@ $(BUILD)/disk.img: $(BUILD)/README.md $(USER_ELFS)
 	@mmd -i $@ ::bin
 	@for f in $(USER_ELFS); do \
 	  mcopy -i $@ $$f ::bin/$$(basename $$f); \
+	done
+	@# ::mod holds the ring3 driver modules (S1b).  Kept out of ::bin so
+	@# a plain `ls /bin` still lists programs and init's /mod scan is the
+	@# only thing that ever spawns a .km.
+	@# The names are copied through AS THEY ARE: build/mod/<name>.km already
+	@# carries the suffix (MOD_ELFS adds it when linking), so appending one
+	@# here would install ps2-keyboard.km.km -- and a bare build/mod/<name>
+	@# would install a name init's *.km scan never matches, which is the
+	@# bug that left the modules on the disk, unspawned, with nothing said.
+	@mmd -i $@ ::mod
+	@for f in $(MOD_ELFS); do \
+	  mcopy -i $@ $$f ::mod/$$(basename $$f); \
 	done
 
 $(BUILD)/README.md: | $(BUILD)

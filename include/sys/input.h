@@ -4,7 +4,7 @@
  * existing rings (console inbuf, msring) keep working as independent
  * consumers of the same producers, so nothing reroutes underneath the
  * 34-38 surface.  Producer semantics live on the producers (isr.c decode
- * path, ps2mouse.c packet tail) and in input_event.c's header comment. */
+ * path, ps2-mouse.c packet tail) and in input_event.c's header comment. */
 #pragma once
 #include <types.h>
 #include <abi/lnxrm_abi.h>

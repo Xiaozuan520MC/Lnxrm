@@ -129,10 +129,17 @@ long kbd_inject_bytes(const char *kbuf, u32 len); /* keys accepted */
 void kbd_stats(struct lnxrm_kbd_info *k);         /* counters snapshot */
 void kbd_inject_scancode(u8 sc); /* ktest: one scancode down the real decode path */
 
-/* mouse syscalls 37-38 land in kernel/drivers/ps2mouse.c; same split. */
+/* keyboard decode + the S1b channel (drivers/ps2-keyboard.c; the tables and
+ * state machine are in abi/ps2-keyboard.h, which userland/mod/ps2-keyboard.c shares) */
+void kbd_process_sc(u8 sc); /* one byte -> the console and input queues */
+void kbd_decode_init(void); /* bind IRQ1's raw stream to the dipc channel */
+
+/* mouse syscalls 37-38 land in kernel/drivers/ps2-mouse.c; same split.
+ * The reassembly/field decode is shared with ring3 through abi/ps2-mouse.h. */
 struct lnxrm_mouse_state;
 struct lnxrm_mouse_info;
 void ps2_mouse_init(void);
+void mouse_decode_init(void); /* bind IRQ12's raw stream to the dipc channel */
 void ms_feed_byte(u8 b); /* ktest drives synthetic packets past the IRQ */
 long mouse_pop(struct lnxrm_mouse_state *out); /* 0 ok, -1 empty */
 u32 ms_pending(void);    /* events buffered right now */

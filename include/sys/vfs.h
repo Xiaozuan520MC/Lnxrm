@@ -119,13 +119,9 @@ int vfs_try_mount_disk(void);
 /* C51: does any volume answer *below* "/"?  Separates "no disk" from "a disk
  * just not one this kernel can spawn /bin/init from". */
 bool vfs_data_volume_ready(void);
-/* Mount the initramfs `make INITRAMFS=` linked into the image at "/" as a
- * read-only root.  LNXRM_ENOENT when the build carried no archive or it is
- * not newc cpio -- a build without INITRAMFS= behaves as it did before. */
-int vfs_mount_initramfs(void);
 /* Publish {ops, priv} under `prefix` and take it back out again (C47).
  * Neither is a syscall -- mounting stays a kernel decision -- but both are the
- * single implementation the disk probe and vfs_mount_initramfs() share.
+ * single implementation the disk probe and the home-volume walk share.
  * vfs_umount() answers LNXRM_ENOENT when nothing is mounted there. */
 int vfs_mount_fs(struct fs_ops *ops, void *priv, const char *prefix);
 int vfs_umount(const char *prefix);
@@ -255,7 +251,7 @@ struct blk_req {
 #define BLK_REQ_QUEUED 0
 #define BLK_REQ_DONE   1
 
-/* block devices (drivers/ide.c + drivers/ahci.c register; fs/fat32.c consumes) */
+/* block devices (drivers/ahci.c registers; fs/fat32.c consumes) */
 struct blkdev {
     const char *name;
     u32 sector_size; /* bytes */

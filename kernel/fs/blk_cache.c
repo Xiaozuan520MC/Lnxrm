@@ -180,9 +180,9 @@ int blk_io_write(struct blkdev *dev, u64 lba, u32 count, const void *buf)
 
     struct blk_req r = {.lba = lba,
                         .count = count,
-                        .buf = (void *)buf, /* const dropped here, as in
-                                              * ide_blk_xfer(): no driver
-                                              * ever writes through it */
+                        /* const dropped here: no driver ever writes
+                         * through this pointer */
+                        .buf = (void *)buf,
                         .is_write = true,
                         .state = BLK_REQ_QUEUED,
                         .status = 0};

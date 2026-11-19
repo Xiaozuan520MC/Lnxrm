@@ -310,7 +310,7 @@ extern void load_cr3(u64);
  *
  *     text      PG_P              (read+execute, no write)
  *     .rodata   PG_P | PG_NX      (read only)
- *     the rest  PG_P | PG_W|PG_NX (data/.init_array/.ktest/.initramfs/
+ *     the rest  PG_P | PG_W|PG_NX (data/.init_array/.ktest/
  *                                  .trampoline/.bss: writable, no execute)
  *
  * ...in BOTH mappings.  Fixing one alias and leaving the other alone would

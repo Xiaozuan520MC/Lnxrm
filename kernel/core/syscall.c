@@ -2,6 +2,7 @@
 #include <sys/vfs.h>
 #include <sys/pipe.h>
 #include <sys/shm.h>
+#include <sys/dipc.h>
 #include <sys/sched.h>
 #include <sys/cpu.h>
 #include <sys/input.h>
@@ -503,8 +504,8 @@ long sys_stat(const char *path, struct lnxrm_stat *buf)
     st.st_size = a.size;
     st.st_blksize = 512;                    /* one sector, what the fs reads */
     st.st_blocks = (a.size + 511) / 512;    /* rounded up, like every df */
-    st.st_nlink = 1;                        /* neither FAT32 nor initramfs
-                                             * has hard links (see abi.h) */
+    st.st_nlink = 1;                        /* FAT32 has no hard links
+                                             * (see abi.h) */
     st.st_uid = 0;                          /* no per-file owner yet: root */
     st.st_gid = 0;
 
@@ -987,6 +988,32 @@ static long h_shm_open(struct intr_frame *f, u64 a3)
 }
 static long h_shm_unlink(struct intr_frame *f, u64 a3) { return path_syscall(f->rdi, sys_shm_unlink); }
 
+/* dipc_open(53) / dipc_recv(54) / dipc_send(55): driver channels (S1a).
+ * The name arrives as a USER address and is copied out exactly as
+ * shm_open's is (copy_user_str answers EFAULT for a pointer ring 3 could
+ * not have named, truncates a too-long one, and sys_dipc_open's own bound
+ * then answers ENAMETOOLONG for -- 31 usable bytes, far inside this 64).
+ *
+ * The two four-argument shapes take their first three arguments the way
+ * every call has always taken them (rdi, rsi, a3 = r10) and read the FOURTH
+ * out of rdx -- the register mmap's fourth argument has read from the frame
+ * since file mappings landed, so the dispatcher needs nothing new.  They are
+ * the only rows that do. */
+static long h_dipc_open(struct intr_frame *f, u64 a3)
+{
+    char name[64];
+    if (copy_user_str(name, f->rdi, sizeof(name)) != 0) return LNXRM_EFAULT;
+    return sys_dipc_open(name, f->rsi);
+}
+static long h_dipc_recv(struct intr_frame *f, u64 a3)
+{
+    return sys_dipc_recv((int)f->rdi, (void *)f->rsi, a3, f->rdx);
+}
+static long h_dipc_send(struct intr_frame *f, u64 a3)
+{
+    return sys_dipc_send((int)f->rdi, (const void *)f->rsi, a3, f->rdx);
+}
+
 /* The table itself, in lnxrm_syscalls.def order.  Rows are complete on
  * purpose: clang's -Wmissing-field-initializers (under -Wextra) flags a
  * partial one, so the two zero fields are spelled out rather than left. */
@@ -1048,6 +1075,15 @@ static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
      * could aim at /etc to worry about. */
     [SYS_shm_open]  = { h_shm_open, 0, NULL },
     [SYS_shm_unlink] = { h_shm_unlink, 0, NULL },
+    /* 53/54/55: GATE_ADMIN, same receipt as kbd_get/input_pop/ps.  A
+     * channel's name is a kernel object and its ring holds the raw bytes
+     * of somebody's keyboard, so "enumerate the drivers" and "read what
+     * they see" are administrative acts -- root (init, and anything it
+     * forks, which is where a .km driver comes from) passes, a plain user
+     * answers -EACCES. */
+    [SYS_dipc_open] = { h_dipc_open, GATE_ADMIN, "dipc_open" },
+    [SYS_dipc_recv] = { h_dipc_recv, GATE_ADMIN, "dipc_recv" },
+    [SYS_dipc_send] = { h_dipc_send, GATE_ADMIN, "dipc_send" },
 };
 
 /* Look the row up, refuse what the gates refuse, then run it.  Register

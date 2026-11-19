@@ -1,7 +1,9 @@
 /* ahci.c: AHCI/SATA driver -- DMA transfers via a single-PRDT command table,
- * exposing the same blkdev interface as ide.c.  Pure C: rewritten from
+ * exposing the kernel's blkdev interface.  Pure C: rewritten from
  * ahci.cpp 2026-10-17, each of constexpr / [[gnu::packed]] / new / a default
- * argument replaced by its direct C equivalent (see the notes at each site). */
+ * argument replaced by its direct C equivalent (see the notes at each site).
+ * This is the tree's only disk driver: kernel/drivers/ide.c went with the
+ * switch to q35 everywhere (2026-11-17). */
 #include <pci.h>
 #include <io.h>
 #include <mm/mm.h>

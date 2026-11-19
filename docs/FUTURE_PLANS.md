@@ -98,12 +98,12 @@
 
 | 类别 | 放置位置 | 说明 |
 |------|----------|------|
-| **大 IPC 开销驱动** | 保留在内核态 | 如系统文件、AHCI 驱动、IDE 驱动、USB 驱动；避免频繁 IPC 带来的性能损耗 |
-| **小 IPC 开销驱动** | 放在 ring3 的 root 模式 | 使用特殊的 `.km` 文件加载到内核 |
+| **大 IPC 开销驱动** | 保留在内核态 | 如系统文件、AHCI 驱动、USB 驱动（`ide.c` 已删，2026-11-18，块设备只剩 AHCI 一条栈）；避免频繁 IPC 带来的性能损耗 |
+| **小 IPC 开销驱动** | 放在 ring3 的 root 模式 | `.km` 文件放进 `disk.img` 的 `::mod`，由 `init` 扫目录拉起——**S1b 已就位（2026-11-18）**、**S1c 已就位（2026-11-19：解码整体在 ring3，内核只在无模块时本地兜底）**，先例 `userland/mod/ps2-keyboard.c` 与 `ps2-mouse.c`（2026-11-19 加 `ps2-` 前缀） |
 
 ### 3. IPC 性能优化
 
-- **共享内存**：减少数据拷贝（`shm_open(51)`/`shm_unlink(52)` 已就位，2026-11-16；下步是让驱动 IPC 走它而不是拷贝）
+- **共享内存**：减少数据拷贝（`shm_open(51)`/`shm_unlink(52)` 已就位，2026-11-16；驱动 IPC 通道 `dipc_open(53)`/`dipc_recv(54)`/`dipc_send(55)` 已就位，2026-11-17 S1a——环就住在共享帧里，ring3 mmap 即可读余量；**S1b 已就位，2026-11-18**——解码表/状态机单源共享头 `abi/ps2-keyboard.h` + `abi/ps2-mouse.h`，IRQ1/IRQ12 在原解码路径旁 `dipc_push` 镜像原始字节（ADDITIVE 不 REPLACE），`init` 扫 `/mod` 拉起 `ps2-keyboard.km` 与 `ps2-mouse.km`。**S1c 已就位，2026-11-19**：解码整体下沉到 ring3——IRQ1/IRQ12 经 `dipc_push_if_listening` 二选一（有 ring3 reader 才进环），模块解码后 `dipc_send(55)` 经通道 sink 回传内核输入队列，无 `.km` 时内核本地兜底，REPLACE 而判据零改动）
 - **急速 IPC**：以快速通信机制加速驱动间交互
 
 ### 4. 与宏内核的关系

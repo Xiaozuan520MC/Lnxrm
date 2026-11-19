@@ -187,8 +187,8 @@ static void test_ata_capacity(void)
  * clean: the write reports -28 instead of a swallowed short count, the
  * file still unlinks, and one write succeeds again afterwards -- space
  * that does not come back is a leak one write away from a volume that
- * never recovers.  Guarded to the real FAT32 root: a ram-backed
- * initramfs has no bottom to hit (vfs_root_is_fat()).  No K_ASSERT before
+ * never recovers.  Guarded to the real FAT32 root: a root with no bottom
+ * to hit (vfs_root_is_fat()).  No K_ASSERT before
  * the unlink: a mid-case abort would leave the volume full for every
  * later smoke step. (2026-10-20) */
 #define ENSPC_CHUNK (16 * 1024)

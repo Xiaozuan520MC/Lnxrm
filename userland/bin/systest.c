@@ -1,6 +1,6 @@
 /* End-to-end coverage of every number in include/abi/lnxrm_syscalls.def.
  *
- * Live calls (53, numbered 0..52 with no holes), all exercised below:
+ * Live calls (56, numbered 0..55 with no holes), all exercised below:
  *    0 read      1 write     2 open      3 close     4 lseek     5 brk
  *    6 getdent   7 dup2      8 nanosleep 9 getpid   10 fork    11 execve
  *   12 exit     13 wait4    14 kill     15 uname    16 sigaction 17 sigprocmask
@@ -28,7 +28,18 @@
  * kernel-side in ktest/t_shm.c instead, where the frame identity can be
  * read directly rather than inferred from a printout.
  *
- * Numbers above LNXRM_SYSCALL_LAST (52) are not in the table and must
+ * The three appended 2026-11-17 (53 dipc_open / 54 dipc_recv / 55
+ * dipc_send) are not called here at all: they carry CAP_SYS_ADMIN and they
+ * only ever answer about channels the KERNEL creates, so there is nothing
+ * for this file to name -- a run with no driver loaded would print an
+ * ENOENT tag that is a claim about a table, not about a call.  The whole
+ * surface (gates, bounds, the park that 54 blocks on) is asserted in
+ * ktest/t_dipc.c instead, where the ring and the wait list are readable
+ * rather than inferred from a printout.  They are listed nowhere below;
+ * the only thing this file owes them is that numbers above
+ * LNXRM_SYSCALL_LAST stay ENOSYS.
+ *
+ * Numbers above LNXRM_SYSCALL_LAST are not in the table and must
  * answer LNXRM_ENOSYS (-38) -- checked at the end.
  *
  * Expected values are printed as tag=value for an out-of-tree checker.

@@ -86,8 +86,8 @@ static void test_stat_paths(void)
     }
 
     /* a file the volume is known to carry: regular, non-empty, with an
-     * identity (FAT32 packs where its record sits; initramfs numbers its
-     * archive slots) and a mount slot behind it */
+     * identity (FAT32 packs where its record sits) and a mount slot
+     * behind it */
     K_EXPECT_EQ(vfs_stat_path("/README.md", &a), 0);
     K_EXPECT_EQ(a.type, V_REG);
     K_EXPECT(a.size > 0);

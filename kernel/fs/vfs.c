@@ -11,12 +11,6 @@
 /* ---- fat32 backend (fs/fat32.c) ---- */
 #include <fat32.h> /* C51: fat_priv, set here when a volume takes "/" */
 
-/* ---- initramfs backend (fs/initramfs.c) ---- */
-extern struct fs_ops irfs_ops;
-extern void *irfs_mount(void);
-
-#define DISK_PREFIX "/"
-
 /* Mounted filesystem info */
 struct mounted_fs {
     struct fs_ops *ops;
@@ -120,7 +114,7 @@ static int register_mount(struct fs_ops *ops, void *priv, const char *prefix)
 }
 
 /* Publish {ops, priv} under `prefix`.  There is no mount(2): mounting stays
- * a kernel decision (the disk probe and vfs_mount_initramfs() make it), and
+ * a kernel decision (the disk probe and the home-volume walk make it), and
  * this is the one entry point they share so that a second mount point
  * cannot be wired up in a way umount() then cannot undo (C47). */
 int vfs_mount_fs(struct fs_ops *ops, void *priv, const char *prefix)
@@ -985,10 +979,11 @@ void vfs_init(void)
  * root-path assertions on a diskless boot instead of reporting them failed. */
 bool vfs_root_ready(void) { return disk_ready; }
 
-/* Is that root the on-disk FAT32 volume, as opposed to the ram-backed
- * initramfs that also answers at "/"?  The boot self-test asks before
- * filling the volume to provoke ENOSPC: a ramfs has no bottom to hit and
- * filling it would walk straight into the OOM tests' territory. (2026-10-20) */
+/* Is that root the on-disk FAT32 volume?  The boot self-test asks before
+ * filling the volume to provoke ENOSPC: a volume with no bottom to hit would
+ * walk straight into the OOM tests' territory.  A diskless boot answers
+ * nothing at "/", so the question still has a false answer worth asking for.
+ * (2026-10-20) */
 bool vfs_root_is_fat(void)
 {
     for (int i = 0; i < mount_count; i++) {
@@ -1091,8 +1086,8 @@ int blk_list_all(void *ubuf, int max)
  *      (refresh_root()), never asserted by a caller.
  * Before this, the first mountable volume took "/" whatever was on it: a
  * data disk could not boot anyone (no /bin/init), yet it squatted at the
- * root path, and the initramfs fallback then had to unmount it (C47) to
- * make room for itself. */
+ * root path, and the home-volume walk then had to work around it (C47) to
+ * make room for the disk that does carry one. */
 
 /* Is `prefix` already an active mount? */
 static bool prefix_taken(const char *prefix)
@@ -1136,10 +1131,9 @@ static const char *home_volume(bool has_init)
 {
     for (int i = 0; i < MAX_MOUNTS; i++) {
         if (prefix_taken(home_prefixes[i])) continue;
-        /* "/" is not a data slot: an init-less disk mounted there would be
-         * displaced by the initramfs fallback rather than booted, and until
-         * that happened every path would resolve through a volume with no
-         * pid 1 in it. */
+        /* "/" is not a data slot: an init-less disk mounted there would
+         * displace nothing -- it would just leave every path resolving
+         * through a volume with no pid 1 in it. */
         if (i == 0 && !has_init) continue;
         return home_prefixes[i];
     }
@@ -1300,10 +1294,9 @@ static int vfs_try_mount_one(struct blkdev *bd, void **mounted)
        *
        * T-081 / C28: this used to be "mount the first registered device, or give
        * up" -- and the first registered device is whichever driver called
-       * blk_register() first.  ide_init() runs before ahci_init() (main.c), so
-       * a speculative probe that found a phantom disk locked out the real one
-       * behind it.  The policy is "every device that actually mounts", each with
-       * its own attempt line.
+       * blk_register() first.  A speculative probe that found a phantom disk
+       * then locked out the real one behind it.  The policy is "every device
+       * that actually mounts", each with its own attempt line.
        *
        * C51: the loop does NOT stop at the device that filled "/" -- a data disk
        * behind the boot disk still gets placed at /mnt..., and a boot disk
@@ -1383,37 +1376,4 @@ long vfs_free_space(const char *path)
     struct mounted_fs *m = fs_for_path(&p);
     if (!m || !m->ops->freespace) return LNXRM_ENOSYS;
     return (long)m->ops->freespace(m->priv);
-}
-
-/* Mount the initramfs linked into the kernel image at "/".
- *
- * The archive is a *root*, not a subtree: /bin/init is opened by that name
- * and the shell resolves everything else from "/", so there is no useful
- * place to mount it when a disk already owns "/".  When the caller asks for
- * this it is because that disk mounted but cannot boot -- it has no
- * /bin/init -- and nothing has opened a file from it yet: this runs after
- * vfs_try_mount_disk() and before sched_init(), i.e. before any task exists
- * to hold a struct file.  So the disk root is deactivated first, rather than
- * left mounted underneath and reachable through two roots at once. */
-int vfs_mount_initramfs(void)
-{
-    void *m = irfs_mount();
-    if (!m) return LNXRM_ENOENT;
-
-    /* Same deactivation umount() performs, so "the disk root is gone" means
-     * one thing no matter which caller asked for it (C47): the table is
-     * synced, disk_ready is recomputed, and nothing is left mounted twice
-     * under "/".  A disk volume without /bin/init no longer reaches "/" at
-     * all (C51), so this only ever disposes of a root that appeared some
-     * other way -- the call stays because two roots under "/" is exactly the
-     * state this function must never leave behind. */
-    umount_prefix("/", "it had no /bin/init");
-
-    register_mount(&irfs_ops, m, DISK_PREFIX);
-    /* disk_ready means "a filesystem answers at /", which vfs_lookup()'s
-     * root case and vfs_root_ready() both key off -- a diskless machine
-     * that boots from initramfs has a root, and the boot self-test should
-     * exercise it instead of skipping its root assertions.  register_mount()
-     * derives it from the table (refresh_root()); nothing here asserts it. */
-    return 0;
 }

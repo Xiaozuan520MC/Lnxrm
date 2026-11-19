@@ -69,10 +69,10 @@ def main():
     # struct.pack_into("<I", data, 0x214, 0x100000)
 
     # ---- init_size (0x260): memory the loader must keep for the kernel ---
-    # setup.asm hardcodes 4 MiB, which is enough for the kernel alone and too
-    # small once `make INITRAMFS=` has linked a cpio archive into the image:
-    # the payload is uncompressed, so the memory the image occupies is the
-    # payload, and a loader that trusts this field (GRUB does -- it sizes the
+    # setup.asm hardcodes 4 MiB, which is enough for the kernel alone and
+    # could be too small: the payload is uncompressed, so the memory the
+    # image occupies is the payload, and a loader that trusts this field
+    # (GRUB does -- it sizes the
     # window it reserves and may load the kernel into from it) would cut the
     # image off mid-way.  Take the larger of setup.asm's floor and the
     # payload rounded up to 2 MiB, plus 2 MiB of headroom above that for the

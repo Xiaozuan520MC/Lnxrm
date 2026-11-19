@@ -19,14 +19,19 @@ USER_LINK_BASE := 0x7f8000400000
 USER_ALL_C := $(shell find bin -maxdepth 1 -name '*.c' 2>/dev/null)
 UIMG      := $(patsubst bin/%.c,%,$(USER_ALL_C))
 
+MOD_ALL_C := $(shell find mod -maxdepth 1 -name '*.c' 2>/dev/null)
+MODIMG    := $(patsubst mod/%.c,%,$(MOD_ALL_C))
+
 USER_OBJDIR := $(BUILD)/usero
 USER_ELFS   := $(addprefix $(BUILD)/user/,$(UIMG))
 
-# Print targets relative to the build dir (short, cwd-independent).
+MOD_ELFS    := $(addprefix $(BUILD)/mod/,$(addsuffix .km,$(MODIMG)))
+
 SHORT = $(patsubst $(BUILD)/%,%,$@)
 
-.PHONY: all clean
+.PHONY: all mod clean
 all: $(USER_ELFS)
+mod: $(MOD_ELFS)
 
 $(BUILD):
 	@mkdir -p $@
@@ -46,13 +51,24 @@ $(USER_OBJDIR)/%.o: bin/%.c | $(BUILD)
 	@printf "  CC      $(SHORT)\n"
 	@$(CC) $(USERFLAGS) -MMD -MP -c -o $@ $<
 
+$(USER_OBJDIR)/mod/%.o: mod/%.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	@printf "  CC      $(SHORT)\n"
+	@$(CC) $(USERFLAGS) -MMD -MP -c -o $@ $<
+
 $(USER_ELFS): $(BUILD)/user/%: $(USER_OBJDIR)/%.o $(USER_OBJDIR)/ulib.o $(USER_OBJDIR)/crt0.o | $(BUILD)
 	@mkdir -p $(dir $@)
 	@printf "  LD      $(SHORT)\n"
 	@$(CC) $(USERFLAGS) $(USERLDFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
 
+$(MOD_ELFS): $(BUILD)/mod/%.km: $(USER_OBJDIR)/mod/%.o $(USER_OBJDIR)/ulib.o $(USER_OBJDIR)/crt0.o | $(BUILD)
+	@mkdir -p $(dir $@)
+	@printf "  LD      $(SHORT)\n"
+	@$(CC) $(USERFLAGS) $(USERLDFLAGS) -Wl,-Ttext=$(USER_LINK_BASE) -o $@ $^
+
 clean:
-	@rm -rf $(BUILD)/usero $(BUILD)/user
+	@rm -rf $(BUILD)/usero $(BUILD)/user $(BUILD)/mod
 	@echo Done!
 
--include $(USER_ALL_C:bin/%.c=$(USER_OBJDIR)/%.d) $(USER_OBJDIR)/ulib.d
+-include $(USER_ALL_C:bin/%.c=$(USER_OBJDIR)/%.d) $(USER_OBJDIR)/ulib.d \
+         $(MOD_ALL_C:mod/%.c=$(USER_OBJDIR)/mod/%.d)

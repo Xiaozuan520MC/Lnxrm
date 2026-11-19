@@ -2,6 +2,8 @@
 #include <sys/cpu.h>
 #include <sys/input.h>
 #include <sys/apic.h>
+#include <sys/dipc.h>
+#include <abi/ps2-keyboard.h> /* LNXRM_KBD_CHANNEL: S1c raw-byte door to the ring3 decoder */
 #include <io.h>
 #include <console.h>
 #include <sys/sched.h>
@@ -10,78 +12,16 @@
 #include <mm/pagefault.h>
 #include <mm/mm.h>
 
-/* ---- keyboard: scancode set 1 -> ASCII ---- */
-/* clang-format off */   /* raw lookup table */
-static const char kmap[128] = {
-    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
-    0, '*', 0, ' ', 0,
-};
-
-static const char kmap_shift[128] = {
-    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?',
-    0, '*', 0, ' ', 0,
-};
-/* clang-format on */
-
-#define SC_LSHIFT   0x2A
-#define SC_RSHIFT   0x36
-#define SC_CAPSLOCK 0x3A
-
-static bool shift_pressed = false;
-static bool capslock_on = false;
-
+/* ---- keyboard: IRQ1's stub ----
+ *
+ * The decode itself (tables, shift/caps/E0 state machine) lives in
+ * drivers/ps2-keyboard.c behind include/abi/ps2-keyboard.h, which
+ * userland/mod/ps2-keyboard.c includes too -- S1b moved it out of here so that the
+ * ring0 and ring3 halves of the channel run ONE table.  What stays is the
+ * hardware door: take the byte off port 0x60, count it, then hand it to
+ * exactly ONE decoder (S1c): the ring3 module while a descriptor holds
+ * the "kbd" channel open, this kernel's decoder otherwise. */
 #define KBD_DATA 0x60
-
-static bool kbd_ext; /* file-scope: the E0 prefix belongs to the next code */
-
-static void kbd_process_sc(u8 sc)
-{
-    if (sc == 0xE0) {
-        kbd_ext = true;
-        return;
-    }
-    bool release = !!(sc & 0x80);
-    bool ext = kbd_ext;
-    u8 code = sc & 0x7f;
-    kbd_ext = false; /* the E0 prefix belongs to this code only */
-
-    if (code == SC_LSHIFT || code == SC_RSHIFT) {
-        shift_pressed = !release;
-        return;
-    }
-    if (code == SC_CAPSLOCK) {
-        if (!release) capslock_on = !capslock_on;
-        return;
-    }
-    if (release) return;
-
-    char c = 0;
-    if (!ext && code < 128 && kmap[code]) {
-        if (shift_pressed)
-            c = kmap_shift[code];
-        else
-            c = kmap[code];
-        if (capslock_on && c >= 'a' && c <= 'z')
-            c = c - 'a' + 'A';
-        else if (capslock_on && c >= 'A' && c <= 'Z')
-            c = c - 'A' + 'a';
-        input_push(c);
-        /* 39: the unified queue gets the same decoded character plus the
-         * recipe (which modifiers were engaged) -- the character is
-         * already transformed, the flags say *why*.  Break codes left at
-         * the `release` return above, and extended (E0) keys keep console
-         * behaviour only: their codes are not ASCII a terminal renders. */
-        input_push_key((int)c,
-                       (u32)(shift_pressed ? INPUT_MOD_SHIFT : 0) |
-                           (u32)(capslock_on ? INPUT_MOD_CAPS : 0));
-    }
-}
 
 /* kbd_info bookkeeping: keys the ring accepted vs. lost to a full ring,
  * and how many scancodes IRQ1 ever carried (the keyboard detector).
@@ -92,7 +32,19 @@ void kbd_irq_handler(struct intr_frame *f)
 {
     u8 sc = inb(KBD_DATA);
     __atomic_add_fetch(&kbd_scans, 1u, __ATOMIC_RELAXED);
-    kbd_process_sc(sc);
+    /* S1c: mirror the RAW byte to the ring3 reader while one holds the
+     * channel open -- it decodes and sends each character back through
+     * the channel's sink (drivers/ps2-keyboard.c), so this stub either MIRRORS
+     * or DECODES, never both.  No reader (no .km on the image, or the
+     * module exited) means the byte is decoded here exactly as before the
+     * channel existed; before kbd_decode_init() there is no channel of
+     * that name and dipc_push_if_listening answers false for the same
+     * reason, losing nothing.  Only this stub pushes: kbd_inject 35 types
+     * ASCII into the console inbuf from a syscall, and a stream that
+     * claims to be "what the hardware carried" must not contain bytes the
+     * hardware never saw. */
+    if (!dipc_push_if_listening(LNXRM_KBD_CHANNEL, &sc, 1))
+        kbd_process_sc(sc);
 }
 
 /* ktest plumbing: one scancode byte down the exact decode path an IRQ1

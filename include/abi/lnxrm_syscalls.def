@@ -52,6 +52,21 @@
  * open/unlink) is that these names live in their own table, not on the
  * volume: shm_open never touches the filesystem and shm_unlink never
  * takes a path, so neither can be spelled as an ordinary file by mistake.
+ * dipc_open/dipc_recv/dipc_send took 53/54/55 (2026-11-17, S1a): driver
+ * inter-process communication (kernel/ipc/dipc.c).  Arity is two
+ * (dipc_open(name, flags) -> fd), four (dipc_recv(fd, buf, len, flags))
+ * and four (dipc_send(fd, buf, len, flags)) -- the first three arguments
+ * of a four-argument call land in rdi/rsi/r10 exactly as they do today,
+ * and the FOURTH rides in rdx, the same register mmap's fourth argument
+ * already reads out of the frame (h_mmap); nothing new is plumbed.  All
+ * three rows carry GATE_ADMIN: a channel names a kernel object and its
+ * byte stream, which is the same administrative surface as the raw key
+ * bytes (kbd_get), the event queue (input_pop) and ps.  The names live in
+ * a table of their own -- eight channels, created by the kernel, never by
+ * a call -- so 53 can only ever OPEN one, never make one, and 55 exists
+ * because the reverse path (a driver answering with decoded events) is
+ * not a shared-memory write at all: it is a call into a sink the channel
+ * was created with.
  *
  * Numbers are not the whole ABI: the ARITY of a call is too.  mmap (42)
  * grew from mmap(addr, len, prot) to the six-argument Linux shape
@@ -114,3 +129,6 @@ LNXRM_SYS(chdir, 49)
 LNXRM_SYS(getcwd, 50)
 LNXRM_SYS(shm_open, 51)
 LNXRM_SYS(shm_unlink, 52)
+LNXRM_SYS(dipc_open, 53)
+LNXRM_SYS(dipc_recv, 54)
+LNXRM_SYS(dipc_send, 55)

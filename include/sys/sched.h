@@ -48,7 +48,14 @@ enum task_state {
     T_STOPPED,
 };
 
-#define TASK_NAME_LEN 16
+/* 16 used to be enough for /bin/lsh and nothing else: /mod/keyboard.km is
+ * 16 characters, so it landed in ps as "/mod/keyboard.k" -- a silent
+ * truncation, not an error.  24 keeps the longest path this image can
+ * carry (/mod/<8>.km + NUL = 17) whole, and the 2026-11-19 PS/2 rename
+ * still fits: /mod/ps2-keyboard.km is 20 characters, 21 with NUL.
+ * struct lnxrm_ps_entry.name must be at least as wide or the kernel
+ * would truncate again on the way out. */
+#define TASK_NAME_LEN 24
 
 struct task {
     u32 pid;
