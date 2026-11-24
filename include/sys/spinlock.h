@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Spinlock: busy-wait mutual exclusion for SMP.
  * The irqsave variant is the default: most locks in this kernel can be
  * taken from interrupt context (handlers print, the tick calls the

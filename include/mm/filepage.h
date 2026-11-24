@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Shared-frame cache behind MAP_SHARED file mappings: two processes mapping
  * the same (file, offset) must see each other's writes, so they need the ONE
  * frame allocated and filled for it.  MAP_PRIVATE stays out -- it owns its

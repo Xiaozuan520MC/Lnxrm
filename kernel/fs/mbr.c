@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* MBR Partition Table Parser */
 #include <disk.h>
 #include <sys/vfs.h>

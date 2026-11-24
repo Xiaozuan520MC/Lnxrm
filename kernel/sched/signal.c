@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Signal delivery: default dispositions, user-installed handlers and the
  * sigreturn path that gets a process back to where it was interrupted.
  *

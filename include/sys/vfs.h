@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 #include <types.h>
 #include <sys/spinlock.h> /* struct blkdev's per-device io_lock (C10) */
@@ -133,6 +135,7 @@ long vfs_free_space(const char *path);
 bool vfs_file_exists(const char *path);
 bool vfs_root_ready(void);    /* a filesystem answers at "/" (boot self-test) */
 bool vfs_root_is_fat(void);   /* ...and it is the on-disk FAT32 volume (ENOSPC test) */
+bool vfs_root_is_ext2(void);  /* ...or the on-disk ext2 volume (S2 root) */
 /* Prefix a relative path with '/', returning `path` itself when it is already
  * absolute; NULL when the normalised path would not fit `buf` (the caller
  * answers LNXRM_ENAMETOOLONG).  Published for the boot self-test (C46). */

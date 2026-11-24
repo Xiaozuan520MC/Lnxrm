@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* stat(45) and gettimeofday(46) -- the two calls that landed 2026-11-11.
  *
  * stat is the first door into a file's metadata that hands out no

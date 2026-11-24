@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Minimal ACPI discovery: RSDP -> RSDT/XSDT -> MADT.
  * Only what SMP + the IOAPIC need: which local APIC IDs exist, and where
  * the IOAPIC sits.

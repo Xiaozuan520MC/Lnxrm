@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Late self-tests: task-table bookkeeping.
  *
  * They run after sched_init() and before the first real process is spawned,

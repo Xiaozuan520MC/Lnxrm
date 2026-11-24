@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* CPU bring-up: GDT/TSS, IDT, APIC, PIT timer, MSR helpers. */
 #include <sys/cpu.h>
 #include <sys/apic.h>

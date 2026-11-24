@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/rm -- remove files or directories.
  * rm <file>       delete a file
  * rm -p <dir>     delete a directory (recursively)

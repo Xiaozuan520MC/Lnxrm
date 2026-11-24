@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* The FAT32 journal, proved rather than asserted (defect C13).
  *
  * The driver's original "journal" was a lie: after-images that only ever

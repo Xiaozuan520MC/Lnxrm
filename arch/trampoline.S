@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: Apache-2.0
+
 ; trampoline.S -- AP startup (16-bit real -> 32-bit -> 64-bit long mode).
 ; Built as a flat binary (-f bin), copied to physical 0x8000 by BSP.
 ;

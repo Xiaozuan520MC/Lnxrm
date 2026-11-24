@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* ps2-keyboard.km -- the ring3 half of the S1c keyboard channel.
  *
  * WHAT THIS FILE IS

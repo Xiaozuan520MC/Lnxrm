@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Crash ring buffer + console log level (PP2, GAP section 5.3).
  *
  * The ring is fixed-size BSS: 96 records of 160 bytes, enough to carry

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-013: property tests -- randomised inputs, fixed seed, no panic, no overrun.
  *
  * T-011/T-012 pin *hand-picked* inputs.  The defects this file exists for are

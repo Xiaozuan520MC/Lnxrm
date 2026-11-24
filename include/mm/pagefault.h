@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-090/T-094/T-MMAP: page-fault dispatch -- demand paging, lazy stack
  * growth and copy-on-write. */
 #pragma once

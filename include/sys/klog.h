@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Kernel log levels + crash ring buffer (PP2 observability, GAP section 5.3).
  *
  * Two halves of one idea:

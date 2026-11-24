@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Virtual memory: master kernel tables (built by entry64.S) + per-process
  * user address spaces under PML4[255].
  *

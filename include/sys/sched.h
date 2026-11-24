@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Scheduler and task definitions (includes POSIX-like signal support). */
 #pragma once
 #include <types.h>

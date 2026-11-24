@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: Apache-2.0
+
 ; lnxrm -- bzImage real-mode setup
 ; Layout follows the Linux x86 boot protocol (Documentation/arch/x86/boot.rst):
 ;   offset 0x1F1 setup_sects, 0x202 "HdrS", 0x200 entry point.

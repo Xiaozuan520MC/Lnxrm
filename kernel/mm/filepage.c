@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* MAP_SHARED's shared-frame cache -- see include/mm/filepage.h for the
  * contract (who owns a reference, why MAP_PRIVATE stays out of it, and why
  * dropping the file is the right moment to forget its frames).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* ELF loader robustness.  elf_load() parses a buffer that came off disk,
  * so every field in it is untrusted input; REVIEW §3.2-G2 credits it with
  * seven checks and this case is what keeps them from being "simplified"

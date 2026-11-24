@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Pure string work on the filesystem side: path normalisation and the 8.3
  * name codec.  Both fail silently -- a wrong abs_path looks up a different
  * file, a wrong short name makes a file vanish from `ls`, and neither ever

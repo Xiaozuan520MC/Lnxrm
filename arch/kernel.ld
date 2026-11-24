@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* eck-system-kernel link script.
  * One contiguous PROGBITS image so VMA/LMA stay perfectly in step:
  * every byte satisfies VMA = LMA + (KERNEL_VMA - KERNEL_LMA).
@@ -31,7 +33,6 @@ SECTIONS
         . = ALIGN(4096);
         __text_end = .;
 
-        __rodata_start = .;
         *(.rodata .rodata.*)
         . = ALIGN(4096);
         __rodata_end = .;
@@ -40,7 +41,6 @@ SECTIONS
          * starts with .init_array (run once by start_kernel, never written
          * afterwards -- writable anyway, so a constructor table that ever
          * has to be patched up does not need a new policy). */
-        __data_start = .;
 
         __init_array_start = .;
         KEEP(*(.init_array*))
@@ -87,7 +87,6 @@ SECTIONS
         __bss_end = .;
     }
 
-    __kernel_end_lma = LOADADDR(.bss) + SIZEOF(.bss);
     __kernel_end = .;
 
     /DISCARD/ : {

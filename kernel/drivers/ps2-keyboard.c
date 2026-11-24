@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* ps2-keyboard.c: the keyboard's decode, and the ring0 half of the S1c
  * channel.
  *

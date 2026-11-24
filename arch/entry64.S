@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: Apache-2.0
+
 ; lnxrm -- 64-bit kernel entry, interrupt stubs, context switch
 ; Assembled with nasm -f elf64. Linked at VMA 0xffffffff80100000 (LMA 0x100000).
 

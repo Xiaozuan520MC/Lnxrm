@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Per-CPU data: accessed via GS segment base. */
 #pragma once
 #include <types.h>

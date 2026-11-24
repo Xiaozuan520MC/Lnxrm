@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* userland/clear.c -- 清屏 */
 #include "ulib.h"
 

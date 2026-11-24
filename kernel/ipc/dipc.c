@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* dipc_open(53) / dipc_recv(54) / dipc_send(55): driver inter-process
  * communication channels (S1a).  The contract is spelled out in
  * include/sys/dipc.h; this file is the mechanism.

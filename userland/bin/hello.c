@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/hello -- demonstrates ELF loading, fork/exec, sleep and exit. */
 #include "ulib.h"
 

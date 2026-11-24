@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Dispatch-level pointer validation: syscall_do()'s gates are what stands
  * between a user pointer and a kernel dereference, and no other self-test
  * reaches them -- t_usercopy proves the copy primitives in isolation,

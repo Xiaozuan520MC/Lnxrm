@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* The unified input event queue (kernel/drivers/input_event.c, syscalls 39-40):
  * one stream -- keyboard makes, mouse deltas, button transitions, wheel
  * -- that a compositor pops instead of touching per-device rings.  The

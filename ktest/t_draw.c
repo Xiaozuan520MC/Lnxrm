@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Drawing primitives must clip: an off-screen rectangle or glyph is allowed
  * to be silly, it is not allowed to write a single byte.  Out-of-range
  * coordinates reach these functions from the fb_* syscalls (24-28), i.e.

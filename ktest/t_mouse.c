@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* mouse 37-38 surface: the aux ring driven through the real dispatch
  * (syscall_probe = gates + pointer checks + error codes).  KTEST_LATE
  * runs after ps2_mouse_init() but headless boots deliver no aux bytes,

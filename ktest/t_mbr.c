@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* C36: the MBR layer must validate every partition entry where it parses
  * it -- a lie about range or size may never survive until I/O -- and must
  * walk the extended partition's EBR chain, where logical partitions used
@@ -11,16 +13,7 @@
 #include <sys/ktest.h>
 #include <disk.h>
 #include <string.h>
-#include "kblk.h"
-
-static void put_entry(u8 *st, u8 status, u8 type, u32 lba, u32 count)
-{
-    memset(st, 0, 16);
-    st[0] = status;
-    st[4] = type;
-    *(u32 *)&st[8] = lba;
-    *(u32 *)&st[12] = count;
-}
+#include "kblk.h" /* put_entry: the partition entry both forge here */
 
 static void test_mbr_ranges_and_the_ebr_chain(void)
 {

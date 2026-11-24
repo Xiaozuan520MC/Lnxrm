@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/reboot -- reset the machine.
  * Asks the kernel for reboot(48): it flushes the disk cache and pulses
  * the reset lines (CAP_SYS_ADMIN gate -- lsh runs as root, so the shell

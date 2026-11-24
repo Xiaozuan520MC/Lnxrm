@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* CPU-hardware self-tests: the irqsave spinlock contract, the TSC, the
  * kernel text-range predicate and the CR0.WP / CR4.SMEP mitigations.  The
  * EARLY cases work with interrupts off and no allocator -- exactly the

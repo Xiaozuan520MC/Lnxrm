@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* What a FAT32 write or truncate must leave on disk, driven through the
  * impl entry points like t_ioerr.c but without fault injection: the
  * subject here is the promise, not the refusal.

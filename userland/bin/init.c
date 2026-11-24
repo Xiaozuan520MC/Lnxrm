@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /init -- first user process. Like Linux: userland drives everything;
  * the kernel just provides fork/exec/wait and files. */
 #include "ulib.h"
@@ -21,13 +23,14 @@ static char buf[256];
 
 /* The ".km" test, case-insensitively.
  *
- * A FAT short name's case is not a property of the file: it comes from the
- * NT bits in the directory record (FAT_NTRES_LOWER_*), so which side writes
- * the file decides whether `spawn_modules` sees "ps2-keyboard.km" or
- * "PS2-KEYBOARD.KM".  Path resolution never cares -- fat_name_eq_short uppercases
- * both sides -- so an extension check that does care would refuse to spawn a
- * file that exec would happily have opened.  A 2-byte suffix is also matched
- * inside longer ones ("x.kmx"), so all three positions are checked. */
+ * The check itself has not changed since S1b, only its rationale: /mod now
+ * sits on an ext2 root whose path resolution IS case-sensitive, and the
+ * image always ships lowercase ".km" names.  Keeping the filter blind to
+ * case still costs nothing -- a stray "X.KM" would pass here and then fail
+ * loudly at exec (ENOENT), which is where the complaint belongs -- and it
+ * keeps matching FAT volumes, where a short name's case comes from the NT
+ * bits in the directory record rather than from the file.  The three bytes
+ * are matched end-anchored, so "x.km" passes and "x.kmx" does not. */
 static int is_module_name(const char *name, size_t n)
 {
     char a, b, c;

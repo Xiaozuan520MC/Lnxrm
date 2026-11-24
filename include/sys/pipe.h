@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* pipe(47): a unidirectional byte stream between two descriptors (PP3).
  *
  * SHAPE

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* shm_open(51) / shm_unlink(52): named shared-memory objects (S0).
  *
  * The design in one paragraph.  A shm object is a name in its OWN table

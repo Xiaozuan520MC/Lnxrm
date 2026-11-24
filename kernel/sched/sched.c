@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Round-robin preemptive scheduler with per-CPU run queues.
  *
  * Queue topology:

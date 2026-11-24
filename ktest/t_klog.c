@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* PP2 pins (GAP section 5.3): the crash ring records exactly what the
  * console filter hides, the level knob clamps and round-trips, and
  * backtrace() walks a known call chain -- frames[3] must be the return

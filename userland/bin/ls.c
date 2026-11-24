@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/ls -- list directory entries, dirs get trailing /. */
 #include "ulib.h"
 

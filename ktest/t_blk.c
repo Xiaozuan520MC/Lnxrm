@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* C28: the block registry is what diskinfo enumerates, and two things about
  * it were wrong.  Parsed partitions never entered it at all, so a disk with
  * a perfectly good partition table showed exactly one device and none of its
@@ -15,16 +17,7 @@
 #include <disk.h>
 #include <mm/mm.h>
 #include <string.h>
-#include "kblk.h"
-
-static void put_entry(u8 *st, u8 status, u8 type, u32 lba, u32 count)
-{
-    memset(st, 0, 16);
-    st[0] = status;
-    st[4] = type;
-    *(u32 *)&st[8] = lba;
-    *(u32 *)&st[12] = count;
-}
+#include "kblk.h" /* put_entry: the partition entry forged below */
 
 /* A partition reaches the registry the way any device does: mbr_parse() ->
  * mbr_get_partition() -> blk_register(), the sequence vfs_try_mount_one()

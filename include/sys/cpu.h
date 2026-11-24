@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* CPU bring-up: GDT/TSS, IDT, APIC, PIT timer, MSR helpers. */
 #pragma once
 #include <types.h>

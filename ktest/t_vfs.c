@@ -1,14 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Late self-tests: the root filesystem, exercised through the same
  * vfs_open_file()/vfs_read_file() path user space reaches via sys_open.
  *
  * These run after vfs_try_mount_disk() and before /bin/init is spawned, so
- * a broken FAT32 driver fails the boot log instead of showing up later as a
- * user process that mysteriously cannot read its own files. */
+ * a broken disk driver fails the boot log instead of showing up later as a
+ * user process that mysteriously cannot read its own files.  Since S2 the
+ * root is ext2; the FAT32 cases still run against the seeded RAM volume
+ * (ktest_seed_fat_volume), and the cases that speak to "/" take their
+ * answer from whichever of the two owns it. */
 #include <sys/ktest.h>
 #include <sys/vfs.h>
 #include <console.h>
 #include <disk.h>
 #include <fat32.h>
+#include <ext2.h> /* ext2_priv/ext2_ops: the root mount since S2 */
 #include <mm/mm.h>
 #include <string.h>
 #include "kblk.h"
@@ -187,8 +193,8 @@ static void test_ata_capacity(void)
  * clean: the write reports -28 instead of a swallowed short count, the
  * file still unlinks, and one write succeeds again afterwards -- space
  * that does not come back is a leak one write away from a volume that
- * never recovers.  Guarded to the real FAT32 root: a root with no bottom
- * to hit (vfs_root_is_fat()).  No K_ASSERT before
+ * never recovers.  Guarded to a root volume with a bottom to hit (FAT32
+ * or ext2, which is what S2 made "/").  No K_ASSERT before
  * the unlink: a mid-case abort would leave the volume full for every
  * later smoke step. (2026-10-20) */
 #define ENSPC_CHUNK (16 * 1024)
@@ -204,8 +210,8 @@ static void test_enospc_on_full_volume(void)
         ktest_skip("no root filesystem");
         return;
     }
-    if (!vfs_root_is_fat()) {
-        ktest_skip("root is not the FAT32 volume");
+    if (!vfs_root_is_fat() && !vfs_root_is_ext2()) {
+        ktest_skip("root is neither the FAT32 nor the ext2 volume");
         return;
     }
 
@@ -420,6 +426,7 @@ static void test_mount_data_reaches_the_node(void)
     K_EXPECT(vn->mnt_data != NULL);
     K_EXPECT(vn->mnt_data != (void *)1);
     if (vfs_root_is_fat()) K_EXPECT_EQ((u64)vn->mnt_data, (u64)fat_priv);
+    if (vfs_root_is_ext2()) K_EXPECT_EQ((u64)vn->mnt_data, (u64)ext2_priv);
     vfs_close_file(f);
 
     /* a directory's iterator carries the same mount, since file_alloc() has
@@ -431,6 +438,7 @@ static void test_mount_data_reaches_the_node(void)
     K_EXPECT(it != NULL);
     K_EXPECT(it->mnt_data != NULL && it->mnt_data != (void *)1);
     if (vfs_root_is_fat()) K_EXPECT_EQ((u64)it->mnt_data, (u64)fat_priv);
+    if (vfs_root_is_ext2()) K_EXPECT_EQ((u64)it->mnt_data, (u64)ext2_priv);
     vfs_close_file(d);
 
     /* vfs_free_space() routes a path to its mount's hook and answers with
@@ -440,6 +448,8 @@ static void test_mount_data_reaches_the_node(void)
     K_EXPECT(via_path >= 0);
     if (vfs_root_is_fat())
         K_EXPECT_EQ((u64)via_path, fat32_ops.freespace(fat_priv));
+    else if (vfs_root_is_ext2())
+        K_EXPECT_EQ((u64)via_path, ext2_ops.freespace(ext2_priv));
     else
         K_EXPECT_EQ(via_path, 0); /* a read-only archive has no free space */
 }
@@ -452,8 +462,8 @@ static void test_mount_data_reaches_the_node(void)
  * the volume routing actually picked. */
 static void test_second_mount_routes_to_its_own_volume(void)
 {
-    if (!root_ready() || !vfs_root_is_fat()) {
-        ktest_skip("no FAT32 root to bind a second mount point to");
+    if (!root_ready()) {
+        ktest_skip("no root filesystem to bind a second mount point to");
         return;
     }
 
@@ -471,9 +481,10 @@ static void test_second_mount_routes_to_its_own_volume(void)
     K_ASSERT(s0 != NULL);
     kblk_forge_fat32_bpb(s0, 1, 8, 2, 1 /* FAT = 512 B = 128 cells */, 256, 2);
 
-    /* fat_mount() publishes its result into fat_priv, which belongs to the
-     * real root volume -- park it and put it straight back, or every case
-     * behind this one would be reading the forged disk. */
+    /* fat_mount() publishes its result into fat_priv, which by now names a
+     * real volume (the seeded RAM volume since S2, the root before it) --
+     * park it and put it straight back, or every case behind this one would
+     * be reading the forged disk. */
     struct fat_mount *active = fat_priv;
     struct fat_mount *m2 = fat_mount(&k->dev);
     fat_priv = active;
@@ -487,9 +498,11 @@ static void test_second_mount_routes_to_its_own_volume(void)
     if (a && r) {
         struct dir_iter *ia = a->priv, *ir = r->priv;
         K_EXPECT(a->is_dir && r->is_dir);
-        /* C39: which mount each iterator belongs to */
+        /* C39: which mount each iterator belongs to -- the root's is
+         * whichever mount took "/" (ext2 since S2, FAT32 before it) */
         K_EXPECT_EQ((u64)ia->mnt_data, (u64)m2);
-        K_EXPECT_EQ((u64)ir->mnt_data, (u64)fat_priv);
+        if (vfs_root_is_fat()) K_EXPECT_EQ((u64)ir->mnt_data, (u64)fat_priv);
+        if (vfs_root_is_ext2()) K_EXPECT_EQ((u64)ir->mnt_data, (u64)ext2_priv);
         K_EXPECT(ia->mnt_data != ir->mnt_data);
 
         /* ... and the answers come from those volumes, not from whichever
@@ -532,11 +545,11 @@ static void test_second_mount_routes_to_its_own_volume(void)
  * the root with it, shows up in the return code and in what each path then
  * answers.  The other half of the rule -- a volume WITH /bin/init takes "/"
  * -- is what every boot does, and what the smoke log's
- * "[vfs] FAT32 mounted at /" line records. */
+ * "[vfs] ext2 mounted at /" line records. */
 static void test_a_disk_without_init_is_placed_below_root(void)
 {
-    if (!root_ready() || !vfs_root_is_fat()) {
-        ktest_skip("no FAT32 root to take down");
+    if (!root_ready()) {
+        ktest_skip("no root filesystem to take down");
         return;
     }
 

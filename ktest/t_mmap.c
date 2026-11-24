@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-MMAP: anonymous mmap/munmap/mprotect, the demand pager behind them, the
  * copy-on-write fork that rests on the order-0 reference counts, and the
  * stack guard that keeps an overflow out of the mmap window.

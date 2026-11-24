@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #include <sys/smp.h>
 #include <sys/apic.h>
 #include <sys/acpi.h>

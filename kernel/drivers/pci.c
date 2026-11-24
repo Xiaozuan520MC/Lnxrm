@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* PCI configuration-space enumeration (port IO, bus 0..255). */
 #include <pci.h>
 #include <io.h>

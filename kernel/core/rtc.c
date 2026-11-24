@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* CMOS real-time clock: the one wall-clock source this machine has.
  *
  * Three layers, deliberately in this order:

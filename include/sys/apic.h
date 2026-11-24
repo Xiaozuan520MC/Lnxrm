@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Local APIC + IPI interface. */
 #pragma once
 #include <types.h>

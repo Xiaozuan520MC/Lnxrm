@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Shared internals of the FAT32 driver: on-disk structures, mount state,
  * path/cluster helpers and the cross-file entry points of fat32.c /
  * fat32_dir.c / fat32_file.c / fat32_meta.c.  Also consumed by the boot

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* shm_open(51) / shm_unlink(52): named shared-memory objects (S0).
  *
  * A shm object is the minimum a microkernel needs to let two address spaces

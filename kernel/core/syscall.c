@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* System call dispatch (int 0x80, nr in rax, args in rdi rsi r10). */
 #include <sys/vfs.h>
 #include <sys/pipe.h>

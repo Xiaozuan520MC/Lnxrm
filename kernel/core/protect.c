@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* kxld protection layer -- see include/sys/protect.h. */
 #include <sys/protect.h>
 #include <sys/sched.h>

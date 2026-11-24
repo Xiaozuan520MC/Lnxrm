@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* VMA list -- see include/mm/vma.h for the contract.
  * Sorted singly-linked list, kmalloc'd nodes, one list per task, and every
  * node that names a file owns exactly one reference on it. */

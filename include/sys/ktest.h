@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Kernel self-test framework: the kernel asserts its own invariants while it
  * boots, so "I believe pmm hands back aligned frames" becomes "pmm proved it
  * on this machine, on this boot".
@@ -71,6 +73,10 @@ void ktest_skip(const char *why);
 
 /* Run every registered case of one stage. */
 void ktest_run(enum ktest_stage stage);
+/* Mount a forged RAM FAT32 volume so the FAT cases have one when "/" is
+ * ext2 (S2).  Call once, after the root mount and before KTEST_LATE; a
+ * FAT32 root or ktest=off makes it do nothing. */
+void ktest_seed_fat_volume(void);
 /* Print the overall verdict (call once, after the last stage). */
 void ktest_summary(void);
 

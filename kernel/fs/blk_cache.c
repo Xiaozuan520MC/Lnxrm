@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Block cache: LRU sector cache for improving disk I/O performance.
  * All device traffic (including this file's own) goes through the
  * blk_io_read()/blk_io_write() pair declared in <disk.h> -- the single choke

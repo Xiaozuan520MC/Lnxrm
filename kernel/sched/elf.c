@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Minimal static ELF64 loader for user programs. */
 #include <elf.h>
 #include <mm/mm.h>

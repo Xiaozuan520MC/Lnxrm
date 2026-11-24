@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* EARLY self-tests: the contracts between assembly/ABI headers and the C
  * code that consumes them, plus the boot memory map the allocator is built
  * on.  Getting any of these wrong is silent corruption, so they run first. */

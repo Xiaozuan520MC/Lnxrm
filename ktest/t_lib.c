@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* EARLY self-tests: the freestanding C library, the ANSI tokenizer and the
  * address-arithmetic macros.  Nothing here allocates, so it can run before
  * pmm_init() -- everything lives on the boot stack. */

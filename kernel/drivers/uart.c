@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* uart.c: 16550 UART driver (COM1) -- the kernel's primary console.
  *
  * Pure C (ported from rust/uart.rs 2026-10-17): same register programming,

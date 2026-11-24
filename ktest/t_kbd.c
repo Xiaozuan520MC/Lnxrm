@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* kbd 34-36 surface: the input stream driven through the real dispatch
  * (syscall_probe = gates + pointer checks + error codes).  KTEST_LATE
  * runs before userland exists and the harness types nothing, so the ring

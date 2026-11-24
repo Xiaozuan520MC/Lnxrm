@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* FAT32 directory layer: 8.3/LFN name handling, directory scanning,
  * path resolution and readdir (fat_dir_iter / getdent). */
 #include "fat32.h"

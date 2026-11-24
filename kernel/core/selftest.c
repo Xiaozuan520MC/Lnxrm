@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Assertion infrastructure (T-010): the counters that console.h's
  * ASSERT()/WARN()/BUG_ON() macros feed, and the note functions behind them.
  *

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* input_event.c: the unified input event queue, syscalls 39-40.
  *
  * One 63-slot stream wrapping every producer the machine has -- the IRQ1

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* The PS/2 aux (mouse) packet decode: the SINGLE source of it, compiled
  * into both halves of the S1b mouse channel.
  *
@@ -40,9 +42,6 @@ extern "C" {
 #define LNXRM_MOUSE_CHANNEL "mouse"
 
 /* byte 0 of every packet: {LB, MB, RB, 0x08, Xs, Ys, Xov, Yov} */
-#define LNXRM_MOUSE_F_LB    0x01
-#define LNXRM_MOUSE_F_MB    0x02
-#define LNXRM_MOUSE_F_RB    0x04
 #define LNXRM_MOUSE_F_SYNC  0x08 /* always set: without it the stream is desynced */
 #define LNXRM_MOUSE_F_XS    0x10 /* dx sign, 9th bit */
 #define LNXRM_MOUSE_F_YS    0x20 /* dy sign, 9th bit */

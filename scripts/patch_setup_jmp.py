@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Patch setup.bin's final long-mode jmp target to _start64's physical address.
 
 Idempotent: if the instruction already targets _start64_phys, it's a no-op.

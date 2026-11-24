@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #include <console.h>
 
 void *memset(void *d, int c, size_t n)

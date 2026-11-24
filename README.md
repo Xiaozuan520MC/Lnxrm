@@ -1,8 +1,9 @@
-# lnxrm 项目概览
+<p align="center">
+  <img src="image/bitcat.svg" width="100" alt="bitcat 吉祥物" />
+</p>
 
+# lnxrm 项目概览 
 > 自制 x86-64 混合内核，使用 C和ASM 两种语言打造
-
-<img src="image/bitcat.svg" width="120" align="right" alt="bitcat 吉祥物" />
 
 ## 构建依赖
 
@@ -27,3 +28,4 @@
 | `docs/BUILD.md` | 构建、运行、调试、排障 |
 | `docs/CODEBASE.md` | 代码结构与各子系统契约 |
 | `docs/GAP_ANALYSIS.md` | 当前开放缺陷、能力差距、修复优先级 |
+

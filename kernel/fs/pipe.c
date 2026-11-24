@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* pipe(47): data structure + wait queue (PP3).  See include/sys/pipe.h for
  * the shape, the wake discipline and why task->wait_next is safe to share
  * with input_event's list.  Everything here is one lock wide: `p->lock`

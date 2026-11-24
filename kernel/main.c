@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* lnxrm C entry point: subsystem bring-up in dependency order. */
 #include <boot.h>
 #include <console.h>
@@ -360,6 +362,8 @@ void start_kernel(void)
     sched_init();
 
 #ifdef CONFIG_KTEST
+    /* S2 made "/" ext2; the FAT cases still need a FAT32 volume. */
+    ktest_seed_fat_volume();
     ktest_run(KTEST_LATE);
     ktest_summary();
 #endif

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Standard VGA 8x16 bitmap font (CP437, printable ASCII 0x20..0x7E).
  * Glyph 0x20..0x7E lives at index ch-0x20; index 0 doubles as the
  * "unprintable" blank.  Kept as a header-only table so a reader can

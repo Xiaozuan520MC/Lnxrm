@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* MM self-tests: the buddy allocator, the kernel heap and the page tables.
  *
  * Every case is required to leave the subsystem exactly as it found it, so

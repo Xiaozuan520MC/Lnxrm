@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* input 39-40 surface: the unified queue driven through the real dispatch
  * (syscall_probe = gates + pointer checks + error codes).  Nothing feeds
  * this queue on a headless boot, and the other input cases (t_kbd ASCII

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Interrupt dispatch: exception reporting, IRQ routing, IPI dispatch. */
 #include <sys/cpu.h>
 #include <sys/input.h>

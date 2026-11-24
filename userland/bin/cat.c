@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/cat -- print a file, or standard input when no operand is given
  * (that is what lets it sit at the end of a shell pipeline). */
 #include "ulib.h"

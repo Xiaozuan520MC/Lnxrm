@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Process management: pid allocation, fork/execve/exit/waitpid, the user
  * memory access helpers and /bin/init spawning. */
 #include <sys/sched.h>

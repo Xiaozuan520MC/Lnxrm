@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* ahci.c: AHCI/SATA driver -- DMA transfers via a single-PRDT command table,
  * exposing the kernel's blkdev interface.  Pure C: rewritten from
  * ahci.cpp 2026-10-17, each of constexpr / [[gnu::packed]] / new / a default

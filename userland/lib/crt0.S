@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: Apache-2.0
+
 ; user program entry (userland/lib/crt0.S).
 ; The kernel lays the stack out as the SysV AMD64 process ABI requires:
 ;   [rsp]      argc

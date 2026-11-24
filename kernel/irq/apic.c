@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Local APIC + IOAPIC driver for SMP.
  *
  * Two register-access paths, chosen per core in apic_enable():

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/lsh -- userspace terminal.
  * Fork/exec each command from /bin/.  One line may be a pipeline of up
  * to MAX_CMDS segments joined by '|'; a segment may also read '<' FILE

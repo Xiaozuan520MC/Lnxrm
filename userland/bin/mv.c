@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/mv -- move a file or directory into another directory, or to a new
  * name when the destination is not a directory.  This is the usual mv
  * behaviour; the path join (destdir/<basename>) happens here, so the kernel

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/mkdir -- create a directory. */
 #include "ulib.h"
 

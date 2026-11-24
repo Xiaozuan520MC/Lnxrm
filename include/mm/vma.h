@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* VMA list: the [start,end) ranges a task claimed with mmap(), and what backs
  * each one.  Nothing is mapped at mmap() time -- the first access #PFs, and
  * page_fault.c finds the covering VMA, checks the quota and maps a frame with

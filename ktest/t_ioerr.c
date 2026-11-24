@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-005: a block device that says "no" must be believed.
  *
  * The defect under test (GAP_ANALYSIS C15): the FAT32 layer called its
@@ -81,11 +83,20 @@ static void test_write_refuses_an_unreadable_sector(void)
     struct fat_mount *m = mnt_or_skip("write");
     if (!m) return;
 
+    /* The seed volume ships bare: since S2 mounts "/" as ext2, no file from
+     * the image ever lands here, so plant the one this case needs -- it
+     * holds the bytes the read-back at the end compares against. */
+    K_ASSERT_EQ(fat_create_impl(fat_priv, "/t005w"), 0);
+
     struct vnode vn;
     memset(&vn, 0, sizeof(vn));
-    K_ASSERT_EQ(fat_lookup_impl(fat_priv, "/README.md", &vn), 0);
+    K_ASSERT_EQ(fat_lookup_impl(fat_priv, "/t005w", &vn), 0);
     K_ASSERT(vn.fs_data != NULL);
     struct resolve *r = vn.fs_data;
+
+    static const char held[] = "A tiny unix-like kernel";
+    K_ASSERT_EQ(fat_write_impl(fat_priv, r, 0, held, sizeof(held) - 1),
+                (int)(sizeof(held) - 1));
 
     u32 clus = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
     K_ASSERT(clus >= 2 && clus < m->max_cluster);
@@ -117,6 +128,7 @@ static void test_write_refuses_an_unreadable_sector(void)
     K_EXPECT(strncmp(back, "A tiny unix-like kernel", 23) == 0);
 
     kfree(vn.fs_data);
+    fat_unlink_impl(fat_priv, "/t005w"); /* leave the seed as it was found */
 }
 
 /* parent_entry_add() scans the parent for a free slot and writes it: both
@@ -193,18 +205,25 @@ static void test_lookup_reports_io_error_not_enoent(void)
 
     /* The same two answers one storey up, where user space sees them: open()
      * must return EIO rather than "no such file", and a readdir must fail
-     * rather than report an empty directory. */
+     * rather than report an empty directory.  They only exist while "/"
+     * itself is the volume under injection: with the ext2 root (S2) the
+     * seed is registered nowhere in the VFS, no path reaches it, and the
+     * contract is checked one storey down only (lk/un/rm/gd below). */
+    bool vfs_half = vfs_root_is_fat();
     struct file *f = NULL;
-    long o = vfs_open_file("/README.md", 0, &f);
-
+    long o = -99;
     struct file *df = NULL;
-    long od = vfs_open_file("/", 0, &df);
+    long od = -99;
     long g1 = -99, g2 = -99;
-    if (od == 0) {
-        char db[256];
-        memset(db, 0, sizeof(db));
-        g1 = df->ops->getdent(df, db, sizeof(db));
-        g2 = df->ops->getdent(df, db, sizeof(db)); /* still the dead scan */
+    if (vfs_half) {
+        o = vfs_open_file("/README.md", 0, &f);
+        od = vfs_open_file("/", 0, &df);
+        if (od == 0) {
+            char db[256];
+            memset(db, 0, sizeof(db));
+            g1 = df->ops->getdent(df, db, sizeof(db));
+            g2 = df->ops->getdent(df, db, sizeof(db)); /* still the dead scan */
+        }
     }
 
     blk_inject_io_off();
@@ -215,12 +234,14 @@ static void test_lookup_reports_io_error_not_enoent(void)
     K_EXPECT_EQ(rm, LNXRM_EIO);
     K_EXPECT_EQ(gd, LNXRM_EIO);   /* not "end of directory" */
 
-    K_EXPECT_EQ(o, LNXRM_EIO);    /* open(): not ENOENT, not EACCES */
-    if (o == 0) vfs_close_file(f);
-    K_EXPECT_EQ(od, 0);           /* the root itself needs no sector read */
-    K_EXPECT_EQ(g1, LNXRM_EIO);   /* getdent(): not 0 = "directory is empty" */
-    K_EXPECT_EQ(g2, LNXRM_EIO);
-    if (od == 0) vfs_close_file(df);
+    if (vfs_half) {
+        K_EXPECT_EQ(o, LNXRM_EIO);    /* open(): not ENOENT, not EACCES */
+        if (o == 0) vfs_close_file(f);
+        K_EXPECT_EQ(od, 0);           /* the root itself needs no sector read */
+        K_EXPECT_EQ(g1, LNXRM_EIO);   /* getdent(): not 0 = "directory is empty" */
+        K_EXPECT_EQ(g2, LNXRM_EIO);
+        if (od == 0) vfs_close_file(df);
+    }
 
     K_EXPECT_EQ(disk_sector(m, dir_lba, dir1), 0);
     K_EXPECT_EQ(memcmp(dir0, dir1, 512), 0);

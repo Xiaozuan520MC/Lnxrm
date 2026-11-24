@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* kxld protection layer (T-031): rules that nothing below kxld may
  * break, enforced on the syscall paths that could damage the system.
  *

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 CROSS   ?=
 CC      := $(CROSS)clang
 NASM    := nasm -w-implicit-abs-deprecated

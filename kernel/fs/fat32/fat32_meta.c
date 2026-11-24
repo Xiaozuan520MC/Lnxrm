@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* FAT32 namespace layer: create / mkdir / rmdir / unlink, including the
  * parent-directory split and the free-dirent claim helper. */
 #include "fat32.h"

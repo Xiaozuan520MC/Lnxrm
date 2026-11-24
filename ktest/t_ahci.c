@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* C49: an interrupt that is routed, unmasked and armed still has to *arrive*.
  *
  * The route prints a line at boot; this case makes the drive do work and

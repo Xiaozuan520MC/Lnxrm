@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 
 #include <stddef.h>
@@ -246,26 +248,14 @@ struct lnxrm_stat {
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_stat) == 56, "stat ABI");
 
-/* st_mode: the type mask and the nine permission bits, all at their Linux
- * values so a program written against Linux spells them the same way. */
+/* st_mode: the type mask, at Linux's values so a program written against
+ * Linux spells them the same way.  The nine permission bits carry no
+ * names here: stat() composes st_mode from octal literals (0555, 0755,
+ * 0666, 0444, 0644) where it builds one. */
 #define LNXRM_S_IFMT  0170000
 #define LNXRM_S_IFREG 0100000
 #define LNXRM_S_IFDIR 0040000
 #define LNXRM_S_IFCHR 0020000
-
-#define LNXRM_S_IRUSR 0400
-#define LNXRM_S_IWUSR 0200
-#define LNXRM_S_IXUSR 0100
-#define LNXRM_S_IRGRP 0040
-#define LNXRM_S_IWGRP 0020
-#define LNXRM_S_IXGRP 0010
-#define LNXRM_S_IROTH 0004
-#define LNXRM_S_IWOTH 0002
-#define LNXRM_S_IXOTH 0001
-
-#define LNXRM_S_IRWXU 0700
-#define LNXRM_S_IRWXG 0070
-#define LNXRM_S_IRWXO 0007
 
 /* ---- gettimeofday (46): the wall clock, microsecond resolution ----
  *
@@ -442,10 +432,11 @@ struct lnxrm_input_info {
 
 LNXRM_STATIC_ASSERT(sizeof(struct lnxrm_input_info) == 32, "input_info ABI");
 
-/* ps: one fixed-size record per task, written into the caller's buffer. */
+/* ps: one fixed-size record per task, written into the caller's buffer.
+ * Numbering mirrors enum task_state; the slot 0 (unused) never crosses ps
+ * -- sys_ps skips it -- so it is not named here. */
 enum lnxrm_task_state {
-    LNXRM_TS_UNUSED = 0,
-    LNXRM_TS_EMBRYO,
+    LNXRM_TS_EMBRYO = 1,
     LNXRM_TS_RUNNABLE,
     LNXRM_TS_RUNNING,
     LNXRM_TS_SLEEPING,

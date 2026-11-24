@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-OOM: the out-of-memory killer.
  *
  * No reclaim, no swap (docs/GAP_ANALYSIS.md): the only way back from a real

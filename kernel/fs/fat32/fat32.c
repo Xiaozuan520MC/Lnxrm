@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* FAT32 driver core: cached FAT table access, mount and the locked fs_ops
  * table.  Scanning: fat32_dir.c; file data: fat32_file.c; namespace:
  * fat32_meta.c; shared types: fat32.h. */

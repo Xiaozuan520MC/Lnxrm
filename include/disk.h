@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Block layer: MBR partition parsing and sector cache.
  * Merges the old mbr.h + blk_cache.h. */
 #pragma once

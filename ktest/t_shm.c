@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* S0 (GAP 5.x): shm_open(51) / shm_unlink(52) -- named shared-memory
  * objects.
  *
@@ -32,19 +34,11 @@
 #include <mm/vma.h>
 #include <mm/filepage.h>
 #include <mm/pagefault.h>
+#include "kfault.h" /* PF_NP_R / pf_frame / map_in, shared with t_dipc */
 
-/* A synthetic user #PF, the same shape t_mmap.c builds: bit0 clear (not
- * present) so the fixers run, cs = 3 so it reads as a ring-3 access.  The
- * shared mapping below is answered by demand_page() either way -- what the
- * error code decides is WHICH fixer claims it, and a lying code would let a
- * check test nothing. */
-#define PF_NP_R 0x00
-static void pf_frame(struct intr_frame *f, u64 err)
-{
-    memset(f, 0, sizeof(*f));
-    f->cs = 3;
-    f->err = err;
-}
+/* The shared mapping below is answered by demand_page() either way -- what
+ * the error code decides is WHICH fixer claims it, and a lying code would
+ * let a check test nothing. */
 
 /* ---- the page the object's name is written into ---- */
 
@@ -88,15 +82,6 @@ static void set_name(const char *s)
     u64 pa = vmm_translate_in(current->pml4, name_va);
     K_EXPECT(pa != 0);
     if (pa) memcpy((void *)PHYS_TO_VIRT(pa), s, strlen(s) + 1);
-}
-
-/* Fault a shared range in and answer the frame it landed on (0 on failure). */
-static u64 map_in(long va)
-{
-    struct intr_frame f;
-    pf_frame(&f, PF_NP_R);
-    if (!page_fault_try_fix(&f, (u64)va)) return 0;
-    return vmm_translate_in(current->pml4, (u64)va);
 }
 
 /* ================= the names themselves =================

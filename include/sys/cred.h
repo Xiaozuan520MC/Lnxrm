@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-030: process privilege tiers.  Every task carries a struct cred:
  *
  *   CRED_USER  a plain process; no privileges of its own

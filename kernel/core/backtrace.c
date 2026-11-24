@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Frame-pointer backtrace (PP2, GAP section 5.3).
  *
  * The chain needs -fno-omit-frame-pointer (Makefile BASEFLAGS): at -Os

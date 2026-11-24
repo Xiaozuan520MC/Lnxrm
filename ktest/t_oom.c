@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-004: running out of memory is an error return, never a panic.
  *
  * The branches under test are the ones a user program could reach by

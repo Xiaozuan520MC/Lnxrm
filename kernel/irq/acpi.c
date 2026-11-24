@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Minimal ACPI: locate the RSDP, walk RSDT/XSDT to the MADT (APIC table),
  * and expose the two facts the rest of the kernel needs from it: which
  * local APIC IDs exist, and where the IOAPIC sits.

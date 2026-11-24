@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* S1a: dipc_open(53) / dipc_recv(54) / dipc_send(55) -- driver
  * inter-process communication channels (kernel/ipc/dipc.c).
  *
@@ -34,16 +36,7 @@
 #include <mm/vma.h>
 #include <mm/filepage.h>
 #include <mm/pagefault.h>
-
-/* A synthetic user #PF, the same shape t_mmap.c builds: bit0 clear (not
- * present) so the fixers run, cs = 3 so it reads as a ring-3 access. */
-#define PF_NP_R 0x00
-static void pf_frame(struct intr_frame *f, u64 err)
-{
-    memset(f, 0, sizeof(*f));
-    f->cs = 3;
-    f->err = err;
-}
+#include "kfault.h" /* PF_NP_R / pf_frame / map_in, shared with t_shm */
 
 /* ---- the two user pages every case below writes through ---- */
 
@@ -111,15 +104,6 @@ static bool got_bytes(u64 va, const void *expect, size_t n)
 {
     void *p = uat(va);
     return p && memcmp(p, expect, n) == 0;
-}
-
-/* Fault a shared range in and answer the frame it landed on (0 on failure). */
-static u64 map_in(long va)
-{
-    struct intr_frame f;
-    pf_frame(&f, PF_NP_R);
-    if (!page_fault_try_fix(&f, (u64)va)) return 0;
-    return vmm_translate_in(current->pml4, (u64)va);
 }
 
 /* ---- the sink one channel is created with ---- */

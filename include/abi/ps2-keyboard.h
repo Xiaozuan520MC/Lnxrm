@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* The keyboard's scancode set 1 -> ASCII decode: the SINGLE source of it,
  * compiled into both halves of the S1b keyboard channel.
  *

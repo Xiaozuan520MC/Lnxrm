@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/echo -- print arguments to stdout. */
 #include "ulib.h"
 

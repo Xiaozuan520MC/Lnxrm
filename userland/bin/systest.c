@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* End-to-end coverage of every number in include/abi/lnxrm_syscalls.def.
  *
  * Live calls (56, numbered 0..55 with no holes), all exercised below:

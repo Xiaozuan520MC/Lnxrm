@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Colour packing: fb_pack() must put each channel exactly where this mode's
  * bit layout says it goes, for every layout a VBE/GRUB loader can report.
  *

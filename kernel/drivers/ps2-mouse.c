@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* ps2-mouse.c: PS/2 aux-port mouse, riding the same i8042 as the keyboard.
  *
  * The controller splits the ports by the status register's AUX bit: IRQ12

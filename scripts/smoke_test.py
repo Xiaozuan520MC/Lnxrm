@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """lnxrm end-to-end smoke test: build -> artifacts -> QEMU boot -> shell.
 
 Six phases, each one must pass:
 
     1. toolchain   required host tools are on PATH
     2. build       make all + disk image (skipped with --no-build)
-    3. artifacts   bzImage boot header, vmlinux symbols, FAT32 image, user ELFs
+    3. artifacts   bzImage boot header, vmlinux symbols, ext2 image, user ELFs
     4. boot        headless QEMU, ordered markers on the serial console
     5. shell       drive /bin/sh over serial: ls, cat, systest
-    6. forged FAT  boot a copy of the image whose /CYC chain is forged and
-                   require the driver to report it and keep running
+    6. forged ext2 boot a copy of the image whose /CYC directory record is
+                   forged and require the driver to report it and keep running
 
 Usage:
     scripts/smoke_test.py [--no-build] [--clean] [--timeout SECS] [--jobs N]
@@ -66,11 +68,16 @@ SHELL_PROMPT = br"(?:# |root@lnxrm\$ )"
 
 BUILD_TIMEOUT = 600
 
+# S2: disk.img is ext2, so the mtools set that formatted and listed it is
+# gone and e2fsprogs took its place.  mke2fs and debugfs are *required* --
+# the Makefile cannot build the image without them -- while e2fsck only
+# feeds a check, so a machine without it skips that one check instead of
+# failing phase 1.
 REQUIRED_TOOLS = [
     "make", "gcc", "g++", "ld", "objcopy", "nm", "nasm",
-    "python3", "dd", "mkfs.vfat", "mcopy", "mmd", "qemu-system-x86_64",
+    "python3", "dd", "mke2fs", "debugfs", "qemu-system-x86_64",
 ]
-OPTIONAL_TOOLS = ["fsck.vfat", "mdir"]
+OPTIONAL_TOOLS = ["e2fsck"]
 
 BOOT_MARKERS = [
     # main.c prints "--x86-64"; older builds printed "-- x86-64".  Accept both
@@ -90,16 +97,25 @@ BOOT_MARKERS = [
     # num_sectors = 0xFFFFFFFF and this line read "2097151 MB" on hardware.
     # 64 MiB == 131072 sectors, and 131072 / 2048 == 64 exactly.
     # BOOT_MARKERS are matched in log order against a cursor that only moves
-    # forward, so this has to sit before "fat32 mounted": the mount attempt is
-    # printed before the mount succeeds.
+    # forward, so this has to sit before the ext2 mount line: the mount
+    # attempt is printed before the mount succeeds.
     ("disk capacity is the real 64 MiB image",
      br"\[vfs\] attempting disk mount on \w+ \(131072 sectors, 64 MiB\)"),
-    # C13: the FAT32 journal lays itself out on every mount -- "clean" once the
-    # log exists, "formatted" the first time, "recovering" when a transaction
-    # was left committed.  It prints before the mount summary because it runs
-    # inside fat_mount(), so it has to sit ahead of the marker below.
-    ("fat32 journal laid out", br"\[fat32\] journal: \d+-sector log at LBA 8 \(\w+\)"),
-    ("fat32 mounted", br"\[vfs\] FAT32 mounted at /"),
+    # S2: the whole disk is ext2 now, and vfs.c tries it before anything
+    # else, so this line -- not a FAT32 one -- is what proves "/" came from
+    # the disk.  "has /bin/init" is the second half of the assertion: an
+    # image that mounted but carries no init would still say "mounted".
+    ("ext2 mounted at /",
+     br"\[vfs\] ext2 mounted at / \(whole disk, has /bin/init\)"),
+    # The FAT32 driver is still in the kernel and still has to work: with a
+    # FAT32 root gone, ktest_seed_fat_volume() forges a 2 MiB volume
+    # (kfatseed) and mounts it just before the late stage, and that is the
+    # volume the FAT32 cases drive.  C13: the journal lays itself out on
+    # every mount -- "clean" once the log exists, "formatted" the first
+    # time, "recovering" when a transaction was left committed.  It prints
+    # inside fat_mount(), ahead of the mount summary below it.
+    ("fat32 seed journal laid out", br"\[fat32\] journal: \d+-sector log at LBA 8 \(\w+\)"),
+    ("fat32 seed mounted", br"\[fat32\] mounted kfatseed:"),
     # T-005: the late self-test arms a failing block device; the FAT32 layer
     # must say so out loud rather than pass the garbage through.
     ("t-005 injected I/O error reported", br"\[fat32\] I/O error"),
@@ -630,21 +646,32 @@ def phase_artifacts(report):
             size = os.path.getsize(DISK)
             report.add("build/disk.img is 64 MiB", size == 64 * 1024 * 1024,
                        "%d bytes" % size)
-            if shutil.which("fsck.vfat"):
-                rc, out = sh(["fsck.vfat", "-n", DISK], timeout=120)
-                report.add("fsck.vfat -n", rc == 0, tail(out, 5))
+            # S2: the root volume is ext2, so the fsck is e2fsck's.  -n never
+            # repairs: an image a previous boot left inconsistent has to fail
+            # here, which is what makes the carry-over case (phase 4 runs on
+            # the same file QEMU just wrote) a real assertion rather than a
+            # formality.
+            if shutil.which("e2fsck"):
+                rc, out = sh(["e2fsck", "-n", DISK], timeout=120)
+                report.add("e2fsck -n", rc == 0, tail(out, 5))
             else:
-                report.skip("fsck.vfat -n", "fsck.vfat not installed")
-            if shutil.which("mdir"):
-                rc, out = sh(["mdir", "-i", DISK, "::/bin"])
-                report.add("FAT32 /bin listed", rc == 0, tail(out, 5))
-                for prog in sorted(p[:-2] for p in os.listdir(os.path.join(ROOT, "userland", "bin"))
-                                   if p.endswith(".c")):
-                    report.add("/bin/%s on image" % prog,
-                               rc == 0 and re.search(r"\b%s\b" % re.escape(prog), out),
-                               "not in mdir ::/bin")
-                rc, out = sh(["mdir", "-i", DISK, "::"])
-                report.add("/README.md on image", rc == 0 and "README" in out)
+                report.skip("e2fsck -n", "e2fsck not installed")
+            # debugfs answers "File not found by ext2_lookup" with exit status
+            # 0, so the exit code proves nothing: an inode's presence is
+            # decided by the "Inode:" line, the same test the Makefile runs
+            # when it builds this image.
+            rc, out = sh(["debugfs", "-R", "ls /bin", DISK])
+            report.add("ext2 /bin listed", rc == 0, tail(out, 5))
+            for prog in sorted(p[:-2] for p in os.listdir(os.path.join(ROOT, "userland", "bin"))
+                               if p.endswith(".c")):
+                rc, out = sh(["debugfs", "-R", "stat /bin/%s" % prog, DISK])
+                report.add("/bin/%s on image" % prog,
+                           re.search(r"^Inode:\s*\d+", out, re.M) is not None,
+                           "no inode for /bin/%s" % prog)
+            rc, out = sh(["debugfs", "-R", "stat /README.md", DISK])
+            report.add("/README.md on image",
+                       re.search(r"^Inode:\s*\d+", out, re.M) is not None,
+                       "no inode for /README.md")
 
         # --- user space ELFs ----------------------------------------------
         usrdir = os.path.join(ROOT, "userland", "bin")
@@ -837,8 +864,10 @@ def run_shell_steps(report, guest, args):
                    "no %r within %ss" % (expect, timeout or args.timeout))
         return guest.region(start)
 
-    # FAT32 hands back 8.3 names, so the root file shows up as readme.md
-    step("ls", br"(?i)readme\.md", "ls shows /README.md")
+    # S2: ext2 stores names byte for byte, so the root file must come back
+    # with the case it was written with -- under the old FAT32 root the same
+    # step could only ask for 8.3's lower-cased "readme.md".
+    step("ls", br"README\.md", "ls shows /README.md")
     step("ls /bin", br"(?i)systest", "ls /bin shows /bin/systest")
     step("cat /README.md", re.escape(README_LINE), "cat /README.md")
     # T-031 interactive face: a refused kill must SAY so, and an absent
@@ -866,127 +895,166 @@ def run_shell_steps(report, guest, args):
 
 
 # --------------------------------------------------------------------------
-# phase 6: a forged cluster chain must be reported, never followed
+# phase 6: a forged directory record must be reported, never followed
 # --------------------------------------------------------------------------
-def fat_layout(path):
-    """(FAT byte offset, data sector, sectors/cluster, root cluster)."""
+def ext2_geom(path):
+    """The numbers needed to find an inode or a data block in the raw image:
+    block size, block count, inode size and each group's inode table.
+
+    Read straight from the two structures ext2_mount() reads -- the
+    superblock at byte 1024 and the group descriptor table in the block
+    after it -- so a forge written here and the driver cannot disagree
+    about where anything lives."""
     with open(path, "rb") as f:
-        b = f.read(512)
-    reserved = struct.unpack_from("<H", b, 14)[0]
-    fatsz = struct.unpack_from("<I", b, 36)[0] or struct.unpack_from("<H", b, 22)[0]
-    return (reserved * 512, reserved + b[16] * fatsz, b[13],
-            struct.unpack_from("<I", b, 44)[0])
+        head = f.read(8192)
+    sb = head[1024:2048]
+    blocks = struct.unpack_from("<I", sb, 4)[0]
+    first = struct.unpack_from("<I", sb, 20)[0]
+    bs = 1024 << struct.unpack_from("<I", sb, 24)[0]
+    bpg = struct.unpack_from("<I", sb, 32)[0]
+    ipg = struct.unpack_from("<I", sb, 40)[0]
+    inosz = struct.unpack_from("<H", sb, 88)[0] or 128
+    ngroups = (blocks + bpg - 1) // bpg if bpg else 1
+    with open(path, "rb") as f:
+        f.seek((first + 1) * bs)
+        gd = f.read(32 * ngroups)
+    return {"bs": bs, "blocks": blocks, "inosz": inosz, "ipg": ipg,
+            "itable": [struct.unpack_from("<I", gd, g * 32 + 8)[0]
+                       for g in range(ngroups)]}
 
 
-def _entry_cluster(path, dirclus, name):
-    """First cluster of a directory entry `name` inside cluster `dirclus`."""
-    _, data, spc, _ = fat_layout(path)
+def ext2_inode_off(geom, ino):
+    """Byte offset of inode `ino` (1-based, the way debugfs prints it)."""
+    g, idx = divmod(ino - 1, geom["ipg"])
+    if g >= len(geom["itable"]):
+        return None
+    return geom["itable"][g] * geom["bs"] + idx * geom["inosz"]
+
+
+def forge_bad_rec_len(path, geom, cyc, victim):
+    """Make /CYC's first directory record claim 4 bytes.
+
+    A scan that trusted it would compare names against bytes inside the
+    record -- and, near the end of the block, against bytes past the
+    buffer -- so the lookup has to stop and say so rather than follow it."""
+    off = ext2_inode_off(geom, cyc)
+    if off is None:
+        return "cannot locate the /CYC inode"
     with open(path, "rb") as f:
-        f.seek((data + (dirclus - 2) * spc) * 512)
-        blob = f.read(spc * 512)
-    for off in range(0, len(blob), 32):
-        e = blob[off:off + 32]
-        if e[0] == 0x00:
-            break
-        # skip LFN (0x0F), volume (0x08) and directory (0x10) records
-        if e[11] & 0x1F:
-            continue
-        if bytes(e[:11]).strip() == name:
-            return struct.unpack_from("<H", e, 26)[0] | \
-                   (struct.unpack_from("<H", e, 20)[0] << 16)
+        f.seek(off + 40)                 # i_block[0]: the directory's block
+        dirblk = struct.unpack("<I", f.read(4))[0]
+    if not dirblk or dirblk >= geom["blocks"]:
+        return "/CYC has no usable data block (%d)" % dirblk
+    with open(path, "r+b") as f:
+        f.seek(dirblk * geom["bs"] + 4)  # rec_len of the record at offset 0
+        f.write(struct.pack("<H", 4))
     return None
 
 
-def subdir_cluster(path, name):
-    """First cluster of a subdirectory of the root, or None."""
-    _, data, spc, root = fat_layout(path)
-    with open(path, "rb") as f:
-        f.seek((data + (root - 2) * spc) * 512)
-        blob = f.read(spc * 512)
-    for off in range(0, len(blob), 32):
-        e = blob[off:off + 32]
-        if e[0] == 0x00:
-            break
-        if (e[11] & 0x10) and bytes(e[:11]).strip() == name:
-            return struct.unpack_from("<H", e, 26)[0] | \
-                   (struct.unpack_from("<H", e, 20)[0] << 16)
+def forge_block_past_end(path, geom, cyc, victim):
+    """Point /CYC/zzz.tst's first data block past the end of the volume.
+
+    The name still resolves and the inode still reads, so the only thing
+    that can refuse the read is the block layer's bounds check -- the
+    answer a corrupted i_block has to get instead of a device I/O error."""
+    off = ext2_inode_off(geom, victim)
+    if off is None:
+        return "cannot locate the /CYC/zzz.tst inode"
+    with open(path, "r+b") as f:
+        f.seek(off + 40)                 # i_block[0]
+        f.write(struct.pack("<I", geom["blocks"] + 7))
     return None
 
 
-def build_forged_image(value_for):
-    """Copy the rootfs, add /CYC with a file, and forge that file's FAT entry.
+def build_forged_image(forge):
+    """Copy the rootfs, add /CYC with a file, prove the copy is clean, and
+    only then hand it to `forge`.
 
-    The directory chain of /CYC is clean on purpose: a correct FAT32 driver
-    stops a directory scan at the 0x00 terminator, so a forged directory
-    chain would never even be followed.  The file's data chain is the one
-    that actually gets walked (by cat /CYC/zzz.tst), so that is the cell
-    the forge targets.
+    debugfs builds the directory (it writes the on-disk shape mtools used
+    to), and the e2fsck pass *before* the forge is what makes the run mean
+    anything: whatever the driver reports afterwards is our corruption and
+    nothing else.  debugfs exits 0 even when a command in the script
+    failed, so the two inodes are confirmed by asking for them -- the same
+    test the Makefile runs over disk.img.
 
-    value_for(cluster) yields the 32-bit value written into FAT[cluster].
-    Returns (image path, cluster) or (None, reason)."""
+    forge(path, geom, dir_ino, file_ino) returns None on success or a
+    one-line reason.  Returns (image path, detail) or (None, reason)."""
     img = os.path.join(SMOKE_DIR, "forged.img")
     # The transcript directory is created by the boot phase; this phase can
     # also run on its own (--no-build after a `make clean`), so create it
     # here instead of dying with a bare FileNotFoundError.
     os.makedirs(SMOKE_DIR, exist_ok=True)
     shutil.copyfile(DISK, img)
-    rc, out = sh(["mmd", "-i", img, "::CYC"])
-    if rc != 0:
-        return None, "mmd ::CYC failed: " + tail(out, 5)
-    clus = subdir_cluster(img, b"CYC")
-    if not clus:
-        return None, "/CYC not visible after mmd"
+
     tmp = os.path.join(SMOKE_DIR, "zzz.bin")
     with open(tmp, "wb") as f:
-        f.write(b"FORGED CHAIN DATA\n" * 480)
-    rc, out = sh(["mcopy", "-i", img, tmp, "::CYC/zzz.tst"])
+        f.write(b"FORGED DIRECTORY DATA\n" * 400)
+    cmds = os.path.join(SMOKE_DIR, "forged.cmds")
+    with open(cmds, "w") as f:
+        f.write("mkdir /CYC\nwrite %s /CYC/zzz.tst\n" % tmp)
+    rc, out = sh(["debugfs", "-w", "-f", cmds, img])
     if rc != 0:
-        return None, "mcopy ::CYC/zzz.tst failed: " + tail(out, 5)
-    fclus = _entry_cluster(img, clus, b"ZZZ     TST")
-    if not fclus:
-        return None, "::CYC/zzz.tst not visible after mcopy"
-    fat0 = fat_layout(img)[0]
-    with open(img, "r+b") as f:
-        f.seek(fat0 + fclus * 4)
-        f.write(struct.pack("<I", value_for(fclus) & 0x0FFFFFFF))
-    return img, fclus
+        return None, "debugfs could not build /CYC: " + tail(out, 5)
+
+    inos = {}
+    for where in ("/CYC", "/CYC/zzz.tst"):
+        rc, out = sh(["debugfs", "-R", "stat %s" % where, img])
+        m = re.search(r"^Inode:\s*(\d+)", out, re.M)
+        if not m:
+            return None, "%s not on the forged image" % where
+        inos[where] = int(m.group(1))
+
+    if shutil.which("e2fsck"):
+        rc, out = sh(["e2fsck", "-n", img], timeout=120)
+        if rc != 0:
+            return None, "copy is not clean before the forge: " + tail(out, 5)
+
+    why = forge(img, ext2_geom(img), inos["/CYC"], inos["/CYC/zzz.tst"])
+    if why:
+        return None, why
+    return img, None
 
 
 FORGED_CASES = [
-    ("self-loop", lambda c: c,
-     br"\[fat32\] chain (loop: cluster \d+ points at itself|walk hit its \d+ step budget)"),
-    ("out-of-volume entry", lambda c: 0x00FFFFF0, br"\[fat32\] corrupt FAT entry"),
+    # The two shapes a corrupted directory has to survive: a record the scan
+    # must not trust, and an inode naming a block the volume does not have.
+    # Both are reported by the driver itself -- the shell prompt coming back
+    # afterwards is the second half of each assertion.
+    ("bad-rec-len", forge_bad_rec_len,
+     br"\[ext2\] directory inode \d+: rec_len \d+ invalid at offset \d+, lookup stopped"),
+    ("block-past-end", forge_block_past_end,
+     br"\[ext2\] block \d+ beyond the volume \(\d+ blocks\), read refused"),
 ]
 
 
-def phase_forged_fat(report, args):
-    with Phase(report, "6/6 forged FAT") as ph:
+def phase_forged_ext2(report, args):
+    with Phase(report, "6/6 forged ext2") as ph:
         if not (os.path.exists(BZIMAGE) and os.path.exists(DISK)):
-            report.skip("forged FAT cases", "nothing to boot")
+            report.skip("forged ext2 cases", "nothing to boot")
             return ph.ok
         # The transcripts written below live next to the forged images; the
         # directory has to exist even when the boot phase never ran.
         os.makedirs(SMOKE_DIR, exist_ok=True)
 
-        for label, value_for, warn in FORGED_CASES:
-            img, info = build_forged_image(value_for)
+        for label, forge, warn in FORGED_CASES:
+            img, info = build_forged_image(forge)
             if img is None:
                 report.add("forged image (%s)" % label, False, info)
                 continue
             guest = Guest(args, args.timeout, disk=img)
             try:
                 if guest.wait(SHELL_PROMPT, args.timeout) is None:
-                    report.add("forged FAT boot (%s)" % label, False,
+                    report.add("forged ext2 boot (%s)" % label, False,
                                "no shell prompt")
                     dump_tail(guest)
                     continue
                 guest.send("cat /CYC/zzz.tst")
-                report.add("forged FAT reported (%s)" % label,
+                report.add("forged ext2 reported (%s)" % label,
                            guest.wait(warn, args.timeout) is not None,
-                           "driver stayed silent about the forged entry")
+                           "driver stayed silent about the forged record")
                 report.add("shell returns (%s)" % label,
                            guest.wait(SHELL_PROMPT, args.timeout) is not None,
-                           "guest hung walking the forged chain")
+                           "guest hung walking the forged directory")
             finally:
                 # same non-default suffix as the main transcript: an smp1
                 # run must not overwrite the smp2 evidence
@@ -1020,7 +1088,7 @@ def main():
                          "markers to the single-CPU pair -- this is the old "
                          "scripts/smoke_smp1.py folded in here")
     ap.add_argument("--repeat", type=int, default=1, metavar="N",
-                    help="OBS-1 jitter gate: run the boot+shell and forged-FAT "
+                    help="OBS-1 jitter gate: run the boot+shell and forged-ext2 "
                          "phases N times (default 1 = unchanged).  "
                          "toolchain/build/artifacts stay single-shot; every "
                          "failing round keeps its serial transcript as "
@@ -1066,8 +1134,8 @@ def main():
         if not booted:
             if len(report.failed) > before:
                 save_failed_serial(args, rnd)
-            continue  # no point forging FAT entries on a guest that won't boot
-        if not phase_forged_fat(report, args):
+            continue  # no point forging ext2 records on a guest that won't boot
+        if not phase_forged_ext2(report, args):
             if len(report.failed) > before:
                 save_failed_serial(args, rnd)
     return finish(report)

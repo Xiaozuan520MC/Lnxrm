@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Kernel heap: power-of-two segregated free lists over a reserved physical
  * region already mapped at KHEAP_VMA. Blocks >= 4 KiB go through the buddy.
  * Every allocation carries an 8-byte header storing the bin index / order.

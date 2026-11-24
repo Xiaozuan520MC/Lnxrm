@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-007 (C24) and T-008 (C26): what the block cache promises.
  *
  * T-007 -- the victim.  The cache used to choose its victim with a single

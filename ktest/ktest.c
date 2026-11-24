@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Self-test runner: walks the linker-collected `.ktest` section, runs the
  * cases registered for the requested stage and reports a verdict.
  *
@@ -8,6 +10,9 @@
 #include <sys/ktest.h>
 #include <console.h>
 #include <boot.h>
+#include <disk.h>       /* blk_cache_purge: the seed's refusal path */
+#include <fat32.h>      /* fat_mount/fat_priv: what the seed supplies */
+#include "kblk.h"       /* kblk_forge_fat32_volume */
 
 /* Declared by arch/kernel.ld around KEEP(*(.ktest)). */
 extern const struct ktest_case __ktest_start[], __ktest_end[];
@@ -127,6 +132,36 @@ void ktest_run(enum ktest_stage stage)
 
     kprintf("[ktest] stage %s: %u cases, %u checks, %u failed\n", stage_name[stage], n,
             selftest_pass - p0, selftest_fail - f0);
+}
+
+/* Give the FAT cases a volume when "/" is not one.  Since S2 the root is
+ * ext2, so fat_priv stays NULL: the twenty-five FAT cases would skip
+ * together and every boot line they print (the journal layout line, t-005,
+ * ...) would vanish with them.  This forges a RAM FAT32 volume and mounts
+ * it -- fat_mount() claims fat_priv because it is empty, which is the same
+ * rule vfs.c follows for a real root -- and it does nothing when a FAT32
+ * root already supplied one, or when ktest=off means the cases will not
+ * run either way. */
+void ktest_seed_fat_volume(void)
+{
+    ktest_parse_cmdline();
+    if (!kt.enabled) return;
+    if (fat_priv) return; /* a FAT32 root already carries the group */
+
+    struct kblk *k = kblk_forge_fat32_volume("kfatseed");
+    if (!k) {
+        kprintf("[ktest] fat volume seed: no memory; FAT cases will skip\n");
+        return;
+    }
+    /* Mounted, never registered and never freed: the FAT cases drive this
+     * volume for the rest of the boot, exactly as they drove a FAT32 root.
+     * It stays out of the block registry on purpose -- diskinfo reports
+     * real devices, and nothing mounts this one a second time. */
+    if (!fat_mount(&k->dev)) {
+        kprintf("[ktest] fat volume seed: forged volume refused\n");
+        blk_cache_purge(&k->dev);
+        kblk_free(k);
+    }
 }
 
 /* The one verdict line the smoke test greps for.  Called once, after the

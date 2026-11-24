@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* The T-031 capability gates, proved against synthetic creds.
  *
  * On a live boot the interesting half of these gates never runs: every

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Per-CPU data management and GS segment setup. */
 #include <sys/percpu.h>
 #include <sys/cpu.h>

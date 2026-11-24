@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #include "fat32.h"
 
 /* On-disk record header.  One record = this sector, immediately followed by

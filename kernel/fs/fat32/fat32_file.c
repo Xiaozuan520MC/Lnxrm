@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* FAT32 file layer: path lookup plus read / write-grow-truncate of
  * regular files (cluster chains are extended through alloc_chain). */
 #include "fat32.h"

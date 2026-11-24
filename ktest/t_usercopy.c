@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* The user/kernel copy boundary: user_ptr_ok() decides whether the kernel
  * may touch an address a user space handed it, and copy_from/to_user() are
  * the only sanctioned way across.  These are the assertions that start

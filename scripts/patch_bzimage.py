@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Patch the bzImage setup header after concatenation.
 
 Linux x86 boot protocol (Documentation/arch/x86/boot.rst) fields we fill:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* T-090/T-094/T-MMAP: page-fault dispatch -- demand paging, lazy stack
  * growth and copy-on-write in one seam.  isr_common() used to treat every #PF
  * as fatal, which made a deepening user stack lethal (sys_execve maps only

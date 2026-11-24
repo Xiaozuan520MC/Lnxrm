@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/kill -- send signal to a process. */
 #include "ulib.h"
 

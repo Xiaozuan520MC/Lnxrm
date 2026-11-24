@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* /bin/ps -- list running processes from a kernel-filled buffer. */
 #include "ulib.h"
 

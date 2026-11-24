@@ -1,5 +1,7 @@
-/* Virtual filesystem: path routing to a FAT32 root mounted at /,
- * plus synthesised device nodes under /dev and the fd table & surface. */
+// SPDX-License-Identifier: Apache-2.0
+
+/* Virtual filesystem: path routing to a root mounted at / (ext2 first, then
+ * FAT32), plus synthesised device nodes under /dev and the fd table & surface. */
 #include <sys/vfs.h>
 #include <console.h>
 #include <mm/mm.h>
@@ -10,6 +12,8 @@
 
 /* ---- fat32 backend (fs/fat32.c) ---- */
 #include <fat32.h> /* C51: fat_priv, set here when a volume takes "/" */
+/* ---- ext2 backend (fs/ext2/) ---- */
+#include <ext2.h>  /* ext2_priv, the same role for the S2 root volume */
 
 /* Mounted filesystem info */
 struct mounted_fs {
@@ -984,15 +988,28 @@ bool vfs_root_ready(void) { return disk_ready; }
  * walk straight into the OOM tests' territory.  A diskless boot answers
  * nothing at "/", so the question still has a false answer worth asking for.
  * (2026-10-20) */
-bool vfs_root_is_fat(void)
+/* The ops table of whatever owns "/", or NULL on a diskless boot.  Both
+ * vfs_root_is_*() answers are this one lookup with a different name on the
+ * end: "is the root this filesystem" is one question about one mount entry. */
+static struct fs_ops *root_ops(void)
 {
     for (int i = 0; i < mount_count; i++) {
         if (!mounts[i].active || mounts[i].prefix_len != 1 || mounts[i].prefix[0] != '/')
             continue;
-        return mounts[i].ops == &fat32_ops;
+        return mounts[i].ops;
     }
-    return false;
+    return NULL;
 }
+
+bool vfs_root_is_fat(void) { return root_ops() == &fat32_ops; }
+
+/* Is that root the on-disk ext2 volume?  The S2 counterpart of
+ * vfs_root_is_fat(): the boot self-test asks which filesystem owns "/"
+ * before making assertions that hold on only one of them (free-space
+ * accounting, mnt_data identity), because "/" has been ext2 since S2 and
+ * FAT32 only when some other image says so.  A diskless boot answers false,
+ * like the FAT one.  (2026-11-20) */
+bool vfs_root_is_ext2(void) { return root_ops() == &ext2_ops; }
 
       /* The block registry: every device the system knows about, in the order
        * diskinfo reports them.  A driver's device and a parsed partition are
@@ -1155,9 +1172,25 @@ static int find_volume(struct blkdev *bd, struct fs_ops **ops, void **priv,
     /* Flush cache before mounting to ensure consistent state */
     blk_cache_flush(bd);
 
-    /* 1. Try whole disk as FAT32 (most common: no MBR partition table) */
+    /* 1. Try the whole disk first (the shipped image is a superfloppy, no
+     * partition table): ext2, then FAT32.  The two probes cannot claim each
+     * other's volume -- ext2_mount() answers only for the 0xEF53 magic at
+     * byte 1024, where a FAT32 volume carries its reserved area and FAT
+     * data, and fat_mount() answers only for a boot sector whose BPB passes
+     * its checks, where an ext2 image has an empty boot block -- so the
+     * order decides which refusal prints first, not which volume wins. */
+    kprintf("[vfs] trying ext2 (whole disk)...\n");
+    void *m = ext2_mount(bd);
+    if (m) {
+        *ops = &ext2_ops;
+        *priv = m;
+        *whole = true;
+        *part = 0;
+        return 0;
+    }
+
     kprintf("[vfs] trying FAT32 (whole disk)...\n");
-    void *m = fat_mount(bd);
+    m = fat_mount(bd);
     if (m) {
         *ops = &fat32_ops;
         *priv = m;
@@ -1207,17 +1240,28 @@ static int find_volume(struct blkdev *bd, struct fs_ops **ops, void **priv,
 
                 void *pm = NULL;
 
-                /* Try FAT32 regardless of the partition's *type byte*.  That
-                 * byte is a label written by whatever formatted the disk and
-                 * it lies routinely: Windows puts FAT32 in 0x06 as often as
-                 * 0x0B, a GPT protective MBR stamps 0xEE over a perfectly
-                 * good FAT32 partition, and hand-built/USB images carry
-                 * whatever the tool felt like.  Restricting to 0x0B/0x0C
-                 * meant a mountable disk was rejected on a formality.
-                 * What actually decides "is this FAT32" is the BPB
-                 * validation inside fat_mount(), which reads the boot sector
-                 * and checks the geometry -- so a Linux or NTFS partition
-                 * fails there in one sector read instead of by name. */
+                /* Try ext2 and FAT32 regardless of the partition's *type
+                 * byte*.  That byte is a label written by whatever formatted
+                 * the disk and it lies routinely: Windows puts FAT32 in 0x06
+                 * as often as 0x0B, a GPT protective MBR stamps 0xEE over a
+                 * perfectly good FAT32 partition, and hand-built/USB images
+                 * carry whatever the tool felt like.  Restricting to
+                 * 0x0B/0x0C meant a mountable disk was rejected on a
+                 * formality.  What actually decides which filesystem is on
+                 * the partition is the probe itself: ext2_mount() reads the
+                 * superblock magic at byte 1024, fat_mount() reads the boot
+                 * sector and checks the geometry -- so a Linux or NTFS
+                 * partition fails there in one sector read instead of by
+                 * name. */
+                kprintf("[vfs]   trying ext2 on partition %d...\n", i);
+                pm = ext2_mount(part_dev);
+                if (pm) {
+                    *ops = &ext2_ops;
+                    *priv = pm;
+                    *whole = false;
+                    *part = i;
+                    return 0;
+                }
                 kprintf("[vfs]   trying FAT32 on partition %d...\n", i);
                 pm = fat_mount(part_dev);
                 if (pm) {
@@ -1274,14 +1318,22 @@ static int vfs_try_mount_one(struct blkdev *bd, void **mounted)
      * must name the volume paths under "/" resolve through, never whichever
      * volume happened to mount first or last.  fat_mount() itself claims the
      * pointer only when it is empty (see fat32.c), so probe order alone
-     * cannot decide this on a machine with a data disk enumerated first. */
-    if (where[1] == 0) fat_priv = priv;
+     * cannot decide this on a machine with a data disk enumerated first.
+     * The ops test is load-bearing since S2: an ext2 root's priv is not a
+     * struct fat_mount *, and handing it to fat_*_impl would read an ext2
+     * mount as a FAT one.  ext2_priv follows the same rule for the other
+     * direction -- root slot only, for the self-test's mnt_data check. */
+    if (where[1] == 0) {
+        if (ops == &fat32_ops) fat_priv = priv;
+        else if (ops == &ext2_ops) ext2_priv = priv;
+    }
 
+    const char *kind = ops == &ext2_ops ? "ext2" : "FAT32";
     if (whole)
-        kprintf("[vfs] FAT32 mounted at %s (whole disk, %s)\n", where,
+        kprintf("[vfs] %s mounted at %s (whole disk, %s)\n", kind, where,
                 has_init ? "has /bin/init" : "no /bin/init");
     else
-        kprintf("[vfs] FAT32 mounted at %s (partition %d, %s)\n", where, part,
+        kprintf("[vfs] %s mounted at %s (partition %d, %s)\n", kind, where, part,
                 has_init ? "has /bin/init" : "no /bin/init");
     blk_cache_flush(bd);
     return where[1] == 0 ? 0 : 1;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* PP3 (GAP section 5.7): pipe(47) -- the ring, both doors, EOF/EPIPE and
  * the wait queue.
  *

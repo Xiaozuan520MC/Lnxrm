@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* kheap internals.  bin_of() decides which free list every small allocation
  * lands in: an off-by-one there hands back a block the caller then overruns,
  * and nothing complains until the heap is corrupt.  Both functions under

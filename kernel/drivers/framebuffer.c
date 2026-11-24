@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* lnxrm -- VBE linear framebuffer driver + graphical console.
  * Supports 8 / 15 / 16 / 24 / 32 bits per pixel.  Every colour handed to
  * the drawing primitives is a true-colour 0x00RRGGBB value; fb_rgb_px()

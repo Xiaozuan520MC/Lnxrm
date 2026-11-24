@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* Physical frame buddy allocator (MAX_ORDER 10 => 4 MiB blocks).
  * Free lists are intrusive: the first 8 bytes of each free block hold the
  * next-free pointer. Per-order bitmaps record which blocks are free so the

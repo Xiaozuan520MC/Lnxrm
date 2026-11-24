@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /* ps2-mouse.km -- the ring3 half of the S1b mouse channel.
  *
  * WHAT THIS FILE IS
