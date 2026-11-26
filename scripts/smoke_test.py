@@ -580,12 +580,22 @@ def read_elf(path):
         raise ValueError("not a 64-bit ELF")
     e_type, e_machine = struct.unpack_from("<HH", data, 16)
     e_entry = struct.unpack_from("<Q", data, 24)[0]
-    e_phoff, e_phentsize, e_phnum = struct.unpack_from("<QHH", data, 32)
-    interp = False
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    # e_phentsize/e_phnum live at 54/56, NOT at 40/42: bytes 40..47 are
+    # e_shoff.  Reading them as <QHH from 32 returned the section-header
+    # offset split in half, which happened to yield a zero phnum on the
+    # static-only images this test used to see -- every check passed while
+    # the program header table was never walked at all.
+    e_phentsize, e_phnum = struct.unpack_from("<HH", data, 54)
+    interp = None
     for i in range(e_phnum):
         off = e_phoff + i * e_phentsize
         p_type = struct.unpack_from("<I", data, off)[0]
-        interp = interp or p_type == 3  # PT_INTERP
+        if p_type == 3:  # PT_INTERP
+            p_offset = struct.unpack_from("<Q", data, off + 8)[0]
+            p_filesz = struct.unpack_from("<Q", data, off + 32)[0]
+            end = data.index(b"\0", p_offset, p_offset + p_filesz)
+            interp = data[p_offset:end].decode("ascii", "replace")
     return {"type": e_type, "machine": e_machine, "entry": e_entry,
             "interp": interp}
 
@@ -687,10 +697,26 @@ def phase_artifacts(report):
             except (OSError, ValueError, struct.error) as exc:
                 report.add("user ELF %s" % name, False, str(exc))
                 continue
-            good = (e["type"] == 2 and e["machine"] == 0x3E and not e["interp"]
-                    and USER_LINK_BASE <= e["entry"] < USER_LINK_BASE + 0x10000000)
-            report.add("user ELF %s (ET_EXEC, static, entry 0x%x)"
-                       % (name, e["entry"]), good)
+            # S3.1: init is the one program kernel_spawn() starts and it is
+            # still a static ET_EXEC linked at USER_LINK_BASE, so it names no
+            # interpreter and its entry is the link address.  Every other
+            # program is execve'd, linked at 0 as ET_DYN, and has to name
+            # /lib/ld.so -- the exact string execve looks for in /lib (see
+            # STATIC_PROGS/DYN_PROGS in userland/Makefile).  Its entry is a
+            # link-at-0 value (small), and the kernel publishes the real
+            # runtime address via AT_ENTRY at exec time -- the static file
+            # itself only ever carries the link address.
+            expect = None if name == "init" else "/lib/ld.so"
+            et = {None: 2, "/lib/ld.so": 3}[expect]
+            good = (e["type"] == et and e["machine"] == 0x3E
+                    and e["interp"] == expect)
+            if expect is None:
+                good = good and e["entry"] == USER_LINK_BASE
+            else:
+                good = good and 0 < e["entry"] < 0x100000
+            report.add("user ELF %s (type=%d, %s, entry 0x%x)"
+                       % (name, et, "static" if expect is None else "interp " + expect,
+                          e["entry"]), good)
         report.add("user/*.c covered (%d programs)" % len(sources), bool(sources))
         return ph.ok
 

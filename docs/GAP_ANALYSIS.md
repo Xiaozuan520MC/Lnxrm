@@ -29,7 +29,7 @@
 | 设备驱动 | 3 | PS/2 键鼠中断驱动、AHCI 中断 + DMA、多盘挂载分流（C49/C51）；**`ide.c` 已删、smoke 切 q35（2026-11-18）**，全仓只剩 AHCI 一条块设备栈；PCI 配置机制半修（C56） |
 | 文件系统 | 3 | **ext2 挂根（S2，完整读/写 + 目录/改名，`e2fsck -n` 为判据）** + FAT32（on-disk redo journal）+ 时间戳 LRU 块缓存 + 簇链步数预算；FAT 边界/挂载批次已收口（C28–C47，见 GAP_ANALYSIS_DONE.md）；ext2 无 journal（靠 `ext2_finish` 失败路径也 flush + 每轮 e2fsck 兜底）、不落 uid/gid |
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 双缓冲 `fb_flip` + `CAP_FB`/归属两道门；无图元（暂不作为缺口） |
-| 用户态 | 2 | 16 个静态 ELF64 + 自带 crt0/迷你 libc，mmap 三件套就位；**`/mod` ring3 驱动模块已就位（S1b，init 扫目录拉起）**；无动态链接器，跑不了第三方软件 |
+| 用户态 | 3 | 16 个 ELF64（init 静态 ET_EXEC + 15 个动态 ET_DYN，`/lib/ld.so` + `/lib/libulib.so`）+ 自带 crt0/迷你 libc，mmap 三件套；**`/mod` ring3 驱动模块已就位（S1b）**；**S3 动态链接与共享库收口（2026-11-25）**：用户态 ldso（ET_DYN + PT_INTERP）、libulib.so、MAP_FIXED 0x10、auxv 6 对（+AT_BASE）；**S3.1 ET_DYN（PIE）+ AT_BASE 收口**：全部 ET_DYN 由内核选基址（elf_place）、AT_BASE 发布解释器 bias、ld.so 经 PT_PHDR 自恢 program bias、Eager 重定位 RELATIVE/GLOB_DAT/JUMP_SLOT/64、sysv hash；16 个 program 全部通过 execve 装载 |
 | 安全模型 | 2 | `cred` + 3 能力位 + `setuid` 单向降权；NXE/WP/SMEP/SMAP + **W^X 已收口（2026-11-12）**；无 gid、RLIMIT、文件属主、KASLR、栈保护 |
 | 测试 | 3 | ktest **167/5290 [2 skipped]**（S2 预期：+`t_ext2` 五例 + `t_ioerr` 环境适配；2026-11-24 `make smoke` 实测精确命中，上一版 2026-11-19 为 162/4974）、smoke **270/270**（S2 换根后构成变、总数不变；最近实测 **2026-11-24**）、`--repeat 2` 连跑 487/487（2026-11-15，本轮未复跑）；无 CI、无宿主单测 |
 | 可观测性 | 3 | 串口日志、分阶段启动、`ps` 内存列、块缓存统计；**loglevel + 崩溃环 + backtrace 已收口（2026-11-15）**；无 `/proc` |
@@ -61,7 +61,6 @@
 | IPC | unix domain socket | 服务/客户端模型前提 | 约 1 周（最后做） |
 | IPC | 线程 / `clone` | 进程模型是单线程假设 | 约 2 周，需重审并发结论 |
 | IPC | `alarm` / 定时信号 | 无超时与定时唤醒，只有 `nanosleep` | 0.5 天 |
-| 内存 | 动态链接器与 `.so` 装载 | 文件映射已就位但 loader 不用它，跑不了第三方程序 | 1–2 周 |
 | 内存 | swap/reclaim、`kmalloc`/`brk` 失败归因 | OOM killer 只补了缺页这半边：杀掉的帧要等 exit + reap 才回池 | 1 周起 / 归因约 200 行 |
 | 权限 | gid 与文件属主 | 任何进程可 `write`/`unlink` 任意文件 | 约 200 行 |
 | 权限 | CPU 时间限制、RLIMIT | 可无限占 CPU；`NR_FDS 16` 等编译期常量 | 80 / 100 行 |
@@ -100,7 +99,7 @@
 4. 内核自身加固：canary、`swapgs`/IST、KASLR（第 3 节「加固」）；内核 W^X 已收口（2026-11-12）。
 5. 文件权限与限额：inode 属主 + 写检查点 + CPU 时间限制（第 3 节「权限」）。
 6. 驱动收口：PCI 配置机制与注释（C56）；AHCI 中断/多盘已收口（C49/C51），**IDE LBA48 随 `ide.c` 删除一并作废**（C53 不再有对应代码，2026-11-18）。
-7. 能力面：**`pipe` 与 shell 管道均已收口（2026-11-15，见 GAP_ANALYSIS_DONE.md）**，下一项动态链接器与共享库（「内存」，文件映射已是前置）；IPC 余项（unix socket、线程、`alarm`）见第 3 节。
+7. 能力面：**`pipe` 与 shell 管道均已收口（2026-11-15）**、**S3 动态链接与共享库收口（2026-11-25）**、**S3.1 ET_DYN（PIE）+ AT_BASE 收口（2026-11-26）**；IPC 余项（unix socket、线程、`alarm`）见第 3 节。
 8. 暂不做：新子系统、POSIX 全覆盖、网络栈——1–7 未落地前不加宽度。（「更换文件系统」一项已由 **S2 ext2 换根**完成，见 GAP_ANALYSIS_DONE.md末条。）
 
 ---

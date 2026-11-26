@@ -76,7 +76,50 @@ enum lnxrm_syscall_number {
  * two-argument shape it had before file mappings existed. */
 #define LNXRM_MAP_SHARED  0x01
 #define LNXRM_MAP_PRIVATE 0x02
-#define LNXRM_MAP_FLAGS   (LNXRM_MAP_SHARED | LNXRM_MAP_PRIVATE)
+/* MAP_FIXED says "at this address or not at all": addr becomes a placement
+ * demand instead of a hint the kernel is free to ignore, so a mapping that
+ * would cover an existing one fails with EBUSY rather than silently picking
+ * somewhere else.  A dynamic loader needs it -- the segments of one shared
+ * object have to land at their link-time relative offsets from a base it
+ * chose, and a mapping at a *different* address would be a different
+ * program.  Value matches Linux's MAP_FIXED; the caller still pays the
+ * usual page-alignment and window checks, so "fixed" never means
+ * "unvalidated", and a range that would cover an existing mapping is
+ * refused outright (EINVAL) instead of tearing the old one down the way
+ * Linux's MAP_FIXED does -- nothing in this kernel maps over live memory
+ * on purpose, and a loader that collides has a bug worth surfacing. */
+#define LNXRM_MAP_FIXED   0x10
+#define LNXRM_MAP_FLAGS   (LNXRM_MAP_SHARED | LNXRM_MAP_PRIVATE | LNXRM_MAP_FIXED)
+
+/* Auxiliary vector keys -- the (type, value) pairs execve parks on the new
+ * stack after envp, which is how a program learns things its own ELF header
+ * cannot tell it: where the loader put the program headers and what the
+ * page size is.  A static program reads none of them; a dynamically linked
+ * one cannot start without AT_PHDR/AT_PHENT/AT_PHNUM (its own header table)
+ * and AT_ENTRY (where to jump).  The kernel publishes exactly those four
+ * plus AT_PAGESZ and AT_BASE, terminated by AT_NULL -- nothing is written
+ * to the stack that nothing reads.
+ *
+ * AT_BASE is the interpreter's load bias: the one number here a program
+ * cannot work out for itself, because the kernel is what chose where the
+ * interpreter landed (elf_place in kernel/sched/elf.c).  It is 0 when
+ * there is no interpreter -- a static image, or one whose interpreter is
+ * linked at absolute addresses -- which is also the honest answer for "the
+ * bias is zero", so a consumer never has to test whether the key exists.
+ * (The same reasoning keeps AT_EXECFN, the execve path string, out of the
+ * vector.)
+ *
+ * Values follow Linux's AT_* numbering because the pairing is the only
+ * thing that matters here and matching it keeps every existing reference
+ * honest -- this ABI is not Linux-compatible at the binary level and these
+ * are conventions, not a claim of compatibility. */
+#define LNXRM_AT_NULL  0  /* terminator: no value follows */
+#define LNXRM_AT_PHDR  3  /* virtual address of the program header table */
+#define LNXRM_AT_PHENT 4  /* size of one program header entry */
+#define LNXRM_AT_PHNUM 5  /* number of program header entries */
+#define LNXRM_AT_PAGESZ 6 /* PAGE_SIZE, so a loader need not hardcode it */
+#define LNXRM_AT_BASE  7  /* interpreter load bias: 0 when there is none */
+#define LNXRM_AT_ENTRY 9  /* entry point of the executable */
 
 /* shm_open(51) flags -- the POSIX/O_CREAT pair, at their POSIX (== Linux)
  * values.  They live here rather than in sys/vfs.h because sys/vfs.h is a

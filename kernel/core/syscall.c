@@ -111,7 +111,6 @@ static long sys_brk(u64 newbrk)
  * pretending to own 16 million frames it will never get. */
 static long sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, long fd, u64 offset)
 {
-    if (addr != 0) return LNXRM_EINVAL; /* kernel-chosen address only */
     if (!len) return LNXRM_EINVAL;
     if (len > MMAP_TOP - MMAP_LO) return LNXRM_ENOMEM;
 
@@ -125,6 +124,24 @@ static long sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, long fd, u64 offset
 
     u64 size = ALIGN_UP(len, PAGE_SIZE);
     if (size > MMAP_TOP - MMAP_LO) return LNXRM_ENOMEM;
+
+    /* MAP_FIXED makes addr a demand instead of a hint: it must be
+     * page-aligned, inside the window, and free -- a range that covers an
+     * existing VMA is refused rather than unmapped first (Linux tears the
+     * old mapping down; nothing here maps over live memory on purpose, and
+     * a loader that collides has a bug worth surfacing).  Without the flag
+     * addr stays what it always was: a hint this kernel has never taken,
+     * so a non-zero one is still EINVAL rather than a silently ignored
+     * request. */
+    int fixed = (flags & LNXRM_MAP_FIXED) != 0;
+    if (fixed) {
+        if (addr & (PAGE_SIZE - 1)) return LNXRM_EINVAL;
+        if (addr < MMAP_LO || addr >= MMAP_TOP) return LNXRM_EINVAL;
+        if (addr + size < addr || addr + size > MMAP_TOP) return LNXRM_EINVAL;
+        if (vma_overlaps(current, addr, addr + size)) return LNXRM_EINVAL;
+    } else if (addr != 0) {
+        return LNXRM_EINVAL; /* kernel-chosen address only */
+    }
 
     /* The file half, checked BEFORE an address is chosen: every reason to
      * say no is knowable from the descriptor alone, and a refusal must not
@@ -152,25 +169,33 @@ static long sys_mmap(u64 addr, u64 len, u64 prot, u64 flags, long fd, u64 offset
      * the HIGHEST one that fits (mmap habit: grow down from the top, so
      * regions cluster below the stack floor and the low heap stays
      * contiguous for brk).  Each gap is [prev end, next start); page
-     * alignment of both bounds makes `gap_hi - size` page-aligned too. */
-    u64 best_hi = 0, prev_end = MMAP_LO;
-    for (struct vma *v = current->vmas; v; v = v->next) {
-        u64 lo = prev_end > MMAP_LO ? prev_end : MMAP_LO;
-        if (v->start > lo && v->start - lo >= size && v->start > best_hi)
-            best_hi = v->start;
-        prev_end = v->end;
-    }
-    {
-        u64 lo = prev_end > MMAP_LO ? prev_end : MMAP_LO;
-        if (MMAP_TOP > lo && MMAP_TOP - lo >= size && MMAP_TOP > best_hi)
-            best_hi = MMAP_TOP;
-    }
-    if (!best_hi) {
-        if (ff) vfs_close_file(ff); /* the mapping never happened */
-        return LNXRM_ENOMEM;        /* no gap fits: address space full */
+     * alignment of both bounds makes `gap_hi - size` page-aligned too.
+     * MAP_FIXED skips the search entirely: the address was validated
+     * above, so the only thing left to prove is that it is still free --
+     * which vma_insert does not do for us, hence the check up front. */
+    u64 start;
+    if (fixed) {
+        start = addr;
+    } else {
+        u64 best_hi = 0, prev_end = MMAP_LO;
+        for (struct vma *v = current->vmas; v; v = v->next) {
+            u64 lo = prev_end > MMAP_LO ? prev_end : MMAP_LO;
+            if (v->start > lo && v->start - lo >= size && v->start > best_hi)
+                best_hi = v->start;
+            prev_end = v->end;
+        }
+        {
+            u64 lo = prev_end > MMAP_LO ? prev_end : MMAP_LO;
+            if (MMAP_TOP > lo && MMAP_TOP - lo >= size && MMAP_TOP > best_hi)
+                best_hi = MMAP_TOP;
+        }
+        if (!best_hi) {
+            if (ff) vfs_close_file(ff); /* the mapping never happened */
+            return LNXRM_ENOMEM;        /* no gap fits: address space full */
+        }
+        start = best_hi - size;
     }
 
-    u64 start = best_hi - size;
     int rc = vma_insert(current, start, start + size, (u32)(prot & 0x7),
                         (u32)flags, offset, ff);
     if (rc < 0) {

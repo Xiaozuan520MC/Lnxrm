@@ -108,6 +108,11 @@ mod:
 $(USER_ELFS): $(BUILD)/user/%: userland/bin/%.c userland/lib/ulib.c userland/lib/crt0.S | user
 	@test -f $@
 
+USER_LIBS := $(BUILD)/lib/ld.so $(BUILD)/lib/libulib.so
+
+$(USER_LIBS): | user
+	@test -f $@
+
 $(MOD_ELFS): $(BUILD)/mod/%.km: userland/mod/%.c userland/lib/ulib.c userland/lib/crt0.S | mod
 	@test -f $@
 
@@ -145,7 +150,7 @@ $(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/vmlinux.bin
 
 clean:
 	@rm -rf $(BUILD)
-	@echo DONE!
+	@printf "CLEAN!\n"
 
 help:
 	@echo make
@@ -172,7 +177,6 @@ ahci: run
 SMOKE_QEMU_ARGS ?= -machine q35
 
 smoke:
-	@echo "smoke: forcing KTEST=1 (self-test markers are what it checks)"
 	@MAKEFLAGS="$(filter-out KTEST=%,$(MAKEFLAGS))" KTEST=1 \
 	  $(PYTHON3) scripts/smoke_test.py --qemu-args "$(SMOKE_QEMU_ARGS)" $(SMOKE_FLAGS)
 
@@ -207,62 +211,15 @@ $(ISO): $(ISO_KRN) $(ISO_CFG)
 	@grub-mkrescue -o $@ $(ISO_TREE) >$(BUILD)/iso.log 2>&1 || { \
 	  cat $(BUILD)/iso.log >&2; exit 1; }
 
-$(BUILD)/disk.img: Makefile $(BUILD)/README.md $(USER_ELFS) $(MOD_ELFS)
+$(BUILD)/disk.img: Makefile $(BUILD)/README.md $(USER_ELFS) $(USER_LIBS) $(MOD_ELFS)
 	@printf "  DISK    $(SHORT)\n"
 	@for t in mke2fs debugfs; do \
 	  command -v $$t >/dev/null 2>&1 || { \
 	    echo "error: $$t not found -- install e2fsprogs (mke2fs, debugfs, e2fsck)"; \
 	    exit 1; }; \
 	done
-	@dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	@# S2: the root volume is a plain ext2 (no journal: ext2_mount() refuses
-	@# ext3/4 images rather than replay a log it never runs).  The flags pin
-	@# the geometry the driver and the smoke test are written against --
-	@# 4 KiB blocks, 16384 inodes of 256 B in ONE group (64 MiB / 32768 max
-	@# blocks per group), FILETYPE as the only incompat feature.  These are
-	@# also mke2fs's own defaults for this size; naming them keeps a newer
-	@# e2fsprogs from deciding otherwise.
-	@mke2fs -q -t ext2 -F -b 4096 -I 256 -N 16384 -O ^has_journal $@
-	@# Populate with debugfs: it writes the inode mode bits FAT32 could not
-	@# express (README.md lands 0664, so / is a writable volume and the
-	@# smoke test's stat.readable check sees its 0400 bit), and it needs no
-	@# loop device or root.  The script is a real file in $(BUILD) so a
-	@# failed run can be replayed by hand.
-	@{ \
-	  echo "write $(BUILD)/README.md /README.md"; \
-	  echo "mkdir /bin"; \
-	  for f in $(USER_ELFS); do echo "write $$f /bin/$$(basename $$f)"; done; \
-	  echo "mkdir /mod"; \
-	  for f in $(MOD_ELFS); do echo "write $$f /mod/$$(basename $$f)"; done; \
-	} > $(BUILD)/disk.cmds
-	@debugfs -w -f $(BUILD)/disk.cmds $@ >$(BUILD)/disk.log 2>&1
-	@# debugfs exits 0 even when a command in the script failed (a missing
-	@# source file prints an error and the run continues), so count what
-	@# actually landed instead of trusting the exit status: every path init
-	@# and the tests open must resolve to an inode, and README.md must be
-	@# long enough for the seek-and-read check (>= 20 bytes) with a mode
-	@# carrying both 0400 (readable) and 0222 (the volume is writable).
-	@bad=""; \
-	for p in /README.md /bin /mod \
-	         $(foreach f,$(USER_ELFS),/bin/$(notdir $(f))) \
-	         $(foreach f,$(MOD_ELFS),/mod/$(notdir $(f))); do \
-	  debugfs -R "stat $$p" $@ 2>&1 | grep -q "^Inode:" || bad="$$bad $$p"; \
-	done; \
-	if [ -n "$$bad" ]; then \
-	  echo "error: disk.img is missing:$$bad"; \
-	  echo "       (see $(BUILD)/disk.log)"; \
-	  exit 1; \
-	fi
-	@info=$$(debugfs -R "stat /README.md" $@ 2>&1 | awk \
-	  '/^Inode:/ { seen = 1; for (i = 1; i <= NF; i++) if ($$i == "Mode:") mode = $$(i + 1) } \
-	   seen && $$1 == "User:" { for (i = 1; i <= NF; i++) if ($$i == "Size:") size = $$(i + 1) } \
-	   END { printf "%s %s", size, mode }'); \
-	set -- $$info; \
-	if [ -z "$$1" ] || [ "$$1" -lt 20 ] || [ -z "$$2" ] || \
-	   [ $$((0$$2 & 0400)) -eq 0 ] || [ $$((0$$2 & 0222)) -eq 0 ]; then \
-	  echo "error: /README.md on disk.img is unusable ($$info: want >= 20 bytes and mode 0400|0222)"; \
-	  exit 1; \
-	fi
+	@python3 scripts/pack_img.py $(BUILD) $(BUILD)/README.md $@ \
+	       --user-elfs $(USER_ELFS) --libs $(USER_LIBS) --mods $(MOD_ELFS)
 	@# ::mod holds the ring3 driver modules (S1b).  Kept out of ::bin so
 	@# a plain `ls /bin` still lists programs and init's /mod scan is the
 	@# only thing that ever spawns a .km.  The names are copied through AS
@@ -270,8 +227,8 @@ $(BUILD)/disk.img: Makefile $(BUILD)/README.md $(USER_ELFS) $(MOD_ELFS)
 	@# adds it when linking), so appending one here would install
 	@# ps2-keyboard.km.km -- and a bare build/mod/<name> would install a
 	@# name init's *.km scan never matches, which is the bug that left the
-	@# modules on the disk, unspawned, with nothing said.  (Both rules run
-	@# inside the debugfs script above; this comment stays with the why.)
+	@# modules on the disk, unspawned, with nothing said.  (The same rule
+	@# lives in scripts/pack_img.py; this comment stays with the why.)
 
 $(BUILD)/README.md: | $(BUILD)
 	@echo "A tiny unix-like kernel in ASM + C!" > $@

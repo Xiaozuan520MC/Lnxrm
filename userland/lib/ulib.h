@@ -129,6 +129,18 @@ static inline long kmmap(long len, int prot)
  * offset, anonymous with a non-zero offset) or ENOMEM (no gap fits). */
 static inline long kmmap_file(long len, int prot, int flags, int fd, long offset)
 { return sys_call6(SYS_mmap, 0, len, prot, flags, fd, offset); }
+
+/* 42 with a caller-chosen address.  MAP_FIXED turns addr from a hint into
+ * a demand: the kernel places the mapping there or refuses with EINVAL --
+ * it never picks somewhere else, and never maps over a range that is
+ * already taken.  A loader needs exactly that, because a shared object's
+ * segments have to land at their link-time offsets from a base it chose
+ * and a mapping at some other address would be a different program.
+ * Returns the address, or EINVAL (unaligned, outside [MMAP_LO, MMAP_TOP),
+ * or colliding with an existing mapping). */
+static inline long kmmap_fixed(long addr, long len, int prot, int flags, int fd,
+                               long offset)
+{ return sys_call6(SYS_mmap, addr, len, prot, flags, fd, offset); }
 static inline long kmunmap(long addr, long len)
 { return sys_call3(SYS_munmap, addr, len, 0); }
 /* 44: mprotect -- re-protect [addr, addr+len) (len rounds up to a page).

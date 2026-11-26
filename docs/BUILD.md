@@ -49,14 +49,14 @@ trampoline.S ─nasm─► bin ─llvm-objcopy─► .o  ├─ ld.lld -T arch/k
 ktest/*.c（仅 KTEST=1）──cc──► .o           │      └─ llvm-objcopy -O binary ─► vmlinux.bin ─┐
 setup.asm ─nasm─► 补零 2 KiB 整数倍 ─patch_setup_jmp.py─► setup.bin ────────────────┴─ cat ─► patch_bzimage.py ─► bzImage
 
-userland/bin/*.c + crt0.S + ulib.c ─► build/user/<名>（静态 ELF）
-userland/mod/*.c + crt0.S + ulib.c ─► build/mod/<名>.km（同配方，独立对象子目录；`.km` 是链接目标名的一部分）
-build/user/* + build/mod/* + README.md ──mke2fs + debugfs──► build/disk.img（/README.md、/bin、/mod）
+userland/bin/*.c + crt0.S + ulib.c ─► build/user/<名>（init 静态 ELF 链在 `0x7f8000400000`；其余程序 `-pie` 链的 ET_DYN，link-at-0，基址由内核 `elf_place()` 选并在 `AT_BASE`/`AT_ENTRY` 里公布）
+userland/mod/*.c + crt0.S + ulib.c ─► build/mod/<名>.km（同上 ET_DYN，装进 `/mod` 由 `init` 扫目录拉起；`.km` 是链接目标名的一部分）
+build/user/* + build/mod/* + README.md ──mke2fs + debugfs──► build/disk.img（/README.md、/bin、/mod，/lib 下装 `ld.so` + `libulib.so`）
 ```
 
 - 源文件用 `find`/`wildcard` 自动发现：新增内核 `.c`、`userland/bin/*.c` 或 `userland/mod/*.c` 不用改 Makefile；头依赖由 `-MMD -MP` 的 `.d` 跟踪。
 - 对象按 `KTEST` 分目录（`build/obj0` / `build/obj1`），两种模式并存，`make` ↔ `make KTEST=1` 切换只重链一次（0.2 s、零 `CC`），不再全量重编 70 个 TU——旧的 `build/.ktest-mode-<n>` stamp 因此删除。**模式标记 `build/.mode-<n>` 必须挂在 `vmlinux.elf` 上、不能挂在对象上**：翻转后每个 `.o` 都比 elf 旧，标记不挂链上，`make` 就会认定上一模式的 `bzImage` 仍最新，把 `KTEST=1` 的内核当 `KTEST=0` 发给你；挂回对象上则又变回全量重编。**该规则还必须排在 `all:` 之后**——它是 Makefile 里第一个不以 `.` 开头的目标，写在 `all:` 前面会夺走默认目标，`make` 从此只检查这个标记、再也不建 `bzImage`。产物一律仍在 `build/` 根（`smoke_test.py` 硬编码 `bzImage`/`vmlinux.elf`/`setup.bin`/`disk.img`/`user/`），`make clean` 照旧整个删。
-- 关键标志：`-ffreestanding -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone -mno-sse* -mcmodel=kernel -Os -g -ffunction-sections -fno-pic`（优化档是 **`-Os`** 而非 -O2；`-fno-omit-frame-pointer` 是 PP2 backtrace 的前提——`-Os` 下 clang 默认丢 rbp，帧指针走链会当场断掉）；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`，链接 `-nostdlib -nostartfiles -static`（链接专用开关单独放 `USERLDFLAGS`，混进编译命令会被 clang 报 `-Wunused-command-line-argument`），链接在 `0x7f8000400000`。
+- 关键标志：`-ffreestanding -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone -mno-sse* -mcmodel=kernel -Os -g -ffunction-sections -fno-pic`（优化档是 **`-Os`** 而非 -O2；`-fno-omit-frame-pointer` 是 PP2 backtrace 的前提——`-Os` 下 clang 默认丢 rbp，帧指针走链会当场断掉）；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`（静态 init）、`-ffreestanding -fPIC ... -Ilib -I../include`（动态程序与 ld.so，`-fno-pie` 改为 `-pie`，不再烙 `--image-base`）；链接 `-nostdlib -nostartfiles -static`（静态 init，`USERLDFLAGS`，链接专用开关单独放，混进编译命令会被 clang 报 `-Wunused-command-line-argument`）、`-nostdlib -nostartfiles -fuse-ld=lld -pie -Wl,--hash-style=sysv -Wl,--dynamic-linker=/lib/ld.so -L$(LIBDIR) -lulib`（动态程序），ld.so 自身用 `--dynamic-linker=`（空，避免给解释器本身挂 PT_INTERP）。链接在 `0x7f8000400000`（静态 init）；动态程序 link-at-0。
 - `vmlinux.elf` 查符号：`grep <sym> build/vmlinux.map` 或 `nm build/vmlinux.elf`。
 - `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；它在 `arch/kernel.ld` 里**显式摆成 `.trampoline` 段**（VMA = `.image` 末尾、LMA 紧随其后），不能留作孤儿段——GNU ld 与 ld.lld 对孤儿段的摆放不同，lld 会因 `.trampoline` 压在 `.bss` 负载地址上直接报 `load address range overlaps with .bss` 而拒链。`setup.bin` 依赖 `vmlinux.elf` 只为 `nm` 查 `_start32/64` 回填跳转；`patch_bzimage.py` 填 boot protocol 头并断言 `HdrS`/`0x55AA`/对齐。
 - 链接器与对象工具是 LLVM 一套（2026-11-14 换链：`ld` → `ld.lld`、`objcopy` → `llvm-objcopy`）。几个坑：lld 不认 GNU 的 `--no-warn-rwx-segments`（它本身也没有 RWX 段警告，直接删）；link map 要写成 `-Map <file>`（空格形式），`-Map=<file>` 不产文件。

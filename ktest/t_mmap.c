@@ -100,6 +100,70 @@ static void test_mmap_syscall_dispatch(void)
 }
 KTEST("mmap", KTEST_LATE, test_mmap_syscall_dispatch);
 
+/* ================= MAP_FIXED ================= */
+/* S3: a loader maps a shared object's segments at their link-time offsets
+ * from a base it chose, so addr has to become a demand.  Two properties
+ * matter to it and are asserted here: an address that is free is honoured
+ * exactly, and one that is not is REFUSED -- never mapped over, never
+ * satisfied somewhere else, because either would hand the loader a
+ * different program than the one it linked. */
+static void test_mmap_fixed(void)
+{
+    K_ASSERT(current->vmas == NULL);
+    u64 count_before = vmm_count_user_pages(current->pml4);
+
+    long a = syscall_probe(SYS_mmap, 0, 0x8000, LNXRM_PROT_READ | LNXRM_PROT_WRITE);
+    K_ASSERT(a > 0);
+
+    /* a free address inside the window is honoured exactly */
+    long want = (long)((u64)a - 0x4000);
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, (u64)want, 0x1000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), want);
+    /* ...and it really landed there, which is the point of the flag */
+    int found = 0;
+    for (struct vma *v = current->vmas; v; v = v->next)
+        if (v->start == (u64)want && v->end == (u64)want + 0x1000) found = 1;
+    K_EXPECT(found);
+
+    /* a collision is refused: wholly, and when only the tail overlaps */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, (u64)a, 0x1000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), LNXRM_EINVAL);
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, (u64)a + 0x7000, 0x2000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), LNXRM_EINVAL);
+    /* unaligned, and outside the mmap window */
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, (u64)want + 1, 0x1000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), LNXRM_EINVAL);
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, USER_BASE, 0x1000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), LNXRM_EINVAL);
+    K_EXPECT_EQ(syscall_probe(SYS_mmap, (u64)want, 0x1000, LNXRM_PROT_READ),
+                LNXRM_EINVAL); /* MAP_FIXED absent: a hint stays refused */
+
+    /* the loader's own sequence -- reserve a span, hand it back, place
+     * segments into the hole at fixed offsets -- is what proves the flag
+     * composes: the reservation above cannot be reused until it is
+     * unmapped, and once it is, two segments land with a gap between
+     * them that nothing else claimed. */
+    long span = syscall_probe(SYS_mmap, 0, 0x5000, LNXRM_PROT_NONE);
+    K_ASSERT(span > 0);
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)span, 0x5000, 0), 0);
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, (u64)span, 0x1000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), span);
+    K_EXPECT_EQ(syscall_probe6(SYS_mmap, (u64)span + 0x2000, 0x1000, LNXRM_PROT_READ,
+                               LNXRM_MAP_FIXED, (u64)-1, 0), span + 0x2000);
+
+    /* none of the refusals mapped anything */
+    K_EXPECT_EQ(vmm_count_user_pages(current->pml4), count_before);
+    K_EXPECT_EQ(current->mem_pages, count_before);
+
+    /* restore: both regions gone, list back to the state this case found */
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)span, 0x5000, 0), 0);
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)want, 0x1000, 0), 0);
+    K_EXPECT_EQ(syscall_probe(SYS_munmap, (u64)a, 0x8000, 0), 0);
+    K_EXPECT(current->vmas == NULL);
+    K_EXPECT_EQ(vmm_count_user_pages(current->pml4), count_before);
+}
+KTEST("mmap", KTEST_LATE, test_mmap_fixed);
+
 /* ================= demand paging ================= */
 static void test_mmap_demand_pager(void)
 {

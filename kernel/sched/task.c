@@ -331,6 +331,129 @@ static long exec_read_image(const char *path, void **img_out, size_t *sz_out)
     return 0;
 }
 
+/* What exec_load_images() learned about the images it mapped. */
+struct exec_images {
+    u64 entry;           /* AT_ENTRY: the program's entry, bias applied */
+    u64 start;           /* where ring 3 begins: the interpreter's entry,
+                          * or `entry` when there is no interpreter */
+    u64 brk;             /* first free byte past BOTH images */
+    u64 pbias;           /* program load bias (0 for an ET_EXEC program) */
+    u64 ibias;           /* interpreter load bias, 0 when there is none */
+    struct elf_phdrs ph; /* the program's header table, in LINK addresses */
+};
+
+/* Read `path`, read the interpreter it names (if any), prove the two
+ * cannot collide, and map both into `pml4`.  Returns 0 or a negative
+ * LNXRM_E*.  On failure every buffer is freed and only pages already
+ * mapped into `pml4` remain -- `pml4` belongs to the caller, which is what
+ * makes the cleanup on both sides of this identical: destroy it.
+ *
+ * Deliberately NO vmm_switch_to() in here: elf_load*() map and fill every
+ * frame through the high-half alias against an explicit `pml4` root, so
+ * this works under ANY address space (see elf.c).  Switching CR3 this
+ * early would open a window in which CR3 was the new root while
+ * current->pml4 still named the old one -- the exact state the #PF report
+ * calls (*MISMATCH*).  The switch belongs to the caller's point of no
+ * return, not here.
+ *
+ * sys_execve() and kernel_spawn() both come through here so the placement
+ * rule, the overlap proof and the auxiliary vector can never drift apart
+ * between the two ways a program gets started. */
+static long exec_load_images(u64 pml4, const char *path, struct exec_images *out)
+{
+    void *img = NULL, *iimg = NULL;
+    size_t sz = 0, isz = 0;
+    long err = 0;
+    u64 cursor = USER_BASE;
+    u64 pbias = 0, plo = 0, phi = 0;
+    u64 ibias = 0, ilo = 0, ihi = 0;
+    u64 entry = 0, brk = 0, ientry = 0, ibrk = 0;
+    int ptype = 0, itype = 0;
+
+    if ((err = exec_read_image(path, &img, &sz)) < 0) return err;
+
+    /* PT_INTERP names the program's dynamic linker.  It is read here,
+     * before any new mapping exists, so an unreadable interpreter is a
+     * plain error return instead of a half-built address space to unwind.
+     * A static image takes none of these branches and behaves exactly as
+     * it did before interpreters existed. */
+    char ipath[128];
+    int interp = elf_interp_path(img, sz, ipath, sizeof ipath);
+    if (interp < 0) {
+        err = LNXRM_ENOEXEC;
+        goto fail;
+    }
+    if (interp && (err = exec_read_image(ipath, &iimg, &isz)) < 0) goto fail;
+
+    /* Both images are in hand, which is the cheap place to prove they fit:
+     * elf_load*() reuses a page that is already mapped rather than failing,
+     * so overlapping spans would have their bytes silently merged instead
+     * of one image being refused.  elf_place() assigns each image a load
+     * bias from one running cursor, so the spans below are bias + link
+     * span -- for an ET_EXEC image the bias is 0 and the link span already
+     * is where it lands. */
+    ptype = elf_place(img, sz, &cursor, &pbias, &plo, &phi);
+    if (ptype < 0) {
+        err = LNXRM_ENOEXEC;
+        goto fail;
+    }
+    if (iimg) {
+        itype = elf_place(iimg, isz, &cursor, &ibias, &ilo, &ihi);
+        if (itype < 0) {
+            err = LNXRM_ENOEXEC;
+            goto fail;
+        }
+        if (pbias + plo < ibias + ihi && ibias + ilo < pbias + phi) {
+            err = LNXRM_ENOEXEC;
+            goto fail;
+        }
+    }
+
+    entry = (ptype == ET_DYN) ? elf_load_dyn(pml4, img, sz, pbias, &brk)
+                              : elf_load(pml4, img, sz, &brk);
+    if (!entry) {
+        err = LNXRM_ENOEXEC;
+        goto fail;
+    }
+
+    /* The auxiliary vector describes the PROGRAM, so it is gathered while
+     * its image is still allocated.  elf_load*() has just accepted this
+     * image, and elf_get_phdrs() checks a strict subset of what they
+     * checked, so a failure here is not reachable -- the zeroed struct
+     * keeps the published values honest if that ever stops being true. */
+    memset(&out->ph, 0, sizeof out->ph);
+    elf_get_phdrs(img, sz, &out->ph);
+    kfree(img);
+    img = NULL;
+
+    /* Execution starts at the interpreter when there is one: it links the
+     * program and then jumps to AT_ENTRY.  brk must clear BOTH images, so
+     * the higher of the two wins. */
+    if (iimg) {
+        ientry = (itype == ET_DYN) ? elf_load_dyn(pml4, iimg, isz, ibias, &ibrk)
+                                   : elf_load(pml4, iimg, isz, &ibrk);
+        kfree(iimg);
+        iimg = NULL;
+        if (!ientry) {
+            err = LNXRM_ENOEXEC;
+            goto fail;
+        }
+        if (ibrk > brk) brk = ibrk;
+    }
+
+    out->entry = entry;
+    out->start = ientry ? ientry : entry;
+    out->brk = brk;
+    out->pbias = pbias;
+    out->ibias = ibias;
+    return 0;
+
+fail:
+    if (img) kfree(img);
+    if (iimg) kfree(iimg);
+    return err;
+}
+
 /* The point of no return, in one place: the new address space is adopted,
  * the old one goes away, and everything that describes "this process" --
  * heap, stack watermark, accounting, open files, name, signal state --
@@ -403,12 +526,34 @@ static void exec_commit(const struct exec_args *a, u64 old_pml4, u64 new_pml4,
     memset(current->sig_masks, 0, sizeof(current->sig_masks));
 }
 
+/* Auxiliary vector entries execve publishes after envp, as (type, value)
+ * pairs terminated by AT_NULL.  The kernel fills these from what it learned
+ * while loading the image -- nothing here is computed for its own sake.
+ * AT_BASE reports the interpreter's load bias: 0 when there is none (a
+ * static image) or the interpreter is an ET_EXEC linked at absolute
+ * addresses, and the bias elf_place() chose otherwise.  It is the one
+ * number in here the kernel knows and the program cannot work out for
+ * itself -- see userland/ldso. */
+struct exec_auxv {
+    u64 phdr;   /* AT_PHDR: where the program header table was mapped */
+    u64 phent;  /* AT_PHENT */
+    u64 phnum;  /* AT_PHNUM */
+    u64 entry;  /* AT_ENTRY: where execution resumes once linked */
+    u64 base;   /* AT_BASE: the interpreter's load bias */
+};
+
 /* User stack per the SysV AMD64 process-entry layout:
  *   [strings]
- *   argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL | auxv NULL
+ *   argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL | auxv pairs
  * rsp is 16-byte aligned at entry, as the ABI requires.  Returns the rsp
- * the new image starts from. */
-static u64 exec_build_stack(const struct exec_args *a)
+ * the new image starts from.
+ *
+ * Takes argc/argv/envc/envp rather than the whole `struct exec_args` so
+ * kernel_spawn() can build init's one-argument frame without putting two
+ * kilobytes of argument scratch on the 16 KiB boot stack -- it never read
+ * `path`, so nothing is lost by narrowing the interface. */
+static u64 exec_build_stack(int argc, char (*argv)[EXEC_ARG_LEN], int envc,
+                            char (*envp)[EXEC_ARG_LEN], const struct exec_auxv *aux)
 {
     u64 sp = USER_STACK_TOP;
     u64 argv_ptrs[EXEC_MAX_ARGS + 1];
@@ -422,33 +567,52 @@ static u64 exec_build_stack(const struct exec_args *a)
 
     sp -= 64;
     *(u64 *)sp = 0;
-    for (int i = a->envc - 1; i >= 0; i--) {
-        size_t len = strlen(a->envp[i]) + 1;
+
+    for (int i = envc - 1; i >= 0; i--) {
+        size_t len = strlen(envp[i]) + 1;
         sp -= len;
-        memcpy((void *)sp, a->envp[i], len);
+        memcpy((void *)sp, envp[i], len);
         envp_ptrs[i] = sp;
     }
-    for (int i = a->argc - 1; i >= 0; i--) {
-        size_t len = strlen(a->argv[i]) + 1;
+    for (int i = argc - 1; i >= 0; i--) {
+        size_t len = strlen(argv[i]) + 1;
         sp -= len;
-        memcpy((void *)sp, a->argv[i], len);
+        memcpy((void *)sp, argv[i], len);
         argv_ptrs[i] = sp;
     }
 
-    /* argc + argv + NULL + envp + NULL + two AT_NULL words */
-    u64 slots = 1 + (u64)a->argc + 1 + (u64)a->envc + 1 + 2;
+    /* argc + argv + NULL + envp + NULL + auxv + AT_NULL.  Six entries plus
+     * the terminator make seven pairs, so fourteen words.  Only keys
+     * something actually reads are written: PHDR/PHENT/PHNUM locate the
+     * program's header table for the dynamic linker, PAGESZ tells it the
+     * page size instead of making it assume one, ENTRY is where it jumps
+     * when the link is done, and BASE is where the kernel put the loader
+     * itself. */
+    u64 slots = 1 + (u64)argc + 1 + (u64)envc + 1 + 2 * 7;
     u64 bytes = slots * 8;
     u64 pad = (16 - (bytes & 15)) & 15;
 
     sp &= ~15UL;
     sp -= bytes + pad;
     u64 *p = (u64 *)sp;
-    *p++ = (u64)a->argc;
-    for (int i = 0; i < a->argc; i++) *p++ = argv_ptrs[i];
+    *p++ = (u64)argc;
+    for (int i = 0; i < argc; i++) *p++ = argv_ptrs[i];
     *p++ = 0;
-    for (int i = 0; i < a->envc; i++) *p++ = envp_ptrs[i];
+    for (int i = 0; i < envc; i++) *p++ = envp_ptrs[i];
     *p++ = 0;
-    *p++ = 0; /* auxv AT_NULL tag */
+    *p++ = LNXRM_AT_PHDR;
+    *p++ = aux->phdr;
+    *p++ = LNXRM_AT_PHENT;
+    *p++ = aux->phent;
+    *p++ = LNXRM_AT_PHNUM;
+    *p++ = aux->phnum;
+    *p++ = LNXRM_AT_PAGESZ;
+    *p++ = PAGE_SIZE;
+    *p++ = LNXRM_AT_ENTRY;
+    *p++ = aux->entry;
+    *p++ = LNXRM_AT_BASE;
+    *p++ = aux->base;
+    *p++ = LNXRM_AT_NULL;
     *p++ = 0;
 
     smap_leave(ac_smap);
@@ -462,47 +626,46 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     long err = exec_copy_args(&a, upath, uargv, uenvp);
     if (err < 0) return err;
 
-    void *img = NULL;
-    size_t sz = 0;
-    if ((err = exec_read_image(a.path, &img, &sz)) < 0) return err;
-
     u64 old_pml4 = current->pml4;
     u64 new_pml4 = vmm_new_user_aspace();
-    if (!new_pml4) {
-        kfree(img);
-        return LNXRM_ENOMEM;
-    }
+    if (!new_pml4) return LNXRM_ENOMEM;
 
     /* map a fresh user stack (16 KiB) below USER_STACK_TOP */
     if (user_stack_map(new_pml4) < 0) {
-        kfree(img); /* was leaked */
         vmm_destroy_user_aspace(new_pml4);
         return LNXRM_ENOMEM;
     }
 
-    u64 entry = 0, brk_end = 0;
-          /* Deliberately NO vmm_switch_to() here: elf_load() maps and fills every
-           * frame through the high-half alias and an explicit `pml4` root, so it
-           * works under ANY address space (see elf.c).  Switching CR3 this early
-           * opened a window in which CR3 was the new root while current->pml4
-           * still named the old one -- the exact state the #PF report calls
-           * (*MISMATCH*).  The switch happens at the point of no return, two
-           * instructions before current->pml4 is published. */
-    entry = elf_load(new_pml4, img, sz, &brk_end);
-    kfree(img);
-    if (!entry) {
-        /* ELF load failed: the caller's address space was never left, so
-         * there is nothing to switch back to -- POSIX says exec failure
-         * returns to the caller. */
+    /* Read both images, place them and map them.  Deliberately NO
+     * vmm_switch_to() in here: elf_load*() maps and fills every frame
+     * through the high-half alias and an explicit `pml4` root, so it works
+     * under ANY address space (see elf.c).  Switching CR3 this early opened
+     * a window in which CR3 was the new root while current->pml4 still
+     * named the old one -- the exact state the #PF report calls
+     * (*MISMATCH*).  The switch happens at the point of no return, two
+     * instructions before current->pml4 is published.
+     *
+     * On failure the caller's address space was never left, so there is
+     * nothing to switch back to -- POSIX says exec failure returns to the
+     * caller -- and the only cleanup is destroying what was built here. */
+    struct exec_images im;
+    memset(&im, 0, sizeof im);
+    if ((err = exec_load_images(new_pml4, a.path, &im)) < 0) {
         vmm_destroy_user_aspace(new_pml4);
-        return LNXRM_ENOEXEC;
+        return err;
     }
 
-    exec_commit(&a, old_pml4, new_pml4, brk_end);
-    u64 sp = exec_build_stack(&a);
+    exec_commit(&a, old_pml4, new_pml4, im.brk);
+    /* AT_PHDR is the program's header table at the address it was actually
+     * mapped to: elf_get_phdrs() reports link addresses, so the program's
+     * own load bias has to be added (an ET_EXEC program has bias 0, which
+     * makes this a no-op for it). */
+    struct exec_auxv auxv = {im.ph.vaddr + im.pbias, im.ph.entsize, im.ph.count,
+                             im.entry, im.ibias};
+    u64 sp = exec_build_stack(a.argc, a.argv, a.envc, a.envp, &auxv);
 
     struct intr_frame *f2 = current->tf;
-    f2->rip = entry;
+    f2->rip = im.start;
     f2->ussp = sp;
     f2->cs = 0x18 | 3;
     f2->usss = 0x20 | 3;
@@ -692,69 +855,63 @@ int kernel_spawn(const char *path)
         return LNXRM_ENOMEM;
     }
 
-    struct file *f = NULL;
-    if (vfs_open_file(path, O_RDONLY, &f) < 0) {
-        kprintf("[init] cannot open %s\n", path);
-        vmm_destroy_user_aspace(t->pml4);
-        kfree(t->kstack);
-        task_free_slot(t);
-        return LNXRM_ENOENT;
-    }
-    size_t sz = vfs_file_size(f);
-    void *img = kmalloc(ALIGN_UP(sz + 1, PAGE_SIZE));
-    if (!img) {
-        vfs_close_file(f);
-        vmm_destroy_user_aspace(t->pml4);
-        kfree(t->kstack);
-        task_free_slot(t);
-        return LNXRM_ENOMEM;
-    }
-    if (vfs_read_file(f, img, sz) != (long)sz) {
-        kfree(img);
-        vfs_close_file(f);
-        vmm_destroy_user_aspace(t->pml4);
-        kfree(t->kstack);
-        task_free_slot(t);
-        return LNXRM_EIO;
-    }
-    vfs_close_file(f);
-
     if (user_stack_map(t->pml4) < 0) {
-        kfree(img);
         vmm_destroy_user_aspace(t->pml4);
         kfree(t->kstack);
         task_free_slot(t);
         return LNXRM_ENOMEM;
     }
 
-    /* elf_load() fills frames through the high-half alias and an explicit
-     * `t->pml4` root, so CR3 need not point there yet -- and must not: this
-     * runs as the idle task, whose own root is master_pml4_phys(), so
-     * switching here would hold CR3 != current->pml4 across the whole load.
-     * The switch moves down to the first direct user-VA store. */
-    u64 entry = elf_load(t->pml4, img, sz, (u64 *)&t->brk_base);
-    kfree(img);
-    if (!entry) {
+    /* Read both images, place them and map them -- the same helper
+     * sys_execve() uses, so init and every execve'd program get the same
+     * placement rule, the same overlap proof and the same auxiliary
+     * vector.  elf_load*() fills frames through the high-half alias and an
+     * explicit `t->pml4` root, so CR3 need not point there yet -- and must
+     * not: this runs as the idle task, whose own root is
+     * master_pml4_phys(), so switching here would hold
+     * CR3 != current->pml4 across the whole load.  The switch moves down to
+     * the first direct user-VA store. */
+    struct exec_images im;
+    memset(&im, 0, sizeof im);
+    long ierr = exec_load_images(t->pml4, path, &im);
+    if (ierr < 0) {
         vmm_destroy_user_aspace(t->pml4);
         kfree(t->kstack);
         task_free_slot(t);
-        return LNXRM_ENOEXEC;
+        return ierr;
     }
+    t->brk_base = (void *)im.brk;
 
-    /* Initial user stack: path string + argc/argv/NULL words.  Direct
-     * user-VA stores, so they need their own SMAP window (this is the
-     * kernel_spawn twin of sys_execve's argv/auxv build below) -- and CR3
-     * has to name the new address space while they run. */
+    /* Initial user stack: path string + argc/argv/NULL + auxv.  Direct
+     * user-VA stores, so they need their own SMAP window -- and CR3 has
+     * to name the new address space while they run.  The auxv describes
+     * the MODULE, so it carries the module's own bias in AT_PHDR and the
+     * interpreter's in AT_BASE. */
     vmm_switch_to(t->pml4);
     u64 sp = USER_STACK_TOP - 256;
     u64 ac_sp = smap_enter();
     strcpy((char *)sp, path);
     u64 argp[2] = {sp, 0};
-    u64 ap = sp - 32;
-    ((u64 *)ap)[0] = 1;
-    ((u64 *)ap)[1] = argp[0];
-    ((u64 *)ap)[2] = 0;
-    ((u64 *)ap)[3] = 0;
+    /* argc + argv[0] + NULL + envp NULL + auxv 6 pairs + AT_NULL pair = 18 words */
+    u64 ap = sp - 18 * 8;
+    ((u64 *)ap)[0] = 1;            /* argc */
+    ((u64 *)ap)[1] = argp[0];      /* argv[0] */
+    ((u64 *)ap)[2] = 0;            /* argv[1] NULL */
+    ((u64 *)ap)[3] = 0;            /* envp NULL */
+    ((u64 *)ap)[4] = LNXRM_AT_PHDR;
+    ((u64 *)ap)[5] = im.ph.vaddr + im.pbias;
+    ((u64 *)ap)[6] = LNXRM_AT_PHENT;
+    ((u64 *)ap)[7] = im.ph.entsize;
+    ((u64 *)ap)[8] = LNXRM_AT_PHNUM;
+    ((u64 *)ap)[9] = im.ph.count;
+    ((u64 *)ap)[10] = LNXRM_AT_PAGESZ;
+    ((u64 *)ap)[11] = PAGE_SIZE;
+    ((u64 *)ap)[12] = LNXRM_AT_ENTRY;
+    ((u64 *)ap)[13] = im.entry;
+    ((u64 *)ap)[14] = LNXRM_AT_BASE;
+    ((u64 *)ap)[15] = im.ibias;
+    ((u64 *)ap)[16] = LNXRM_AT_NULL;
+    ((u64 *)ap)[17] = 0;
     smap_leave(ac_sp);
 
     vmm_switch_to(master_pml4_phys());
@@ -769,7 +926,7 @@ int kernel_spawn(const char *path)
 
     struct intr_frame *tf = (struct intr_frame *)(t->kstack_top - sizeof(struct intr_frame));
     memset(tf, 0, sizeof(*tf));
-    tf->rip = entry;
+    tf->rip = im.start;
     tf->ussp = ap;
     tf->cs = 0x18 | 3;
     tf->usss = 0x20 | 3;
@@ -786,7 +943,7 @@ int kernel_spawn(const char *path)
     t->rq_next = NULL;
     t->state = T_RUNNABLE;
     runqueue_add(t);
-    kprintf("[task] spawned pid=%u (%s) entry=%#lx sp=%#lx\n", t->pid, path, entry, ap);
+    kprintf("[task] spawned pid=%u (%s) entry=%#lx sp=%#lx\n", t->pid, path, im.start, ap);
     return t->pid;
 }
 
