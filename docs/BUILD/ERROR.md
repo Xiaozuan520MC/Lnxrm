@@ -8,6 +8,7 @@
 
 - **串口**（最常用）：所有 `kprintf` 走这里，`-serial stdio` 直看 / `file:` 存档 / `null` 让给 gdb。
 - **debugcon 早期标记**（最快的分诊）：`arch/entry64.S` 向端口 `0xE9` 打单字符，`-debugcon stdio` 才可见——`K`(进 `_start64`) `b`(段寄存器) `c`(主页表) `d`(.activate) `f`(CR4.PAE) `e`(load_cr3) `M`(bss 清完、进 C)。`KbcdfeM` 全有 = 已到 C 世界门口；串口要 `console_init()` 之后才有。
+- **解压 stub 串口标记**：`arch/decompress_head.S` 在 COM1 直接打 `D`(进 stub) `1`(inflate blob 搬到 `0x200000`) `2`(gzip 搬到 `0x300000`) `I`(即将跳 `inflate_main`)，`-serial stdio` 即可见。`D12I` 之后无输出 = 解压失败或入口跳转失败，按第 7 节对应行排查。
 - **GDB**：构建带 `-O2 -g` / nasm `-F dwarf -g`。
   ```sh
   qemu-system-x86_64 ... -serial null -S -s   # 冻结 + TCP 1234 stub
@@ -28,11 +29,12 @@
 | 链接报 `undefined symbol: trampoline_start` | **`BUILD=` 被覆盖到别处**：`Makefile` 的 `--redefine-sym _binary_build_trampoline_bin_*` 写死了默认路径，而 `llvm-objcopy -I binary` 的符号名由输入路径导出 | 用默认 `BUILD=build`（唯一受支持的用法）；或手工按实际路径重新 `--redefine-sym` 生成 `$(OBJDIR)/trampoline.o` |
 | 光盘启动停在 `Stop!`，`cannot open /bin/init` | `disk.img` 损坏/过期（`imageiso` 不重建） | `rm build/disk.img && make build/disk.img`，`e2fsck -n` 复核 |
 | `e2fsck -n` 报错（计数对不上、目录记录越界等） | 上一轮 QEMU 被杀在写盘中途——**QEMU 直接写 `build/disk.img`，没有快照**；或驱动留了不一致的元数据 | `rm build/disk.img && make build/disk.img` 重建；若是稳定复现，那是驱动的 bug 不是镜像的 |
-| `patch_setup_jmp.py` 找不到 `jmp 0x18:0xF00DFACE` | 哨兵跳转被改，或缺 `_start32/64` | `grep -n F00DFACE arch/setup.asm`；`nm build/vmlinux.elf \| grep _start` |
+| `patch_setup_jmp.py` 找不到 `jmp 0x18:0xF00DFACE` | `setup.asm` 里的哨兵被改或删了（脚本已不查内核符号） | `grep -n F00DFACE arch/setup.asm` |
 | `patch_bzimage.py` 断言失败 | `HdrS`/`0x55AA` 被破坏或 setup 补零逻辑被改 | `xxd -s 0x1f0 -l 32 build/bzImage` |
 | `undefined reference to '__stack_chk_fail'` | 某文件没继承 `-fno-stack-protector` | 检查是否走 `KERNFLAGS`/`USERFLAGS` |
 | 用户态 `undefined reference to '_start'` | 链接没带 `crt0.o` | 走根 Makefile 的 `$(USER_ELFS)` 规则 |
-| 改 `_start32/64` 后跳错地址 | 符号变了但 `setup.bin` 没重 patch | `rm -f build/setup.bin build/bzImage && make` |
+| 改 `_start32/64` 后跳错地址 | `kernel_entry.S` 没重生成（`_start64` 物理入口烘焙在解压 stub 里） | `rm -f build/kernel_entry.S build/decompress.elf build/bzImage && make`；正常会随 `vmlinux.elf` 依赖自动重算 |
+| 串口停在 `D12I` | `inflate()` 返回负数，或 `_start64` 入口地址不对 | 看是否有错误码；核对 `cat build/compressed_size.S build/kernel_entry.S`；也可在宿主机直接编译 `kernel/lib/inflate.c` 单测解压结果 |
 | 串口停在 `M` 无输出 | `console_init`/bootinfo 问题 | gdb 断 `start_kernel` 单步 |
 | `[vfs] no disk found` | AHCI 没探到盘，或镜像既不是合法整盘 ext2、也不是可挂的 FAT32/分区（**不是 IDE 的事**：`ide.c` 已删，只剩 AHCI 一条栈） | `rm build/disk.img` 重建；确认没用 `MACHINE=pc`/`-machine pc`（i440fx 无 AHCI） |
 | GRUB 下 24 bpp 而非 32 | `gfxpayload` 写成逗号形式 | 写 `x32` 形式，见 5.2 |

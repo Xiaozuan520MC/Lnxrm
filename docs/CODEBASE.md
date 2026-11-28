@@ -5,7 +5,7 @@
 | 分类 | 文件 | 内容 |
 |---|---|---|
 | §1 总览 | `CODEBASE/CODEBASE_OVERVIEW.md` | 产物、目录树、容量常量 |
-| §2 启动 | `CODEBASE/CODEBASE_BOOT.md` | `start_kernel` 顺序、页表、GS/MSR 初始化 |
+| §2 启动 | `CODEBASE/CODEBASE_BOOT.md` | 压缩启动链（S3.5）、`start_kernel` 顺序、页表、GS/MSR 初始化 |
 | §3 内存 | `CODEBASE/CODEBASE_MEMORY.md` | buddy、kheap、三槽地址空间、W^X、COW、#PF、mmap、OOM |
 | §4 进程·调度·信号 | `CODEBASE/CODEBASE_PROC.md` | task 槽、fork/execve/exit、调度、信号、凭据 |
 | §5 系统调用与 ABI | `CODEBASE/CODEBASE_SYSCALL.md` | 两道门、sysents 表、swapgs/TLS、arch_prctl、56 项总表 |

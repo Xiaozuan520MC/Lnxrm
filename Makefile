@@ -10,6 +10,9 @@ PYTHON3 := python3
 BUILD   := build
 ARCHDIR := arch
 
+# Root directory for `make install` (mirrors the ext2 root layout).
+INSTALL_DIR ?= $(BUILD)/install
+
 ISO_TREE := $(BUILD)/iso
 ISO_CFG  := $(ISO_TREE)/boot/grub/grub.cfg
 ISO_KRN  := $(ISO_TREE)/boot/bzImage
@@ -27,6 +30,8 @@ endif
 WARN    := -Wall -Wextra -Wno-unused-parameter
 MAKEFLAGS += --no-print-directory
 .DELETE_ON_ERROR:
+.NOTPARALLEL: $(BUILD)/decompress_head.o $(BUILD)/decompress.elf \
+              $(BUILD)/decompress.bin $(BUILD)/bzImage
 
 KTEST ?= 0
 ifeq ($(KTEST),1)
@@ -47,11 +52,12 @@ BASEFLAGS := -ffreestanding -fno-stack-protector -fno-omit-frame-pointer -fno-pi
              -ffunction-sections -fdata-sections $(KTEST_DEFS)
 KERNFLAGS := $(BASEFLAGS) -std=gnu11
 
-.PHONY: all clean run user mod smoke imageiso help
+.PHONY: all clean run user mod install smoke imageiso help
 all: $(BUILD)/bzImage
 
 KASM_ALL := $(shell find arch -name '*.S' 2>/dev/null)
-KASM     := $(filter-out arch/trampoline.S,$(KASM_ALL))
+
+KASM     := $(filter-out arch/trampoline.S arch/decompress_head.S,$(KASM_ALL))
 
 ARCH_SRC_C  := $(shell find arch -name '*.c' 2>/dev/null)
 ARCH_C_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(ARCH_SRC_C))
@@ -105,6 +111,14 @@ user:
 mod:
 	@$(MAKE) -C userland BUILD=$(abspath $(BUILD)) mod
 
+install: user mod $(BUILD)/README.md
+	@printf "  INSTALL $(INSTALL_DIR)\n"
+	@mkdir -p $(INSTALL_DIR)/bin $(INSTALL_DIR)/mod $(INSTALL_DIR)/lib
+	@cp -f $(USER_ELFS) $(INSTALL_DIR)/bin/
+	@cp -f $(MOD_ELFS) $(INSTALL_DIR)/mod/
+	@cp -f $(USER_LIBS) $(INSTALL_DIR)/lib/
+	@cp -f $(BUILD)/README.md $(INSTALL_DIR)/README.md
+
 $(USER_ELFS): $(BUILD)/user/%: userland/bin/%.c userland/lib/ulib.c userland/lib/crt0.S | user
 	@test -f $@
 
@@ -135,16 +149,71 @@ $(BUILD)/vmlinux.bin: $(BUILD)/vmlinux.elf
 	@printf "  OBJCOPY $(SHORT)\n"
 	@$(OBJCOPY) -O binary $< $@
 	
-$(BUILD)/setup.bin: $(ARCHDIR)/setup.asm $(BUILD)/vmlinux.elf | $(BUILD)
+$(BUILD)/setup.bin: $(ARCHDIR)/setup.asm | $(BUILD)
 	@printf "  NASM    $(SHORT)\n"
 	@$(NASM) -f bin -o $@ $<
 	@python3 -c "d=open('$@','rb').read();pad=(2048-len(d)%2048)%2048;open('$@','wb').write(d+b'\x00'*pad)"
-	@$(PYTHON3) scripts/patch_setup_jmp.py $@ $(BUILD)/vmlinux.elf
+	@$(PYTHON3) scripts/patch_setup_jmp.py $@
 
-$(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/vmlinux.bin
+$(BUILD)/inflate.o: kernel/lib/inflate.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	@printf "  CC      $(SHORT)\n"
+	@$(CC) $(KERNFLAGS) -D__LNXRM_KERNEL__ -MMD -MP -c -o $@ $<
+
+$(BUILD)/inflate.elf: $(BUILD)/inflate.o $(ARCHDIR)/inflate.ld | $(OBJDIR)
+	@printf "  LD      $(SHORT)\n"
+	@$(LD) -T $(ARCHDIR)/inflate.ld -o $@ $(BUILD)/inflate.o
+
+$(BUILD)/compressed_size.S: $(BUILD)/vmlinux.bin.gz | $(BUILD)
+	@printf "  GEN     $(SHORT)\n"
+	@printf 'section .rodata\n\tglobal compressed_size\ncompressed_size:\n\tdq %s\n' $$(stat -c%s $(BUILD)/vmlinux.bin.gz) > $@
+
+$(BUILD)/compressed_size.o: $(BUILD)/compressed_size.S | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	@printf "  NASM    $(SHORT)\n"
+	@$(NASM) -f elf64 -o $@ $<
+
+$(BUILD)/inflate_main.S: $(BUILD)/inflate.elf | $(BUILD)
+	@printf "  GEN     $(SHORT)\n"
+	@printf 'section .text\n\tglobal inflate_main_addr\ninflate_main_addr:\n\tdq 0x%s\n' $$(nm $(BUILD)/inflate.elf | awk '/ T inflate_main$$/{print $$1}') > $@
+
+$(BUILD)/inflate_main.o: $(BUILD)/inflate_main.S | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	@printf "  NASM    $(SHORT)\n"
+	@$(NASM) -f elf64 -o $@ $<
+
+$(BUILD)/kernel_entry.S: $(BUILD)/vmlinux.elf | $(BUILD)
+	@printf "  GEN     $(SHORT)\n"
+	@printf 'section .rodata\n\tglobal kernel_entry_addr\nkernel_entry_addr:\n\tdq 0x%s\n' $$(nm $(BUILD)/vmlinux.elf | awk '/ kernel_entry_phys$$/{print $$1}') > $@
+
+$(BUILD)/kernel_entry.o: $(BUILD)/kernel_entry.S | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	@printf "  NASM    $(SHORT)\n"
+	@$(NASM) -f elf64 -o $@ $<
+
+$(BUILD)/decompress_head.o: $(ARCHDIR)/decompress_head.S $(BUILD)/inflate.elf | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	@printf "  OBJCOPY+NASM $(SHORT)\n"
+	@$(OBJCOPY) -O binary $(BUILD)/inflate.elf $(BUILD)/inflate.bin && \
+	 $(NASM) -f elf64 -F dwarf -g -o $@ $<
+
+$(BUILD)/decompress.elf: $(BUILD)/decompress_head.o $(BUILD)/compressed_size.o $(BUILD)/inflate_main.o $(BUILD)/kernel_entry.o $(ARCHDIR)/decompress.ld | $(OBJDIR)
+	@printf "  LD      $(SHORT)\n"
+	@$(LD) -T $(ARCHDIR)/decompress.ld -o $@ $(BUILD)/decompress_head.o $(BUILD)/compressed_size.o $(BUILD)/inflate_main.o $(BUILD)/kernel_entry.o
+
+$(BUILD)/decompress.bin: $(BUILD)/decompress.elf | $(BUILD)
+	@printf "  OBJCOPY $(SHORT)\n"
+	@$(OBJCOPY) -O binary $< $@
+	@python3 -c "d=open('$@','rb').read();pad=(512-len(d)%512)%512;open('$@','wb').write(d+b'\x00'*pad)"
+
+$(BUILD)/vmlinux.bin.gz: $(BUILD)/vmlinux.bin | $(BUILD)
+	@printf "  GZIP    $(SHORT)\n"
+	@gzip -n -9 < $< > $@
+
+$(BUILD)/bzImage: $(BUILD)/setup.bin $(BUILD)/decompress.bin $(BUILD)/vmlinux.bin.gz
 	@printf "  BZIMAGE $(SHORT)\n"
-	@cat $(BUILD)/setup.bin $(BUILD)/vmlinux.bin > $@
-	@$(PYTHON3) scripts/patch_bzimage.py $@ $$(( $$(stat -c%s $(BUILD)/setup.bin) ))
+	@cat $(BUILD)/setup.bin $(BUILD)/decompress.bin $(BUILD)/vmlinux.bin.gz > $@
+	@$(PYTHON3) scripts/patch_bzimage.py $@ $$(stat -c%s $(BUILD)/setup.bin)
 	@printf "  SIZE    %s bytes\n" $$(stat -c%s $@)
 	@printf "  Done!\n"
 
@@ -157,6 +226,7 @@ help:
 	@echo make clean
 	@echo make user
 	@echo make mod
+	@echo 'make install INSTALL_DIR=<dir>'
 	@echo make run
 	@echo make smoke
 	@echo make imageiso
@@ -191,8 +261,8 @@ $(ISO_CFG): | $(BUILD)
 	  "set timeout=$(GRUB_TIMEOUT)" \
 	  'set default=0' \
 	  'insmod all_video' \
-	  'set gfxmode=1920x1080x32,1280x720x32,auto' \
-	  'set gfxpayload=1920x1080x32,1280x720x32,keep' \
+	  'set gfxmode=1920x1080x32,auto' \
+	  'set gfxpayload=1920x1080x32,keep' \
 	  'menuentry "lnxrm" {' \
 	  '  linux /boot/bzImage console=ttyS0' \
 	  '  boot' \

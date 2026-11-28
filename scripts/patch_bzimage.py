@@ -65,6 +65,21 @@ def main():
     syssize = (payload + 15) // 16
     struct.pack_into("<I", data, 0x1F4, syssize)
 
+    # setup.bin (loaded at 0x90000) shares the same header bytes as the
+    # bzImage prefix; keep its syssize in sync so the standalone copy stays
+    # consistent with the final image.  The decompress stub does NOT read
+    # this field: it uses the compressed size baked in by the Makefile.
+    import os
+    setup_bin_path = os.path.join(os.path.dirname(path), "setup.bin")
+    try:
+        with open(setup_bin_path, "r+b") as sf:
+            sdata = bytearray(sf.read())
+            struct.pack_into("<I", sdata, 0x1F4, syssize)
+            sf.seek(0)
+            sf.write(bytes(sdata))
+    except OSError:
+        pass
+
     # ---- code32_start (0x214): 32-bit protected-mode entry --------------
     # We leave this alone; setup.asm already sets it to 0x100000.
     # Uncomment and set if you move the payload:

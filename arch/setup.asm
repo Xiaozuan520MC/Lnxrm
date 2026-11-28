@@ -5,7 +5,8 @@
 ;   offset 0x1F1 setup_sects, 0x202 "HdrS", 0x200 entry point.
 ; Loaded by SeaBIOS/QEMU at 0x9000:0000, entered at 0x9000:0200.
 ; Job: enable A20 -> protected mode -> build temporary page tables ->
-;      activate long mode -> far jump to the 64-bit kernel at 0x100000.
+;      activate long mode -> far jump to the decompression stub at 0x100000,
+;      which inflates the gzip payload and enters _start64.
 
 BITS 16
 ORG 0
@@ -561,7 +562,7 @@ pm_entry:
     mov DWORD [0x6F00], 0
 
 pm_jmp64:
-    jmp 0x18:0xF00DFACE             ; patched by build -> _start64 physical
+    jmp 0x18:0xF00DFACE             ; patched by build -> 0x100000 (decompress stub)
 
 ; ------------------------------------------------------------------ data ---
 align 8

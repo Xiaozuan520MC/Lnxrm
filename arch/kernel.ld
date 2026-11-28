@@ -10,6 +10,12 @@ ENTRY(_start64)
 KERNEL_LMA = 0x100000;
 KERNEL_VMA = 0xffffffff80100000;
 
+/* Physical address of the 64-bit entry.  After inflating the kernel back to
+ * 0x100000, the decompression stub must jump to _start64 -- 0x100000 itself
+ * is _start32, 32-bit code that faults under the long-mode CS.  Baked into
+ * build/kernel_entry.S via nm (see Makefile). */
+kernel_entry_phys = ABSOLUTE(_start64 - (KERNEL_VMA - KERNEL_LMA));
+
 SECTIONS
 {
     . = KERNEL_VMA;

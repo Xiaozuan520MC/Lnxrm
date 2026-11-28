@@ -8,7 +8,7 @@ x86-64 freestanding 单体内核：C 为主体，启动/中断/上下文切换�
 
 | 产物 | 说明 |
 |---|---|
-| `build/bzImage` | `setup.bin` + `vmlinux.bin`，两个 Python 脚本回填 boot header |
+| `build/bzImage` | `setup.bin` + `decompress.bin` + `vmlinux.bin.gz`，两个 Python 脚本回填 boot header |
 | `build/vmlinux.elf/.bin` | 链接产物（`arch/kernel.ld`，单一 `.image` 段 VMA `0xffffffff80100000` / LMA `0x100000`）/ 裸 payload |
 | `build/disk.img` | 64 MiB ext2 系统盘（S2 起：`mke2fs` + `debugfs` 造，装 `/README.md`、`/bin`、`/mod`；4 KiB 块 × 16384、16384 个 256 B inode、单块组、**无 journal**） |
 | `build/user/<name>` | 16 个静态 ELF64 用户程序 |
@@ -16,12 +16,12 @@ x86-64 freestanding 单体内核：C 为主体，启动/中断/上下文切换�
 | `build/lnxrm.iso` | GRUB 引导 ISO（仅 bootloader + 内核，无根文件系统） |
 | `build/obj0/`、`build/obj1/` | 两种 `KTEST` 模式各自的对象与 `.d`（两模式并存，切换只重链 ~0.2 s、零重编；`trampoline.bin` 仍留 `build/` 根，符号名由路径导出） |
 
-补丁脚本是构建链关键：`patch_setup_jmp.py` 回填 `setup.bin` 哨兵 `0xF00DFACE` 的真实跳转，`patch_bzimage.py` 填 boot header 并断言 `HdrS`/`0x55AA`/payload 对齐（详见 `../BUILD/BUILD.md`）。
+补丁脚本是构建链关键：`patch_setup_jmp.py` 把 `setup.bin` 的哨兵 `0xF00DFACE` 固定改成 `0x100000`（解压 stub 入口），`patch_bzimage.py` 填 boot header（`setup_sects`/`syssize`/`init_size`）并断言 `HdrS`/`0x55AA`/payload 对齐；`compressed_size`、`kernel_entry_phys`、`inflate_main` 由 Makefile 构建期生成 `.S` 烘进 stub（详见 `../BUILD/BUILD.md`）。
 
 ```
 Makefile               构建入口（源文件自动发现 + 镜像/运行/冒烟）；用户态委托 userland/Makefile；工具链 clang → ld.lld → llvm-objcopy（binutils 留给 `nm` 与 smoke 检查）；对象按 KTEST 分目录 build/obj<N>/，模式标记 .mode-<N> 挂链接侧
-arch/                  setup.asm(实模式) entry64.S(_start32/64、中断桩、swtch) trampoline.S(AP 入口,拷 0x8000)
-                        cpu.c(GDT/TSS/IDT/PIT/LAPIC) kernel.ld(段边界符号 __text_*/__rodata_*/__data_* 供 W^X)
+arch/                  setup.asm(实模式) decompress_head.S(0x100000 解压 stub) entry64.S(_start32/64、中断桩、swtch) trampoline.S(AP 入口,拷 0x8000)
+                        cpu.c(GDT/TSS/IDT/PIT/LAPIC) kernel.ld(段边界符号 __text_*/__rodata_*/__data_* 供 W^X；kernel_entry_phys) inflate.ld/decompress.ld(解压 blob @0x200000 / stub @0x100000)
 include/               全部头文件：abi/(lnxrm_abi.h + lnxrm_syscalls.def + keyboard.h + mouse.h) sys/ mm/ 其余
 kernel/                main.c(start_kernel 编排)
   core/                syscall.c(分发/门) print.c klog.c(环+loglevel) backtrace.c percpu.c smp.c protect.c selftest.c rtc.c
@@ -34,6 +34,7 @@ kernel/                main.c(start_kernel 编排)
   fs/fat32/            fat32.c fat32_dir.c fat32_file.c fat32_meta.c fat32_journal.c
   ipc/                 dipc.c(驱动 IPC 通道：名字表+共享帧环+等待链, 53/54/55)
   drivers/             pci.c ahci.c uart.c ps2-mouse.c(辅助口鼠标 + dipc 通道；重组/字段解码抽到 abi/ps2-mouse.h，**2026-11-19 由 `ps2mouse.c` 改名**) framebuffer.c input_event.c ps2-keyboard.c(扫描码解码单源 + dipc 通道)
+  lib/                 inflate.c(启动 gzip 解压；同一份源码既编进内核，也单独链成 0x200000 的 inflate.elf)
 ktest/                 启动自测：ktest.c 框架 + 33 个 t_*.c + include/（在仓库根）
 userland/              Makefile + bin/ 16 个程序（lsh 解析 `|` 与 `<`/`>`、内建 cd/pwd；mv 兼做改名；cat 无参数读 stdin；ls 无参时 kgetcwd 取当前目录）+ mod/ ring3 驱动模块（S1b，现为 ps2-keyboard 与 ps2-mouse 两个 `.km`（2026-11-19 加 `ps2-` 前缀），与 bin/ 同配方、独立对象子目录、装进镜像 `/mod`）+ lib/(crt0.S + ulib.c)
 scripts/               patch_setup_jmp.py patch_bzimage.py smoke_test.py

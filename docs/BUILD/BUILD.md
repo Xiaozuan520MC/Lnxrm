@@ -11,7 +11,7 @@ sudo apt install make clang lld llvm binutils nasm python3 \
 
 可选：`grub-pc-bin` + `xorriso`（`make imageiso`）、`e2fsck`（smoke 检查，缺则 SKIP）、`g++`（构建不用，但 smoke 工具链检查要求在 PATH）。
 
-`binutils` 仍要装：编译/链接/取 payload 已经全走 LLVM（`clang` → `ld.lld` → `llvm-objcopy`），但 `scripts/patch_setup_jmp.py` 用 `nm` 查 `_start32/64`，且 smoke 的工具链检查把 `ld`/`objcopy` 列为必需，缺则整个 smoke 起不来。
+`binutils` 仍要装：编译/链接/取 payload 已经全走 LLVM（`clang` → `ld.lld` → `llvm-objcopy`），但 Makefile 仍用 `nm` 从 `inflate.elf`/`vmlinux.elf` 取 `inflate_main`、`kernel_entry_phys` 烘焙进解压 stub，且 smoke 的工具链检查把 `ld`/`objcopy` 列为必需，缺则整个 smoke 起不来。
 
 **S2 起根文件系统是 ext2**，造镜像/列目录/查错分别是 `mke2fs`、`debugfs`、`e2fsck`（同属 `e2fsprogs`）；`dosfstools`/`mtools` 只有在你还要手工造 FAT 卷时才需要，构建与 smoke 已不再用它们。
 
@@ -24,6 +24,7 @@ sudo apt install make clang lld llvm binutils nasm python3 \
 | `all`（默认） | 只建 `build/bzImage`，**不含**用户态与磁盘镜像 |
 | `user` | 全部用户态 ELF → `build/user/`（`userland/bin/*.c` 自动发现） |
 | `mod` | 全部 ring3 驱动模块 → `build/mod/<名>.km`（`userland/mod/*.c` 自动发现，S1b；`disk.img` 会自动触发） |
+| `install` | 按 ext2 根布局装到 `INSTALL_DIR`（默认 `build/install`）：`user/` → `bin/`、`mod/` → `mod/`、`lib/` → `lib/`，外加 `README.md`；不清目标目录 |
 | `run` | `user` + `mod` + `bzImage` + `disk.img` 后启动 QEMU（唯一自动挂盘的常用入口） |
 | `smoke` | 六阶段冒烟，强制 `KTEST=1` |
 | `imageiso` | `build/lnxrm.iso`（GRUB，不重建 `disk.img`） |
@@ -35,6 +36,7 @@ sudo apt install make clang lld llvm binutils nasm python3 \
 | `DISK=0` | `1` | 不挂盘，快速看早期启动日志 |
 | `MACHINE` / `KVM` | `q35` / 自动探测 | QEMU 机型；`/dev/kvm` 可用即加 `--enable-kvm`。**`MACHINE=pc`（i440fx）已无磁盘驱动**（`ide.c` 删除）⇒ 挂不了根，只用于不碰盘的自测 |
 | `CMDLINE` | 空 | `make run` 传给 QEMU `-append` 的内核命令行（内核解析 `loglevel=<0..3>`、`ktest=off\|continue`）；**空则不加 `-append`**，与不带它的旧行为逐位一致 |
+| `INSTALL_DIR` | `build/install` | `make install` 的目标根目录；其下生成 `bin/`、`mod/`、`lib/`、`README.md` |
 | `SMOKE_FLAGS` | 空 | 原样传给 `scripts/smoke_test.py`，如 `--smp 1` |
 | `SMOKE_QEMU_ARGS` | `-machine q35` | 在 `SMOKE_FLAGS` **之前**传给 `--qemu-args`；`smoke_test.py` 的 argparse 取**最后一个**，故你自己给 `--qemu-args` 仍可覆盖。2026-11-18 起 smoke 由此走 q35（ICH9 AHCI），不再落 QEMU 默认 i440fx + PIIX3 IDE |
 
@@ -44,10 +46,16 @@ sudo apt install make clang lld llvm binutils nasm python3 \
 
 ```
 kernel/**.c, arch/*.c ──cc──► build/obj<N>/**/*.o ─┐
-arch/*.S ──nasm──► build/obj<N>/arch/*.o    │
-trampoline.S ─nasm─► bin ─llvm-objcopy─► .o  ├─ ld.lld -T arch/kernel.ld --gc-sections ─► vmlinux.elf
-ktest/*.c（仅 KTEST=1）──cc──► .o           │      └─ llvm-objcopy -O binary ─► vmlinux.bin ─┐
-setup.asm ─nasm─► 补零 2 KiB 整数倍 ─patch_setup_jmp.py─► setup.bin ────────────────┴─ cat ─► patch_bzimage.py ─► bzImage
+arch/*.S ──nasm──► build/obj<N>/arch/*.o           ├─ ld.lld -T arch/kernel.ld --gc-sections ─► vmlinux.elf
+ktest/*.c（仅 KTEST=1）──cc──► .o                  │      ├─ llvm-objcopy -O binary ─► vmlinux.bin
+trampoline.S ─nasm─► bin ─llvm-objcopy─► .o ───────┘      └─ gzip -n -9 ─► vmlinux.bin.gz
+
+kernel/lib/inflate.c ──cc──► inflate.o ─ld.lld -T arch/inflate.ld─► inflate.elf ─objcopy─► inflate.bin（0x200000）
+decompress_head.S（incbin inflate.bin）+ 生成的 compressed_size.S / inflate_main.S / kernel_entry.S
+    ─ld.lld -T arch/decompress.ld─► decompress.elf ─objcopy─► decompress.bin（补零 512 B）
+
+setup.asm ─nasm─► 补零 2 KiB 整数倍 ─patch_setup_jmp.py─► setup.bin
+setup.bin + decompress.bin + vmlinux.bin.gz ─cat─► patch_bzimage.py ─► bzImage
 
 userland/bin/*.c + crt0.S + ulib.c ─► build/user/<名>（init 静态 ELF 链在 `0x7f8000400000`；其余程序 `-pie` 链的 ET_DYN，link-at-0，基址由内核 `elf_place()` 选并在 `AT_BASE`/`AT_ENTRY` 里公布）
 userland/mod/*.c + crt0.S + ulib.c ─► build/mod/<名>.km（同上 ET_DYN，装进 `/mod` 由 `init` 扫目录拉起；`.km` 是链接目标名的一部分）
@@ -58,19 +66,24 @@ build/user/* + build/mod/* + README.md ──mke2fs + debugfs──► build/dis
 - 对象按 `KTEST` 分目录（`build/obj0` / `build/obj1`），两种模式并存，`make` ↔ `make KTEST=1` 切换只重链一次（0.2 s、零 `CC`），不再全量重编 70 个 TU——旧的 `build/.ktest-mode-<n>` stamp 因此删除。**模式标记 `build/.mode-<n>` 必须挂在 `vmlinux.elf` 上、不能挂在对象上**：翻转后每个 `.o` 都比 elf 旧，标记不挂链上，`make` 就会认定上一模式的 `bzImage` 仍最新，把 `KTEST=1` 的内核当 `KTEST=0` 发给你；挂回对象上则又变回全量重编。**该规则还必须排在 `all:` 之后**——它是 Makefile 里第一个不以 `.` 开头的目标，写在 `all:` 前面会夺走默认目标，`make` 从此只检查这个标记、再也不建 `bzImage`。产物一律仍在 `build/` 根（`smoke_test.py` 硬编码 `bzImage`/`vmlinux.elf`/`setup.bin`/`disk.img`/`user/`），`make clean` 照旧整个删。
 - 关键标志：`-ffreestanding -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone -mno-sse* -mcmodel=kernel -Os -g -ffunction-sections -fno-pic`（优化档是 **`-Os`** 而非 -O2；`-fno-omit-frame-pointer` 是 PP2 backtrace 的前提——`-Os` 下 clang 默认丢 rbp，帧指针走链会当场断掉）；用户态编译 `-ffreestanding -fno-pic -mcmodel=large`（静态 init）、`-ffreestanding -fPIC ... -Ilib -I../include`（动态程序与 ld.so，`-fno-pie` 改为 `-pie`，不再烙 `--image-base`）；链接 `-nostdlib -nostartfiles -static`（静态 init，`USERLDFLAGS`，链接专用开关单独放，混进编译命令会被 clang 报 `-Wunused-command-line-argument`）、`-nostdlib -nostartfiles -fuse-ld=lld -pie -Wl,--hash-style=sysv -Wl,--dynamic-linker=/lib/ld.so -L$(LIBDIR) -lulib`（动态程序），ld.so 自身用 `--dynamic-linker=`（空，避免给解释器本身挂 PT_INTERP）。链接在 `0x7f8000400000`（静态 init）；动态程序 link-at-0。
 - `vmlinux.elf` 查符号：`grep <sym> build/vmlinux.map` 或 `nm build/vmlinux.elf`。
-- `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；它在 `arch/kernel.ld` 里**显式摆成 `.trampoline` 段**（VMA = `.image` 末尾、LMA 紧随其后），不能留作孤儿段——GNU ld 与 ld.lld 对孤儿段的摆放不同，lld 会因 `.trampoline` 压在 `.bss` 负载地址上直接报 `load address range overlaps with .bss` 而拒链。`setup.bin` 依赖 `vmlinux.elf` 只为 `nm` 查 `_start32/64` 回填跳转；`patch_bzimage.py` 填 boot protocol 头并断言 `HdrS`/`0x55AA`/对齐。
+- `trampoline.S` 走两段式（裸二进制 → ELF 对象，符号改名防被通配进 `.image`）；它在 `arch/kernel.ld` 里**显式摆成 `.trampoline` 段**（VMA = `.image` 末尾、LMA 紧随其后），不能留作孤儿段——GNU ld 与 ld.lld 对孤儿段的摆放不同，lld 会因 `.trampoline` 压在 `.bss` 负载地址上直接报 `load address range overlaps with .bss` 而拒链。`setup.bin` 现在只依赖 `setup.asm`：`patch_setup_jmp.py` 把哨兵 `0xF00DFACE` 固定改成 `0x100000`（解压 stub 入口），不再查内核符号；`patch_bzimage.py` 填 boot protocol 头（`setup_sects`/`syssize`/`init_size`）并断言 `HdrS`/`0x55AA`/对齐。
 - 链接器与对象工具是 LLVM 一套（2026-11-14 换链：`ld` → `ld.lld`、`objcopy` → `llvm-objcopy`）。几个坑：lld 不认 GNU 的 `--no-warn-rwx-segments`（它本身也没有 RWX 段警告，直接删）；link map 要写成 `-Map <file>`（空格形式），`-Map=<file>` 不产文件。
 - 换链后 `nm`/`strings` 逐字节比对 GNU 产物会看到差异，属预期而非回归：lld 对 `.rodata.str1.1` 这类 `SHF_MERGE|SHF_STRINGS` 段会做尾串合并并**裁掉无人引用的死串**（如无调用者的 `kmalloc_or_panic` 的 panic 格式串），GNU ld 留着；段内布局随之位移，`.text` 里 `mov rdi, imm32` 的 rodata 地址、以及 data 段的对齐填充（GNU `nop` / lld `int3`）都会不同。判定口径是**符号表 + 运行时**，不是 payload 字节。
 - 可复现：设 `SOURCE_DATE_EPOCH` 后 `bzImage` SHA256 稳定。
-- `make -j$(nproc)` 安全；改了 `_start32/64` 相对位置而启动跳错：`rm -f build/setup.bin build/bzImage && make`。
+- 解压链的常量全部构建期烘焙：`compressed_size`（`vmlinux.bin.gz` 大小）、`kernel_entry_phys`（`arch/kernel.ld` 的 `ABSOLUTE(_start64 - (KERNEL_VMA - KERNEL_LMA))`）、`inflate_main`（`nm build/inflate.elf`）分别生成 `build/compressed_size.S`、`build/kernel_entry.S`、`build/inflate_main.S`，链进 `decompress.elf`。
+- `make -j$(nproc)` 安全；`_start64` 相对位置变了不用手工清产物：`kernel_entry.S` 依赖 `vmlinux.elf`，会自动重算并重链解压 stub。
 
 ### 3.2 产物
 
 | 文件 | 说明 |
 |---|---|
-| `build/bzImage` | 最终可引导镜像（大小随 KTEST 变） |
+| `build/bzImage` | 最终可引导镜像：`setup.bin` + `decompress.bin` + `vmlinux.bin.gz`（大小随 KTEST 变） |
 | `build/vmlinux.elf` / `.bin` / `.map` | 符号+调试信息 / 裸 payload / 链接映射 |
-| `build/setup.bin` | 真模式 setup（已补零、回填跳转） |
+| `build/vmlinux.bin.gz` | `gzip -n -9` 压缩后的内核，接在 `decompress.bin` 之后 |
+| `build/setup.bin` | 真模式 setup（已补零；哨兵已回填为 `0x100000` 解压 stub） |
+| `build/inflate.elf` / `inflate.bin` | 启动解压器（独立链接在 `0x200000`）/ incbin 进 stub 的裸二进制 |
+| `build/decompress.elf` / `decompress.bin` | 解压 stub（链接在 `0x100000`，补零到 512 B）/ bzImage payload 前缀 |
+| `build/{compressed_size,kernel_entry,inflate_main}.S` | 构建期生成并 `nasm` 的常量：gzip 长度、`_start64` 物理入口、`inflate_main` 地址 |
 | `build/disk.img` | 64 MiB ext2 整盘（无分区表；含 `/README.md`、`/bin`、`/mod`，S2 起） |
 | `build/user/<名>` | 静态用户态 ELF |
 | `build/mod/<名>.km` | ring3 驱动模块 ELF（**`.km` 是链接出来的名字**，`MOD_ELFS` 直接 `addsuffix`；装进 `/mod` 时名字原样搬，由 `init` 扫目录拉起） |

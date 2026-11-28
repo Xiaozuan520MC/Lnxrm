@@ -10,6 +10,8 @@
 >
 > **S3 动态链接（2026-11-26 `0c14cc6`）+ S3.2 syscall 入口（2026-11-27）+ S3.3 sysretq 出口（2026-11-28）**：ktest 预期 **171 cases / 5339 checks [2 skipped]**——账是 S3.1 的 `0c14cc6` 加 4 例（`t_elf.c` 的 `test_elf_interp_path`/`test_elf_get_phdrs`/`test_elf_image_range` + `t_mmap.c` 的 `test_mmap_fixed`，167+4=171、checks +49），**S3.2 与 S3.3 零新增**（S3.2 只改 `t_syscall.c` 头注释；S3.3 只改 `arch/cpu.c`、`arch/entry64.S`、`kernel/sched/task.c` 与文档，ktest 一字未动）。**2026-11-27 `make smoke -j8` 实测：smoke 270/270、ktest 171 cases / 5339 checks [2 skipped] 三档 0 failed**（early 25/426、mm 18/462、late 128/4451）；S3.2 三档 `fsyntax-only` 与 `make all user mod`（KTEST=0/1）零警告，详见 GAP_ANALYSIS_DONE.md 末条。**2026-11-28 实测（S3.3 后）**：smoke **270/270**；ktest 两轮 171 cases / 5340 与 **171/5339 [2 skipped] 0 failed**（late 档 checks ±1 摆动为既有运行期条件波动，第 2 轮精确命中基线），详见 GAP_ANALYSIS_DONE.md 末条。
 >
+> **S3.5 gzip 启动解压（2026-11-28）**：`bzImage = setup.bin + decompress.bin + vmlinux.bin.gz`；解压 stub 在 `0x100000`，inflate 器在 `0x200000`，gzip 副本在 `0x300000`，解压回 `0x100000` 后跳 `_start64` 物理入口。构建链新增 `inflate.elf`/`decompress.elf` 与三个构建期烘焙的 `.S`；ktest/smoke 计数不变。
+>
 > 编号 C1–C72 是稳定 ID（README 与代码注释有交叉引用），不重排；主体只收**仍然开放**的条目，已关闭的全部在 `GAP_ANALYSIS_DONE.md`（原第 6 节）。
 
 ---

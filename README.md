@@ -13,14 +13,14 @@
 |------|------|
 | `工具链` | clang、nasm、lld、llvm、python3、qemu-system-x86_64 |
 | `镜像` | grub-mkrescue + grub-pc-bin |
-| `磁盘` | mkfs.vfat + mtools |
+| `磁盘` | e2fsprogs（mke2fs / debugfs） |
 
 ## 产物
 
 | 文件 | 说明 |
 |------|------|
-| `build/bzImage` | 内核镜像 |
-| `build/disk.img` | FAT32 磁盘 |
+| `build/bzImage` | 内核镜像（setup + 解压 stub + gzip 内核） |
+| `build/disk.img` | ext2 系统盘 |
 | `build/lnxrm.iso` | GRUB ISO |
 
 ## 文档

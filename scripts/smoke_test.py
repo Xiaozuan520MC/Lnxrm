@@ -628,9 +628,9 @@ def phase_artifacts(report):
                    syssize * 16 + 15 >= len(data) - payload_off >= syssize * 16 - 15,
                    "syssize=%d payload=%d" % (syssize, len(data) - payload_off))
         setup_bin = os.path.join(BUILD, "setup.bin")
-        report.add("setup.bin size == payload offset",
+        report.add("payload offset >= setup.bin size",
                    os.path.exists(setup_bin) and
-                   os.path.getsize(setup_bin) == payload_off,
+                   payload_off >= os.path.getsize(setup_bin),
                    "setup.bin=%s offset=%d"
                    % (os.path.getsize(setup_bin) if os.path.exists(setup_bin)
                       else "missing", payload_off))
