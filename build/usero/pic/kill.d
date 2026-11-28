@@ -1,6 +1,0 @@
-/home/xiaoxia/文档/easycaikuai/Lnxrm/build/usero/pic/kill.o: bin/kill.c \
-  lib/ulib.h ../include/abi/lnxrm_abi.h \
-  ../include/abi/lnxrm_syscalls.def
-lib/ulib.h:
-../include/abi/lnxrm_abi.h:
-../include/abi/lnxrm_syscalls.def:
