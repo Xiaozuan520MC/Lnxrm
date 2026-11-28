@@ -7,6 +7,6 @@ int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    xputs("cat mkdir clear echo help kill ls mv ps lsh touch rm reboot cd pwd\n");
+    xputs("cat mkdir clear echo kill ls mv ps touch rm reboot cd pwd poweroff\n");
     return 0;
 }

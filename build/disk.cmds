@@ -1,0 +1,26 @@
+write build/README.md /README.md
+mkdir /bin
+write build/user/cat /bin/cat
+write build/user/clear /bin/clear
+write build/user/echo /bin/echo
+write build/user/halt /bin/halt
+write build/user/hello /bin/hello
+write build/user/help /bin/help
+write build/user/init /bin/init
+write build/user/kill /bin/kill
+write build/user/ls /bin/ls
+write build/user/lsh /bin/lsh
+write build/user/mkdir /bin/mkdir
+write build/user/mv /bin/mv
+write build/user/poweroff /bin/poweroff
+write build/user/ps /bin/ps
+write build/user/reboot /bin/reboot
+write build/user/rm /bin/rm
+write build/user/systest /bin/systest
+write build/user/touch /bin/touch
+mkdir /lib
+write build/lib/ld.so /lib/ld.so
+write build/lib/libulib.so /lib/libulib.so
+mkdir /mod
+write build/mod/ps2-keyboard.km /mod/ps2-keyboard.km
+write build/mod/ps2-mouse.km /mod/ps2-mouse.km
