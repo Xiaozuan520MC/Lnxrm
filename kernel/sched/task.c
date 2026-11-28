@@ -127,6 +127,13 @@ int sys_fork(void)
     ch->parent_gen = current->generation;
     ch->cred = current->cred; /* T-030: fork inherits the parent's tier */
     strcpy(ch->cwd, current->cwd); /* cwd follows the process, like fds */
+    /* S3.4: so do the ring-3 segment bases -- the child's address space is
+     * a COW copy of the parent's, so a thread pointer the parent set still
+     * points at a live page in the child, exactly like cwd and fds.  A
+     * fresh slot starts both at 0 (task_alloc_slot), so this is the only
+     * thing that ever gives a child a non-zero one. */
+    ch->user_fs = current->user_fs;
+    ch->user_gs = current->user_gs;
     ch->state = T_EMBRYO;
     ch->pml4 = vmm_new_user_aspace();
     if (!ch->pml4) { /* T-004: no frame for the root -> fork fails, not panics */
@@ -507,6 +514,19 @@ static void exec_commit(const struct exec_args *a, u64 old_pml4, u64 new_pml4,
     current->mem_pages = vmm_count_user_pages(current->pml4);
     current->mem_peak = current->mem_pages;
 
+    /* S3.4: a new image starts with no segment bases.  Both old values
+     * pointed into the address space execve just threw away, and nothing in
+     * the new one has installed a replacement yet -- keeping them would
+     * hand the image's first arch_prctl(ARCH_GET_FS) (and its first
+     * %fs-relative access) a pointer into freed pages.  The MSRs are
+     * written along with the struct fields because this task is the current
+     * one on this CPU right now: IA32_FS_BASE is where ring 3 reads FS
+     * from, and IA32_KERNEL_GS_BASE is what SWAPGS will hand ring 3. */
+    current->user_fs = 0;
+    current->user_gs = 0;
+    wrmsr(MSR_IA32_FS_BASE, 0);
+    wrmsr(MSR_IA32_KERNEL_GS_BASE, 0);
+
         /* Close O_CLOEXEC descriptors. */
     for (int i = 0; i < NR_FDS; i++)
         if (current->fds[i] && (current->fds[i]->flags & O_CLOEXEC))
@@ -667,7 +687,7 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     struct intr_frame *f2 = current->tf;
     f2->rip = im.start;
     f2->ussp = sp;
-    f2->cs = 0x18 | 3;
+    f2->cs = 0x28 | 3;
     f2->usss = 0x20 | 3;
     f2->rflags = 0x202;
     return 0;
@@ -928,7 +948,7 @@ int kernel_spawn(const char *path)
     memset(tf, 0, sizeof(*tf));
     tf->rip = im.start;
     tf->ussp = ap;
-    tf->cs = 0x18 | 3;
+    tf->cs = 0x28 | 3;
     tf->usss = 0x20 | 3;
     tf->rflags = 0x202;
     t->tf = tf;

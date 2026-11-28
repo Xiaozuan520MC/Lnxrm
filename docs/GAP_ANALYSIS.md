@@ -1,12 +1,14 @@
 # lnxrm 差距分析：现在缺什么、错什么、先修什么
 
-> 对象：`lnxrm` —— x86-64 freestanding 单体内核（C + NASM），QEMU 为主目标。构建与运行见 BUILD.md，代码结构见 CODEBASE.md（§6–§10 在 CODEBASE_SUBSYSTEMS.md）。
+> 对象：`lnxrm` —— x86-64 freestanding 单体内核（C + NASM），QEMU 为主目标。构建与运行见 BUILD.md，代码结构见 CODEBASE.md（§1–§10 分布于 CODEBASE_*.md）。
 >
 > 基线（**2026-11-19 `make smoke` 实测**，S1b + 两轮修复后）：系统调用 **56 个（0–55 连续无空洞）**，末八条 `reboot` 48、`chdir` 49、`getcwd` 50、`shm_open` 51、`shm_unlink` 52、`dipc_open` 53、`dipc_recv` 54、`dipc_send` 55；ktest **162 cases / 4974 checks**（2 skipped、1 刻意告警）、`make smoke` **270/270**、三档 `make` 零警告——各项来历见 GAP_ANALYSIS_DONE.md（2026-11-17 S1a 轮为 162/4951、3 skipped，差账见 GAP_ANALYSIS_DONE.md末）。
 >
 > 2026-11-18/19 新增（**2026-11-19 实跑全绿**）：S1b 键盘**与鼠标**通道 + ring3 `.km` 模块、initramfs 整套与 `ide.c` 删除、smoke 切 q35——`make smoke` **270/270**、ktest **162/4974**（`kbd_decode_init`/`mouse_decode_init` 都排在 ktest 之后，故 case 数一位不变；+23 的账与 `t_ahci` 转实测见 GAP_ANALYSIS_DONE.md末），见 GAP_ANALYSIS_DONE.md 2026-11-18 各条。**S1c 解码器下沉**同日落地（GAP_ANALYSIS_DONE.md 末条；**smoke 复跑 2026-11-19 实测 270/270**、ktest **162/4974** 一位不变）。
 >
 > **S2 ext2 换根（2026-11-22 交付，2026-11-24 收口：smoke 270/270、ktest 167/5290 [2 skipped] 实测全绿）**：`disk.img` 换 ext2 并接管 `/`，新驱动 `kernel/fs/ext2/`（block/inode 子目录 + `include/ext2.h`）、ktest 新增 `t_ext2` 五例、smoke 判据换 e2fsprogs + forged ext2（**总数仍 270**，构成见 GAP_ANALYSIS_DONE.md末条）。三档零警告：KTEST=0 **146333/nm 846**、KTEST=1 **422013/nm 1425**、`mod` 8312/8072 B；phase 1+3 对独立树实跑 51/51。首跑（同日）late 档 4 case/22 check 红——1 个驱动真 bug（`ext2_rename` 截断返回值当错误码）、1 处测试期望错（EOF 钳位）、2 处 `t_ioerr` 环境锚点，四项已修、修后独立树三档复测零警告（详见 GAP_ANALYSIS_DONE.md末条）。**ktest 预期 167 cases / 5290 checks [2 skipped]**（首跑实测 5281 + 写例补跑 13 − lookup VFS 半段门住 4；+5 case / +317 checks 来自 `t_ext2`）——**2026-11-24 `make smoke -j8` 实测精确命中 167 cases / 5290 checks [2 skipped]**。
+>
+> **S3 动态链接（2026-11-26 `0c14cc6`）+ S3.2 syscall 入口（2026-11-27）+ S3.3 sysretq 出口（2026-11-28）**：ktest 预期 **171 cases / 5339 checks [2 skipped]**——账是 S3.1 的 `0c14cc6` 加 4 例（`t_elf.c` 的 `test_elf_interp_path`/`test_elf_get_phdrs`/`test_elf_image_range` + `t_mmap.c` 的 `test_mmap_fixed`，167+4=171、checks +49），**S3.2 与 S3.3 零新增**（S3.2 只改 `t_syscall.c` 头注释；S3.3 只改 `arch/cpu.c`、`arch/entry64.S`、`kernel/sched/task.c` 与文档，ktest 一字未动）。**2026-11-27 `make smoke -j8` 实测：smoke 270/270、ktest 171 cases / 5339 checks [2 skipped] 三档 0 failed**（early 25/426、mm 18/462、late 128/4451）；S3.2 三档 `fsyntax-only` 与 `make all user mod`（KTEST=0/1）零警告，详见 GAP_ANALYSIS_DONE.md 末条。**2026-11-28 实测（S3.3 后）**：smoke **270/270**；ktest 两轮 171 cases / 5340 与 **171/5339 [2 skipped] 0 failed**（late 档 checks ±1 摆动为既有运行期条件波动，第 2 轮精确命中基线），详见 GAP_ANALYSIS_DONE.md 末条。
 >
 > 编号 C1–C72 是稳定 ID（README 与代码注释有交叉引用），不重排；主体只收**仍然开放**的条目，已关闭的全部在 `GAP_ANALYSIS_DONE.md`（原第 6 节）。
 
@@ -31,9 +33,9 @@
 | 图形 / 显示 | 3 | 帧缓冲控制台 + 双缓冲 `fb_flip` + `CAP_FB`/归属两道门；无图元（暂不作为缺口） |
 | 用户态 | 3 | 16 个 ELF64（init 静态 ET_EXEC + 15 个动态 ET_DYN，`/lib/ld.so` + `/lib/libulib.so`）+ 自带 crt0/迷你 libc，mmap 三件套；**`/mod` ring3 驱动模块已就位（S1b）**；**S3 动态链接与共享库收口（2026-11-25）**：用户态 ldso（ET_DYN + PT_INTERP）、libulib.so、MAP_FIXED 0x10、auxv 6 对（+AT_BASE）；**S3.1 ET_DYN（PIE）+ AT_BASE 收口**：全部 ET_DYN 由内核选基址（elf_place）、AT_BASE 发布解释器 bias、ld.so 经 PT_PHDR 自恢 program bias、Eager 重定位 RELATIVE/GLOB_DAT/JUMP_SLOT/64、sysv hash；16 个 program 全部通过 execve 装载 |
 | 安全模型 | 2 | `cred` + 3 能力位 + `setuid` 单向降权；NXE/WP/SMEP/SMAP + **W^X 已收口（2026-11-12）**；无 gid、RLIMIT、文件属主、KASLR、栈保护 |
-| 测试 | 3 | ktest **167/5290 [2 skipped]**（S2 预期：+`t_ext2` 五例 + `t_ioerr` 环境适配；2026-11-24 `make smoke` 实测精确命中，上一版 2026-11-19 为 162/4974）、smoke **270/270**（S2 换根后构成变、总数不变；最近实测 **2026-11-24**）、`--repeat 2` 连跑 487/487（2026-11-15，本轮未复跑）；无 CI、无宿主单测 |
+| 测试 | 3 | ktest **171/5339 [2 skipped]**（S3.1 `0c14cc6` 加 `t_elf` 三例 + `test_mmap_fixed` 共 4 例，167+4；S3.2 零新增；2026-11-27 `make smoke` 实测三档 0 failed，上一版 2026-11-24 为 167/5290、2026-11-19 为 162/4974）、smoke **270/270**（S2 换根后构成变、总数不变；最近实测 **2026-11-27**）、`--repeat 2` 连跑 487/487（2026-11-15，本轮未复跑）；无 CI、无宿主单测 |
 | 可观测性 | 3 | 串口日志、分阶段启动、`ps` 内存列、块缓存统计；**loglevel + 崩溃环 + backtrace 已收口（2026-11-15）**；无 `/proc` |
-| 可移植 / 启动安全 | 2 | 门控已切 q35 + TCG + `-m 256`（`SMOKE_QEMU_ARGS`，2026-11-18）；无 KASLR/KPTI、入口无 `swapgs`、无 IST |
+| 可移植 / 启动安全 | 2 | 门控已切 q35 + TCG + `-m 256`（`SMOKE_QEMU_ARGS`，2026-11-18）；无 KASLR/KPTI、**`syscall` 入口已就位但无 `swapgs`**（S3.2 落地、出口 S3.3 切 `sysretq`、swapgs 归 S3.4）、无 IST |
 
 ---
 
@@ -66,7 +68,7 @@
 | 权限 | CPU 时间限制、RLIMIT | 可无限占 CPU；`NR_FDS 16` 等编译期常量 | 80 / 100 行 |
 | 权限 | 登录会话、文件系统沙箱 | 无"天生的普通用户"，冒烟程序都以 root 跑 | 约 1 周 / mmap 就位后再评估 |
 | 加固 | KASLR、栈 canary | 链接地址固定、gadget 定位零成本；靠 `-fno-stack-protector` 纪律 | 100–200 / 50 行 |
-| 加固 | `swapgs`+TLS、IST、KPTI | 无 TLS、无故障栈（引导栈 16 KiB 无 guard）、用户页表带完整内核映射 | 30 / 80 行 / 先量代价 |
+| 加固 | `swapgs`+TLS、IST、KPTI | 无 TLS、无故障栈（引导栈 16 KiB 无 guard）、用户页表带完整内核映射；**`swapgs` 待 S3.4**——现在 GS 恒为内核值（用户态从不碰它），`entry_SYSCALL_64` 正是按这个前提写的，换成 swapgs 必须连同「用户 GS 另有其值」一起改，且 `int 0x80` 那道门要同步 | 30 / 80 行 / 先量代价 |
 | CI | CI 配置、smoke 矩阵、宿主单测 | 门控只在本地手动跑一轮（C68）；连跑抖动门 `--repeat` 已加（2026-11-13），缺 CI 接入 | 各 1–2 天 |
 | 抢占 | syscall 全程关中断、内核态不可抢占 | 慢盘 I/O 期间本核无时钟、无抢占（C7 后仅剩本核：别核的时钟不再被慢盘拖住）；长临界区拖住整核 | 1 天+审计 / 1–2 周 |
 | 可观测 | `/proc`、debug syscall、统计计数器 | panic 后已有崩溃环形缓冲 + backtrace 兜底（2026-11-15 收口），但运行期黑盒测试仍只能读串口 | 合计约 400 行 |

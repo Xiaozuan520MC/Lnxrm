@@ -16,6 +16,23 @@ extern "C" {
 #define PCACHE_N 32
 
 struct cpu_info {
+    /* SYSCALL entry (arch/entry64.S) reaches these two with a GS-relative
+     * load and nothing else, so they come FIRST: their offsets are pinned
+     * by _Static_assert in percpu.c, and putting them ahead of every other
+     * member keeps them at 0 and 8 no matter how wide struct task (which
+     * this struct embeds) ever grows.  A field inserted above them would
+     * silently point entry_SYSCALL_64 at the wrong word. */
+    u64 entry_stack_top; /* top of the ring3->ring0 entry stack; always the
+                          * value tss_set_rsp0() just gave TSS.rsp0, so a
+                          * `syscall` builds its frame exactly where the
+                          * `int 0x80` gate would have.  0 until the first
+                          * switch_to(), which is also when ring 3 first
+                          * becomes reachable. */
+    u64 entry_scratch;   /* SYSCALL-entry scratch: the user RSP, parked here
+                          * across the stack switch (SYSCALL saves nothing
+                          * and every GPR is already spoken for by the
+                          * frame).  Same idea as Linux's TSS.sp2. */
+
     u32 id;       /* logical CPU id */
     u32 apic_id;  /* APIC ID */
     bool started; /* true once AP is online */

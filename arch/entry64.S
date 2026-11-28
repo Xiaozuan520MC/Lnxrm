@@ -398,15 +398,63 @@ extern syscall_entry
     pop rbx
 %endmacro
 
+; --------------------------------------------------------------------------
+; S3.4 -- swapgs discipline.  One rule, applied at every door in this file.
+;
+; IA32_GS_BASE and IA32_KERNEL_GS_BASE name the kernel's per-CPU block and
+; the user's GS between them, and SWAPGS exchanges the pair.  So the CPU
+; arrives at an entry point in one of exactly two states:
+;
+;   from ring 3  -- IA32_GS_BASE still holds the USER's value; the kernel
+;                   needs its own, so SWAPGS once.
+;   from ring 0  -- IA32_GS_BASE already is the kernel's (ring 3 never ran,
+;                   or an earlier door swapped already); SWAPGS once would
+;                   hand the kernel the user's base, so do nothing.
+;
+; The discriminator is the frame's saved CS, which is a faithful record of
+; the CPL the CPU was at: IS_PRIVILEGED(cs) is true exactly when GS still
+; holds the user's value.  struct intr_frame lays cs out at offset 144 and
+; every stub in this file builds that frame identically after PUSHALL --
+; r15..rbx are 15 pushes (120 bytes), then intno at +120, err at +128, rip
+; at +136, cs at +144 -- so one offset serves all of them, including
+; entry_SYSCALL_64's synthesised frame and glue_first's.  Pushed as QWORD,
+; so the low dword is the selector; the CPL bits live there.
+;
+; Both macros must therefore run BEFORE POPALL moves rsp off the frame.
+; The leaving one additionally disables interrupts first: between the swap
+; and iretq/sysret the user's GS is live while ring-0 code still runs, and
+; an interrupt taken there would take its own "came from ring 0" branch and
+; run the kernel against the user's base.  Nothing is lost by the cli --
+; iretq reloads RFLAGS from the frame and SYSRET from r11, so the user's
+; own IF comes back either way.
+%define OFF_FRM_CS 144
+
+%macro SWAPGS_IN 0
+    test DWORD [rsp + OFF_FRM_CS], 3
+    jz   %%ring0
+    swapgs
+%%ring0:
+%endmacro
+
+%macro SWAPGS_OUT 0
+    test DWORD [rsp + OFF_FRM_CS], 3
+    jz   %%ring0
+    cli
+    swapgs
+%%ring0:
+%endmacro
+
 section .text.isr
 %macro ISR_NOERR 1
 isr%1:
     push QWORD 0                        ; synthetic err slot
     push QWORD %1                       ; vector
     PUSHALL
+    SWAPGS_IN                           ; ring 3 -> kernel GS (S3.4)
     mov rdi, rsp
     cld
     call isr_common
+    SWAPGS_OUT                          ; swap back before iretq (S3.4)
     POPALL
     add rsp, 16
     iretq
@@ -416,9 +464,11 @@ isr%1:
 isr%1:
     push QWORD %1                       ; CPU pushed err already
     PUSHALL
+    SWAPGS_IN                           ; ring 3 -> kernel GS (S3.4)
     mov rdi, rsp
     cld
     call isr_common
+    SWAPGS_OUT                          ; swap back before iretq (S3.4)
     POPALL
     add rsp, 16                         ; discard intno + err
     iretq
@@ -454,12 +504,120 @@ isr128:                                 ; syscall gate (ring 3)
     push QWORD 0
     push QWORD 128
     PUSHALL
+    SWAPGS_IN                           ; cs is 0x2B here, so this always swaps
     mov rdi, rsp
     cld
     call syscall_entry                  ; may block/schedule
+    SWAPGS_OUT
     POPALL
     add rsp, 16
     iretq
+
+; --------------------------------------------------------------------------
+; SYSCALL entry -- the second door into syscall_entry() (S3.2).
+;
+; Reached from ring 3 through EFER.SCE -> MSR_LSTAR, not through the IDT, so
+; nothing here is CPU-pushed: SYSCALL only leaves RIP in RCX and RFLAGS in
+; R11, masks RFLAGS per IA32_FMASK, and loads CS/SS from STAR[47:32].  Every
+; other register -- RAX and the six Linux argument registers
+; rdi rsi rdx r10 r8 r9 -- arrives untouched, which is the whole reason the
+; dispatcher reads its arguments from there.
+;
+; Two things the CPU does NOT do for us, and what we do instead:
+;   * no stack switch.  TSS.rsp0 is what an `int 0x80` gate would load, so
+;     this stub loads the same number out of the per-CPU struct (kept in step
+;     with the TSS by tss_set_rsp0()) and the frame lands at exactly the
+;     address isr128 would have built it at.
+;   * no saved RSP.  SYSCALL clobbers nothing but RCX/R11 and every GPR is
+;     already claimed by the frame, so the user RSP parks in a per-CPU
+;     scratch word across the switch -- Linux parks it in TSS.sp2.
+;
+; GS is the one thing SYSCALL leaves alone, so this stub owns the swap
+; (S3.4).  SWAPGS first, before the very first [gs:...] read: the CPU
+; arrives here from ring 3, so IA32_GS_BASE still holds the user's value
+; and [gs:CPU_OFF_ENTRY_SCRATCH] below would otherwise be written into
+; whatever %gs base ring 3 left behind.  SWAPGS cannot fault at CPL 0, so
+; there is no window in which the load above runs against the wrong base.
+; The exit swaps back in both of its tails -- the two `swapgs` below, each
+; after the last thing that reads kernel memory.
+;
+; The iretq tail (rip/cs/rflags/ussp/usss) has to be synthesised here
+; because SYSCALL pushes none of it; it is what iretq will pop on the way
+; out, so sysretq can replace this exit in S3.3 without the frame changing
+; shape.  The result is field-for-field the isr128 frame, so
+; syscall_entry() cannot tell the two doors apart.
+;
+; These two offsets are asserted against struct cpu_info in percpu.c.
+%define CPU_OFF_ENTRY_STACK_TOP 0
+%define CPU_OFF_ENTRY_SCRATCH   8
+
+; GDT selectors (Option A, S3.3 sysretq):
+;   e[4]=0x20 UDATA  -> SYSRET SS = 0x20|3 = 0x23  (unchanged)
+;   e[5]=0x28 UCODE  -> SYSRET CS = 0x28|3 = 0x2B  (was 0x1B)
+%define SEL_UCODE32 0x18   ; 32-bit user code slot (kept, unused by sysretq)
+%define SEL_UDATA   0x20   ; user data slot        -> SYSRET SS  = 0x23
+%define SEL_UCODE   0x28   ; user code slot        -> SYSRET CS  = 0x2B
+
+global entry_SYSCALL_64
+entry_SYSCALL_64:
+    swapgs                          ; ring 3's base -> KERNEL_GS_BASE, kernel's
+                                    ; base -> GS_BASE; BEFORE any [gs:] below
+    mov [gs:CPU_OFF_ENTRY_SCRATCH], rsp ; user RSP, before the stack switch
+    mov rsp, [gs:CPU_OFF_ENTRY_STACK_TOP] ; == TSS.rsp0; FMASK already cleared IF
+    ; iretq/sysretq tail, pushed highest-address first so it lands in the order
+    ; struct intr_frame declares: rip, cs, rflags, ussp, usss.
+    push QWORD SEL_UDATA | 3            ; usss = UDATA | 3  (= 0x23, unchanged)
+    push QWORD [gs:CPU_OFF_ENTRY_SCRATCH] ; ussp = the user RSP stashed above
+    push r11                            ; rflags (SYSCALL parked them in r11)
+    push QWORD SEL_UCODE | 3            ; cs    = UCODE | 3  (= 0x2B, was 0x1B)
+    push rcx                            ; rip   (SYSCALL parked it in rcx)
+    push QWORD 0                        ; err   -- nothing pushed an error code
+    push QWORD 128                      ; intno -- same gate number isr128 uses
+    PUSHALL                             ; rcx/r11 still hold the user's values
+    mov rdi, rsp
+    cld                                 ; DF is not ours to inherit
+    call syscall_entry                  ; may block/schedule
+    ; ---- S3.3 sysretq exit path (guard before POPALL: RAX is scratch) ----
+    ; f->rip is at [rsp+136] right after PUSHALL.  SYSRET faults (#GP) on a
+    ; non-canonical RIP, so screen it here.  sar 47 sign-extends bit 47:
+    ;   0  -> user canonical (rax == 0)
+    ;  -1  -> kernel canonical (rax == -1)
+    ; other -> non-canonical -> fall back to iretq
+    ; ---- S3.4: both tails below SWAPGS back to ring 3's base, as the LAST
+    ; thing they do, so every frame read and the final rsp load still run
+    ; against the kernel's base.  The swap is unconditional here: this door
+    ; is only reachable from ring 3 (cs is synthesised as SEL_UCODE|3 above,
+    ; never read from a CPU-pushed frame), so unlike the ISR stubs there is
+    ; no ring-0 branch to discriminate.  `cli` closes the gap in front of it:
+    ; an interrupt arriving while ring 3's base is live would take its own
+    ; "came from ring 0" branch and run the kernel against the user's GS.
+    mov rax, [rsp+136]           ; rax = f->rip
+    sar rax, 47
+    cmp rax, -1
+    je near sysret_ok            ; kernel canonical
+    test rax, rax
+    je near sysret_ok            ; user canonical too
+    ; non-canonical: fall through to iretq
+    POPALL
+    add rsp, 16
+    cli                          ; user IF returns in the iretq frame
+    swapgs                       ; back to ring 3's GS
+    iretq
+sysret_ok:
+    POPALL
+    add rsp, 16                  ; rsp -> f->rip
+    mov rcx, [rsp]               ; rcx = f->rip   (SYSRET: RCX <- RIP)
+    mov r11, [rsp+16]            ; r11 = f->rflags (SYSRET: R11 <- RFLAGS)
+    cli                          ; user IF returns in r11 (SYSRET loads it)
+    mov rsp, [rsp+24]            ; rsp = f->ussp  (SYSRET does not restore RSP);
+                                 ; kernel base still live, interrupts already
+                                 ; off, so nothing can be taken on the way in
+    swapgs                       ; last ring-0 act: back to ring 3's GS
+    o64 sysret                   ; == sysretq, encodes 48 0f 07.  Written this
+                                 ; way because nasm parses a bare `sysretq` as
+                                 ; a label and emits nothing (label-orphan),
+                                 ; and a bare `sysret` would be 0f 07 = return
+                                 ; to *compatibility* mode -- i.e. wrong CS.L.
 
 ; IPI vectors 0xF0..0xF2 — must push the real vector number, not 19.
 ; (idt_init used to alias 49..255 onto isr19, so a reschedule IPI was
@@ -469,9 +627,11 @@ isr240:                                 ; 0xF0 reschedule
     push QWORD 0
     push QWORD 240
     PUSHALL
+    SWAPGS_IN                           ; an IPI lands on ring 3 code too (S3.4)
     mov rdi, rsp
     cld
     call isr_common
+    SWAPGS_OUT
     POPALL
     add rsp, 16
     iretq
@@ -480,9 +640,11 @@ isr241:                                 ; 0xF1 spare
     push QWORD 0
     push QWORD 241
     PUSHALL
+    SWAPGS_IN
     mov rdi, rsp
     cld
     call isr_common
+    SWAPGS_OUT
     POPALL
     add rsp, 16
     iretq
@@ -491,9 +653,11 @@ isr242:                                 ; 0xF2 stop
     push QWORD 0
     push QWORD 242
     PUSHALL
+    SWAPGS_IN
     mov rdi, rsp
     cld
     call isr_common
+    SWAPGS_OUT
     POPALL
     add rsp, 16
     iretq
@@ -534,7 +698,16 @@ swtch:
 ; its interrupt frame onto its fresh kernel stack right below cpu_ctx.
 global glue_first
 glue_first:
-    ; swtch()'s ret left rsp pointing at this task's interrupt frame
+    ; swtch()'s ret left rsp pointing at this task's interrupt frame.  This is
+    ; the one door a brand-new task takes.  switch_to() has already installed
+    ; ITS user_gs in IA32_KERNEL_GS_BASE on the way in; IA32_GS_BASE still
+    ; holds the per-CPU block (this CPU never left ring 0).  The saved cs in
+    ; the frame is 0x2B (ring 3), so SWAPGS_IN would wrongly treat GS as
+    ; already holding a user value -- it doesn't, this frame never ran in
+    ; ring 3.  One unconditional swapgs hands IA32_KERNEL_GS_BASE (this task's
+    ; user GS) to ring 3; there is no return swapgs because we never come
+    ; back through this door.
+    swapgs
     POPALL
     add rsp, 16
     iretq

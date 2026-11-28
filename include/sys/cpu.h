@@ -30,6 +30,48 @@ u64 rdtsc(void);
 
 #define MSR_IA32_EFER 0xC0000080
 #define EFER_NXE      (1ULL << 11) /* PTE XD (bit 63) honoured */
+#define EFER_SCE      (1ULL << 0)  /* SYSCALL/SYSRET enable: clear, and 0F 05
+                                    * is #UD (SDM: "If IA32_EFER.SCE = 0
+                                    * THEN #UD").  LME/LMA live in the boot
+                                    * asm, NXE in vmm_init(); only this bit
+                                    * is added here, on every CPU. */
+
+/* ---- SYSCALL/SYSRET MSRs (Intel SDM Vol.2, "SYSCALL") ----
+ * Written by cpu_protect_init() so both the BSP and every AP can take a
+ * ring-3 `syscall` the moment it can run ring-3 code at all. */
+#define MSR_STAR         0xC0000081
+#define MSR_LSTAR        0xC0000082
+#define MSR_SYSCALL_MASK 0xC0000084 /* SDM name IA32_FMASK */
+
+/* ---- segment-base MSRs (Intel SDM Vol.2 "MSR 0xC0000101/2", SWAPGS) ----
+ * S3.4.  IA32_GS_BASE is the base the CPU actually uses for GS-relative
+ * accesses; IA32_KERNEL_GS_BASE is the shadow SWAPGS exchanges it with, so
+ * exactly one of the two names the kernel's per-CPU block and the other the
+ * user's GS at any instant.  The whole swapgs contract in one line:
+ *
+ *   in kernel  IA32_GS_BASE = &cpu_table[cpu], IA32_KERNEL_GS_BASE = user GS
+ *   in ring 3  the two are exchanged
+ *
+ * which is why every entry point from ring 3 must SWAPGS exactly once and
+ * every exit back to ring 3 must swap back -- take either half and the
+ * kernel reads user memory as its per-CPU struct (isr_common's this_cpu_data()
+ * is an rdmsr of 0xC0000101), and the other half leaks &cpu_table[] to a
+ * ring-3 read of %gs.
+ *
+ * IA32_FS_BASE is the third one and is NOT part of that dance: x86-64 System
+ * V puts the user's TLS on FS, no kernel code here dereferences FS, so
+ * arch_prctl(ARCH_SET_FS) may write it directly from ring 0 (S3.4 TLS). */
+#define MSR_IA32_FS_BASE         0xC0000100
+#define MSR_IA32_GS_BASE         0xC0000101
+#define MSR_IA32_KERNEL_GS_BASE  0xC0000102
+
+/* RFLAGS bits SYSCALL clears on entry (RFLAGS := RFLAGS AND NOT(IA32_FMASK)).
+ * Linux's list verbatim -- "clear as much as possible to minimize user
+ * space-kernel interference": CF PF AF ZF SF TF IF DF OF IOPL NT RF AC ID.
+ * IF matters here: the kernel must enter with interrupts off exactly as an
+ * interrupt gate would leave it, and the frame that iretq pops still carries
+ * the caller's own flags (they arrive in R11, untouched by the mask). */
+#define SYSCALL_RFLAGS_MASK 0x257FD5ULL
 
 /* ---- CR0 / CR4 control bits (Intel SDM Vol.3 Ch.2) ---- */
 #define CR0_MP         (1UL << 1)
@@ -63,7 +105,12 @@ bool cpu_has_x2apic(void);
  * CR0.PG; this is the C-level backstop (BSP cpu_init, every AP ap_main) and
  * the only place CR4.SMEP/CR4.SMAP are set, because those need a CPUID
  * gate.  Also publishes g_smap so the uaccess helpers below know whether
- * STAC/CLAC exist at all (#UD when CR4.SMAP=0). */
+ * STAC/CLAC exist at all (#UD when CR4.SMAP=0).
+ *
+ * It is also where this CPU's SYSCALL door is armed -- EFER.SCE, STAR,
+ * LSTAR and the FMASK -- because that set is per-CPU and BSP/AP share this
+ * one function.  Nothing here can fire yet: no ring-3 code exists before
+ * the first switch_to(), which is what fills in the entry stack. */
 void cpu_protect_init(void);
 
 /* ---- SMAP uaccess windows (only valid once cpu_protect_init ran) ---- */

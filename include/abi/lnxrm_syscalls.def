@@ -58,9 +58,11 @@
  * inter-process communication (kernel/ipc/dipc.c).  Arity is two
  * (dipc_open(name, flags) -> fd), four (dipc_recv(fd, buf, len, flags))
  * and four (dipc_send(fd, buf, len, flags)) -- the first three arguments
- * of a four-argument call land in rdi/rsi/r10 exactly as they do today,
- * and the FOURTH rides in rdx, the same register mmap's fourth argument
- * already reads out of the frame (h_mmap); nothing new is plumbed.  All
+ * of a four-argument call land in rdi/rsi/rdx and the FOURTH rides in
+ * r10, the same register mmap's fourth argument already reads out of the
+ * frame (h_mmap), so nothing new is plumbed.  (That is the S3.2 Linux
+ * six-register layout; before it the split was rdi/rsi/r10 plus rdx --
+ * every entry stub and every frame reader moved together.)  All
  * three rows carry GATE_ADMIN: a channel names a kernel object and its
  * byte stream, which is the same administrative surface as the raw key
  * bytes (kbd_get), the event queue (input_pop) and ps.  The names live in
@@ -69,14 +71,27 @@
  * because the reverse path (a driver answering with decoded events) is
  * not a shared-memory write at all: it is a call into a sink the channel
  * was created with.
+ * arch_prctl took 56 (2026-11-28, S3.4): the TLS door.  Arity is two --
+ * arch_prctl(code, addr), both in the Linux register positions (rdi, rsi) --
+ * where code picks one of four actions from LNXRM_ARCH_* in lnxrm_abi.h:
+ * SET_FS/SET_GS install a segment base, GET_FS/GET_GS write the current one
+ * back through the USER address in `addr`.  No gate: it names nothing but
+ * the caller's own task, and every address it will accept is below
+ * USER_MAX_VMA, which is what keeps a program from pointing its own %fs at
+ * kernel memory and reading it from ring 3.  It is the only writer of
+ * IA32_FS_BASE and of struct task's two base fields; swapgs (S3.4) is the
+ * only reader of IA32_KERNEL_GS_BASE, which is why ARCH_SET_GS does not
+ * touch IA32_GS_BASE at all -- see h_arch_prctl().
  *
  * Numbers are not the whole ABI: the ARITY of a call is too.  mmap (42)
  * grew from mmap(addr, len, prot) to the six-argument Linux shape
  * mmap(addr, len, prot, flags, fd, offset) when file mappings landed
  * (2026-11-09).  The number did not move -- nothing here is renumbered --
  * but a pre-rebuild binary calling the three-argument form reads whatever
- * rdx/rcx/r8 happened to hold, so userland and the kernel are rebuilt
+ * r10/r8/r9 happened to hold, so userland and the kernel are rebuilt
  * together; that is what `make user` and the disk image rule already do.
+ * The same argument for S3.2: the register layout is part of the ABI too,
+ * which is why the entry stubs and the frame readers changed in one commit.
  */
 LNXRM_SYS(read, 0)
 LNXRM_SYS(write, 1)
@@ -134,3 +149,4 @@ LNXRM_SYS(shm_unlink, 52)
 LNXRM_SYS(dipc_open, 53)
 LNXRM_SYS(dipc_recv, 54)
 LNXRM_SYS(dipc_send, 55)
+LNXRM_SYS(arch_prctl, 56)

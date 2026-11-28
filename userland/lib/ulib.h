@@ -11,47 +11,58 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+/* ---- syscall stubs ---------------------------------------------------- *
+ * S3.2: every stub issues `syscall`, not `int 0x80`.  The kernel's
+ * entry_SYSCALL_64 takes the number from rax and the arguments from
+ * rdi rsi rdx r10 r8 r9 -- the Linux six-register layout -- and `syscall`
+ * itself overwrites rcx (it parks RIP there) and r11 (RFLAGS), so both are
+ * in every clobber list below.  Nothing else is disturbed, which is what
+ * lets a two-argument stub leave rdx holding whatever it likes: handlers
+ * only read the registers their own arity names. */
+
 static inline long syscall1(long n, long a)
 {
     long r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
     return r;
 }
 
-/* careful: int 0x80 clobbers rcx/r11 only; use SysV arg regs */
+/* `syscall` clobbers rcx/r11 only; the SysV arg regs rdi/rsi/rdx stay
+ * usable for operands. */
 static inline long syscall2(long n, long a, long b)
 {
     long r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "D"(a), "S"(b) : "rcx", "r11", "memory");
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b) : "rcx", "r11", "memory");
     return r;
 }
 
 static inline long sys_call3(long n, long a, long b, long c)
 {
     long r;
-    __asm__ volatile("mov %4, %%r10\n\tint $0x80"
+    __asm__ volatile("syscall"
                      : "=a"(r)
-                     : "a"(n), "D"(a), "S"(b), "r"((long)c)
-                     : "rcx", "r11", "r10", "memory");
+                     : "a"(n), "D"(a), "S"(b), "d"(c)
+                     : "rcx", "r11", "memory");
     return r;
 }
 
-/* Six arguments -- mmap's shape.  The first three land exactly where
- * sys_call3 puts them (rdi, rsi, r10, the kernel's int 0x80 contract) and
- * the last three go to rdx/rcx/r8, which is where the kernel's trap frame
- * reads them (h_mmap).  rdx and rcx have constraint letters; r10 and r8 do
- * not, so they are pinned with register variables -- the documented idiom
- * for "this operand must be in that register", and the same one the libc
- * syscall() wrappers use. */
+/* Six arguments -- mmap's and dipc's shape.  They land in rdi, rsi, rdx,
+ * r10, r8, r9, which is the Linux layout, what the kernel's frame reads
+ * (h_mmap, h_dipc_recv/send) and exactly what `syscall` leaves untouched.
+ * rdx has a constraint letter; r10, r8 and r9 do not, so those three are
+ * pinned with register variables -- the documented idiom for "this operand
+ * must be in that register", and the same one the libc syscall() wrappers
+ * use.  rcx is a clobber here, not an operand: `syscall` overwrites it. */
 static inline long sys_call6(long n, long a, long b, long c, long d, long e, long f)
 {
     long r;
-    register long arg3 asm("r10") = c;
-    register long arg6 asm("r8") = f;
-    __asm__ volatile("int $0x80"
+    register long arg4 asm("r10") = d;
+    register long arg5 asm("r8") = e;
+    register long arg6 asm("r9") = f;
+    __asm__ volatile("syscall"
                      : "=a"(r)
-                     : "a"(n), "D"(a), "S"(b), "r"(arg3), "d"(d), "c"(e), "r"(arg6)
-                     : "r11", "memory");
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(arg4), "r"(arg5), "r"(arg6)
+                     : "rcx", "r11", "memory");
     return r;
 }
 
@@ -276,6 +287,21 @@ static inline long kdipc_recv(int fd, void *buf, size_t len, long flags)
  * with no sink), -EFAULT, -EBADF.  Flags must be 0. */
 static inline long kdipc_send(int fd, const void *buf, size_t len, long flags)
 { return sys_call6(SYS_dipc_send, fd, (long)buf, (long)len, flags, 0, 0); }
+
+/* arch_prctl(56): the TLS door (S3.4).  `code` is one of the LNXRM_ARCH_*
+ * values from lnxrm_abi.h -- Linux's own numbering -- and `addr` is the
+ * segment base to install (SET_*) or a user buffer that receives the
+ * current one (GET_*), which is exactly Linux arch_prctl's shape.
+ *
+ * The base lands on FS for SET_FS, because that is where the System V thread
+ * pointer lives and where a compiler lowering `__thread` will read it; GS is
+ * the register swapgs owns at every kernel boundary, so it takes a different
+ * route into the kernel (see h_arch_prctl).  Returns 0, -EACCES (addr at or
+ * above USER_MAX_VMA -- the kernel's half of the address space) or -EINVAL
+ * (an unknown code); GET_* answers -EFAULT for a buffer the kernel cannot
+ * write. */
+static inline long karch_prctl(int code, u64 addr)
+{ return syscall2(SYS_arch_prctl, code, (long)addr); }
 
 /* keyboard 34-36: get drains one buffered key (EAGAIN when empty),
  * inject types bytes on the console's behalf -- both CAP_SYS_ADMIN;

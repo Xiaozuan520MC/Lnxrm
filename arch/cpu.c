@@ -44,13 +44,14 @@ static void gdt_fill_one(struct cpu_gdt *cg)
     e[0] = 0;
     e[1] = 0x00AF9A000000FFFF; /* 0x08 KCODE L=1 */
     e[2] = 0x00CF92000000FFFF; /* 0x10 KDATA */
-    e[3] = 0x00AFFA000000FFFF; /* 0x18 UCODE L=1 DPL=3 */
-    e[4] = 0x00CFF2000000FFFF; /* 0x20 UDATA DPL=3 */
+    e[3] = 0x00CFAA000000FFFF; /* 0x18 UCODE32 placeholder (SYSRET reads its SS base as +8 = e[4]) */
+    e[4] = 0x00CFF2000000FFFF; /* 0x20 UDATA DPL=3 -> SYSRET SS = 0x23 */
+    e[5] = 0x00AFFA000000FFFF; /* 0x28 UCODE L=1 DPL=3 -> SYSRET CS = 0x2B */
 
     u64 b = (uptr)&cg->tss;
-    e[5] = ((sizeof(cg->tss) - 1) & 0xFFFFULL) | ((b & 0xFFFFULL) << 16) |
+    e[6] = ((sizeof(cg->tss) - 1) & 0xFFFFULL) | ((b & 0xFFFFULL) << 16) |
            (((b >> 16) & 0xFFULL) << 32) | (0x89ULL << 40) | (((b >> 24) & 0xFFULL) << 56);
-    e[6] = b >> 32;
+    e[7] = b >> 32;
 
     memset(&cg->tss, 0, sizeof(cg->tss));
     cg->tss.iopb = sizeof(cg->tss);
@@ -64,7 +65,7 @@ void gdt_init_cpu(int cpu)
     struct cpu_gdt *cg = &cpu_gdt_tab[cpu];
     gdt_fill_one(cg);
     gdt_reload(&cg->gdtr);
-    tss_load(0x28);
+    tss_load(0x30);
 }
 
 void gdt_init(void)
@@ -73,10 +74,24 @@ void gdt_init(void)
 void tss_set_rsp0(u64 rsp)
 {
     struct cpu_info *ci = this_cpu_data();
-    if (!ci)
+    if (!ci) {
+        /* GS base is not published yet (main.c sets it before anything can
+         * schedule), so this is the TSS-only belt-and-braces path -- the
+         * `syscall` door has no GS base to load its stack from and cannot
+         * be reached.  The write below just keeps the two mirrors in step
+         * if that ever changes. */
         cpu_gdt_tab[0].tss.rsp0 = rsp;
-    else
+        cpu_table[0].entry_stack_top = rsp;
+    } else {
         cpu_gdt_tab[ci->id].tss.rsp0 = rsp;
+        /* SYSCALL does not switch stacks (SDM: "The SYSCALL instruction
+         * does not save the stack pointer"), so entry_SYSCALL_64 loads its
+         * RSP from here instead of from the TSS.  The two are the same
+         * number by construction: keeping them together in this one
+         * function is what stops a future second rsp0 writer from leaving
+         * the `syscall` door pointed at a stale stack. (2026-11-27) */
+        ci->entry_stack_top = rsp;
+    }
 }
 
 /* ---- IDT ---- */
@@ -348,6 +363,10 @@ bool cpu_has_x2apic(void)
  * them).  False until then: a missed window would over-protect, never #UD. */
 bool g_smap = false;
 
+/* The SYSCALL entry point (arch/entry64.S).  Declared here rather than in a
+ * header: only cpu_protect_init() takes its address, to hand to LSTAR. */
+extern void entry_SYSCALL_64(void);
+
 void cpu_protect_init(void)
 {
     u64 cr0, cr4;
@@ -363,6 +382,34 @@ void cpu_protect_init(void)
         g_smap = true;
     }
     __asm__ volatile("mov %0,%%cr4" ::"r"(cr4) : "memory");
+
+    /* Arm the `syscall` door on this CPU (S3.2).  Four writes, and every one
+     * of them is per-CPU, which is why they live in the BSP/AP-shared hook
+     * rather than in the boot asm.
+     *
+     *   EFER.SCE     0F 05 is #UD without it.
+     *   STAR         bits 47:32 = KCODE (0x08): SYSCALL loads CS from there
+     *                with the RPL forced to 0, and SS as CS+8 -- which is
+     *                KDATA (0x10) only because the GDT lists them in that
+     *                order.  Bits 63:48 = 0x1B (USER_DS|3): SYSRET derives
+     *                user CS as base+16 = 0x2B and user SS as base+8 = 0x23,
+     *                which matches the GDT layout where UDATA (0x20) sits
+     *                one slot below UCODE (0x28).
+     *   LSTAR        entry_SYSCALL_64.
+     *   FMASK        the RFLAGS bits to clear on entry -- Linux's list,
+     *                which puts IF among them so the kernel starts exactly
+     *                as an interrupt gate would have left it.
+     *
+     * Idempotent, like the CR0/CR4 half above: EFER is read-modify-write
+     * and only the SCE bit is added, so a second call (or vmm_init's own
+     * NXE write) cannot lose it. */
+    {
+        u64 efer = rdmsr(MSR_IA32_EFER);
+        if (!(efer & EFER_SCE)) wrmsr(MSR_IA32_EFER, efer | EFER_SCE);
+        wrmsr(MSR_STAR, ((u64)0x1B << 48) | ((u64)0x08 << 32)); /* [63:48]=0x1B SYSRET base, [47:32]=0x08 KCODE */
+        wrmsr(MSR_LSTAR, (u64)(uptr)entry_SYSCALL_64);
+        wrmsr(MSR_SYSCALL_MASK, SYSCALL_RFLAGS_MASK);
+    }
 }
 
 void cpu_init(void)

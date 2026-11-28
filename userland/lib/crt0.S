@@ -22,7 +22,7 @@ _start:
     call main
     mov rdi, rax                ; exit code
     mov eax, 12                 ; SYS_exit
-    int 0x80
+    syscall                     ; nr in rax, arg in rdi (rcx/r11 die with it)
 .hang:
     jmp .hang
 

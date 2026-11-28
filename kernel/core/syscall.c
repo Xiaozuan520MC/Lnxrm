@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/* System call dispatch (int 0x80, nr in rax, args in rdi rsi r10). */
+/* System call dispatch (nr in rax, args in rdi rsi rdx r10 r8 r9 -- the
+ * Linux six-register layout).  Two doors reach it: the `syscall`
+ * instruction through entry_SYSCALL_64 (the one userland uses) and
+ * `int 0x80` through isr128, kept as the compatibility gate.  Both build
+ * the same struct intr_frame, which is why nothing below knows or cares
+ * which one it was entered from. (S3.2) */
 #include <sys/vfs.h>
 #include <sys/pipe.h>
 #include <sys/shm.h>
@@ -85,14 +90,14 @@ static long sys_brk(u64 newbrk)
 /* ---- mmap / munmap (T-MMAP, then file mappings) ----
  *
  * mmap is the six-argument Linux shape: mmap(addr, len, prot, flags, fd,
- * offset).  The int 0x80 ABI hands the dispatcher three of them (rdi, rsi,
- * r10, exactly as every other call has them) and the frame carries the rest
- * in rdx/rcx/r8 -- h_mmap reads them straight out, so no new register
- * plumbing was needed.  `addr` must still be 0: the kernel picks the
- * address top-down in [MMAP_LO, MMAP_TOP) and answering EINVAL for
- * anything else is honest where honouring a hint it would then ignore is
- * not.  prot is the LNXRM_PROT_* mask; unknown bits are masked off so a
- * later flag stays forward-compatible instead of breaking old callers.
+ * offset).  The dispatcher's ABI is exactly that shape, so all six arrive
+ * in rdi, rsi, rdx, r10, r8, r9 and h_mmap reads them straight out of the
+ * frame -- no new register plumbing was needed.  `addr` must still be 0:
+ * the kernel picks the address top-down in [MMAP_LO, MMAP_TOP) and
+ * answering EINVAL for anything else is honest where honouring a hint it
+ * would then ignore is not.  prot is the LNXRM_PROT_* mask; unknown bits
+ * are masked off so a later flag stays forward-compatible instead of
+ * breaking old callers.
  *
  * fd < 0 means "no file": an anonymous mapping, whose flags word is
  * normalised to MAP_PRIVATE (both names mean the same thing for a range
@@ -829,14 +834,14 @@ static long h_lseek(struct intr_frame *f, u64 a3)
     return sys_lseek((int)f->rdi, (long)f->rsi, (int)a3);
 }
 static long h_brk(struct intr_frame *f, u64 a3) { return sys_brk(f->rdi); }
-/* mmap is the one row wider than the dispatcher's three arguments: rdi,
- * rsi and a3 (=r10) are the first three exactly as every other call has
- * them, and flags/fd/offset ride in the next three registers the int 0x80
- * stub already pushed into the frame.  Nothing new is plumbed -- the frame
- * has always carried them. */
+/* mmap is the one row wider than a three-argument call: rdi, rsi and a3
+ * (= rdx) are the first three exactly as every other call has them, and
+ * flags/fd/offset ride in r10, r8 and r9 -- the last three registers of
+ * the same Linux layout the entry stubs save.  Nothing new is plumbed --
+ * the frame has always carried them. */
 static long h_mmap(struct intr_frame *f, u64 a3)
 {
-    return sys_mmap(f->rdi, f->rsi, a3, f->rdx, (long)f->rcx, f->r8);
+    return sys_mmap(f->rdi, f->rsi, a3, f->r10, (long)f->r8, f->r9);
 }
 static long h_munmap(struct intr_frame *f, u64 a3) { return sys_munmap(f->rdi, f->rsi); }
 static long h_mprotect(struct intr_frame *f, u64 a3) { return sys_mprotect(f->rdi, f->rsi, a3); }
@@ -1022,10 +1027,9 @@ static long h_shm_unlink(struct intr_frame *f, u64 a3) { return path_syscall(f->
  * then answers ENAMETOOLONG for -- 31 usable bytes, far inside this 64).
  *
  * The two four-argument shapes take their first three arguments the way
- * every call has always taken them (rdi, rsi, a3 = r10) and read the FOURTH
- * out of rdx -- the register mmap's fourth argument has read from the frame
- * since file mappings landed, so the dispatcher needs nothing new.  They are
- * the only rows that do. */
+ * every call takes them (rdi, rsi, a3 = rdx) and read the FOURTH out of
+ * r10 -- the same register mmap's fourth argument reads out of the frame,
+ * so the dispatcher needs nothing new.  They are the only rows that do. */
 static long h_dipc_open(struct intr_frame *f, u64 a3)
 {
     char name[64];
@@ -1034,11 +1038,79 @@ static long h_dipc_open(struct intr_frame *f, u64 a3)
 }
 static long h_dipc_recv(struct intr_frame *f, u64 a3)
 {
-    return sys_dipc_recv((int)f->rdi, (void *)f->rsi, a3, f->rdx);
+    return sys_dipc_recv((int)f->rdi, (void *)f->rsi, a3, f->r10);
 }
 static long h_dipc_send(struct intr_frame *f, u64 a3)
 {
-    return sys_dipc_send((int)f->rdi, (const void *)f->rsi, a3, f->rdx);
+    return sys_dipc_send((int)f->rdi, (const void *)f->rsi, a3, f->r10);
+}
+
+/* arch_prctl(56) -- S3.4, the TLS door.  The S3.2 register layout puts
+ * `code` in rdi and `addr` in rsi, so this row reads the frame directly and
+ * takes no third argument.
+ *
+ * One comparison gates every case, and it does both jobs at once:
+ *   USER_MAX_VMA is the top of ring 3, so `addr >= it` covers kernel
+ *   addresses and non-canonical ones together (the window's top sits well
+ *   under 0x0000800000000000, so everything below it is canonical already).
+ *   Accepting anything else would let a program aim its OWN segment base at
+ *   kernel memory and read it from ring 3 -- and SMAP is no help there:
+ *   SMAP governs explicit data accesses to user pages, not what a ring-3
+ *   segment-relative load resolves to.  This check is the thing standing
+ *   between arch_prctl and a read-anywhere primitive.
+ *
+ * The two halves are not symmetric, which is the whole reason for the
+ * comment on ARCH_SET_GS/ARCH_GET_GS below. */
+static long h_arch_prctl(struct intr_frame *f, u64 a3)
+{
+    int code = (int)f->rdi;
+    u64 addr = f->rsi;
+    u64 val;
+
+    switch (code) {
+    case LNXRM_ARCH_SET_FS:
+        if (addr >= USER_MAX_VMA) return LNXRM_EACCES;
+        /* Ring 0 never dereferences FS in this kernel, so IA32_FS_BASE IS
+         * the thread pointer whether we are in ring 0 or ring 3 -- there is
+         * no shadow to route around and the write can go straight down. */
+        current->user_fs = addr;
+        wrmsr(MSR_IA32_FS_BASE, addr);
+        return 0;
+    case LNXRM_ARCH_SET_GS:
+        if (addr >= USER_MAX_VMA) return LNXRM_EACCES;
+        /* NOT IA32_GS_BASE.  Ring 0 is executing right now, and in ring 0
+         * that cell is this CPU's per-CPU block: writing it would feed every
+         * [gs:...] below -- including entry_SYSCALL_64's own stack switch on
+         * the next call -- and the next SWAPGS would hand ring 3 the kernel
+         * address instead of this one.  IA32_KERNEL_GS_BASE is the cell
+         * SWAPGS exchanges FROM, i.e. where a ring-3 GS value is supposed to
+         * live; struct task::user_gs is the same fact in a form switch_to()
+         * can carry to whichever CPU this task runs on next. */
+        current->user_gs = addr;
+        wrmsr(MSR_IA32_KERNEL_GS_BASE, addr);
+        return 0;
+    case LNXRM_ARCH_GET_FS:
+        if (addr >= USER_MAX_VMA) return LNXRM_EACCES;
+        /* Read the MSR, not the field: for FS they are the same cell, so
+         * this answers from the hardware state a ring-3 %fs: load would
+         * actually resolve against. */
+        val = rdmsr(MSR_IA32_FS_BASE);
+        return copy_to_user((void *)addr, &val, sizeof(val)) < 0 ? LNXRM_EFAULT : 0;
+    case LNXRM_ARCH_GET_GS:
+        if (addr >= USER_MAX_VMA) return LNXRM_EACCES;
+        /* The mirror of ARCH_SET_GS: reading IA32_GS_BASE here would return
+         * this CPU's per-CPU block straight into user memory -- the one leak
+         * the swapgs discipline exists to prevent.  current->user_gs is the
+         * user's value by construction (switch_to() and ARCH_SET_GS are its
+         * only writers). */
+        val = current->user_gs;
+        return copy_to_user((void *)addr, &val, sizeof(val)) < 0 ? LNXRM_EFAULT : 0;
+    default:
+        /* An unknown code is answered as an unknown code, before any address
+         * is looked at: which of the two checks fires is part of what a
+         * caller can distinguish, so it must not depend on rsi. */
+        return LNXRM_EINVAL;
+    }
 }
 
 /* The table itself, in lnxrm_syscalls.def order.  Rows are complete on
@@ -1111,6 +1183,12 @@ static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
     [SYS_dipc_open] = { h_dipc_open, GATE_ADMIN, "dipc_open" },
     [SYS_dipc_recv] = { h_dipc_recv, GATE_ADMIN, "dipc_recv" },
     [SYS_dipc_send] = { h_dipc_send, GATE_ADMIN, "dipc_send" },
+    /* 56: no gate.  arch_prctl names nothing but the CALLER's own segment
+     * bases, every address it accepts is confined to ring 3 by
+     * USER_MAX_VMA, and there is no object here another process could aim
+     * at -- so the only thing a "capability" would be gating is a program
+     * editing its own TLS. */
+    [SYS_arch_prctl] = { h_arch_prctl, 0, NULL },
 };
 
 /* Look the row up, refuse what the gates refuse, then run it.  Register
@@ -1151,7 +1229,10 @@ void syscall_entry(struct intr_frame *f)
 
     if (current) current->tf = f;
 
-    long ret = syscall_do(f, f->rax, f->r10);
+    /* Third argument = rdx, the third slot of the Linux layout.  It is a
+     * separate parameter only because sysent rows take (frame, a3); the
+     * other five are read out of the frame by the handler that wants them. */
+    long ret = syscall_do(f, f->rax, f->rdx);
 
     f->rax = (u64)(long)ret;
     f->rflags |= 0x200;
@@ -1165,12 +1246,12 @@ void syscall_entry(struct intr_frame *f)
  *
  * syscall_entry()'s half of the contract -- CLAC, the kxld BUG_ON, the tf
  * save, the signal check -- is ring-0 *user-entry* plumbing and starts
- * with int 0x80, which a kernel self-test cannot raise on itself.  The
- * other half -- the capability/owner gates, the pointer validation, the
- * per-syscall error codes -- is what the self-test wants, and this calls
- * exactly that half: syscall_do() with a zeroed frame.  Not reachable
- * from user space (it is not a syscall of its own) and built only when
- * CONFIG_KTEST is defined. (2026-10-20) */
+ * with a ring-3 `syscall` or `int 0x80`, neither of which a kernel
+ * self-test can raise on itself.  The other half -- the capability/owner
+ * gates, the pointer validation, the per-syscall error codes -- is what the
+ * self-test wants, and this calls exactly that half: syscall_do() with a
+ * zeroed frame.  Not reachable from user space (it is not a syscall of its
+ * own) and built only when CONFIG_KTEST is defined. (2026-10-20) */
 long syscall_probe(u64 nr, u64 a1, u64 a2, u64 a3)
 {
     /* The three-argument shape every existing call uses.  mmap is wider
@@ -1186,14 +1267,18 @@ long syscall_probe6(u64 nr, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6)
 {
     struct intr_frame f;
 
+    /* Lay the six arguments out exactly where a real entry would have
+     * left them: rdi rsi rdx r10 r8 r9, the Linux six-register layout the
+     * `syscall` instruction's caller uses.  (S3.2 -- was
+     * rdi/rsi/r10/rdx/rcx/r8 under the int 0x80 contract.) */
     memset(&f, 0, sizeof(f));
     f.rax = nr;
     f.rdi = a1;
     f.rsi = a2;
-    f.r10 = a3;
-    f.rdx = a4; /* mmap's flags */
-    f.rcx = a5; /* ... its fd   */
-    f.r8 = a6;  /* ... and its offset */
+    f.rdx = a3;     /* third:  prot / len             */
+    f.r10 = a4;     /* fourth: mmap flags, dipc flags */
+    f.r8 = a5;      /* fifth:  mmap fd                */
+    f.r9 = a6;      /* sixth:  mmap offset            */
     return syscall_do(&f, nr, a3);
 }
 #endif

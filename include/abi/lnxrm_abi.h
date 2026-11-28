@@ -54,7 +54,25 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  55
+#define LNXRM_SYSCALL_LAST  56
+
+/* arch_prctl(56) codes -- S3.4 TLS.  Values are Linux's own
+ * (arch/x86/include/uapi/asm/prctl.h) so a ported test can compare them
+ * literally, the same convention the errno numbers follow.
+ *
+ * The two halves are independent mechanisms and it is worth saying why
+ * they both live behind one call:
+ *   FS  is the System V thread pointer -- a compiler lowering `__thread`
+ *       emits `%fs:offset` -- and nothing in ring 0 dereferences it, so
+ *       setting it is a plain write to IA32_FS_BASE.
+ *   GS  is the register SWAPGS exchanges with IA32_KERNEL_GS_BASE at every
+ *       ring-3 boundary (S3.4).  While ring 0 runs IA32_GS_BASE is the
+ *       kernel's per-CPU block, so an ARCH_SET_GS writes the SHADOW, which
+ *       is the cell SWAPGS will hand ring 3 -- see h_arch_prctl(). */
+#define LNXRM_ARCH_SET_GS 0x1001
+#define LNXRM_ARCH_SET_FS 0x1002
+#define LNXRM_ARCH_GET_FS 0x1003
+#define LNXRM_ARCH_GET_GS 0x1004
 
 /* mmap() protection bits (same values as Linux PROT_*, shared here so the
  * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */

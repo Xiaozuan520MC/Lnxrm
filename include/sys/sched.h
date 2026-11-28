@@ -84,6 +84,19 @@ struct task {
     char *kstack; /* kmalloc'd KSTACK_SIZE */
     char *kstack_top;
 
+    /* S3.4: this task's ring-3 segment bases -- FS (the System V thread
+     * pointer, what `__thread` would sit on) and GS (the one SWAPGS exchanges
+     * with IA32_KERNEL_GS_BASE).  IA32_FS_BASE and IA32_KERNEL_GS_BASE are
+     * per-CPU, the values they hold are per-task, and switch_to() is the
+     * seam where the two are put back in step: it saves the outgoing task's
+     * pair on the way out and installs the incoming one on the way in.  Skip
+     * that and the next task scheduled on the CPU inherits the previous
+     * task's TLS through an arch_prctl(ARCH_GET_FS) of its own.  0 = "no base
+     * set", which is what a fresh slot reads as (task_alloc_slot clears
+     * both); fork copies the parent's, execve drops them with the image. */
+    u64 user_fs;
+    u64 user_gs;
+
     u64 pml4;       /* CR3 physical */
     void *brk_base; /* user heap start (= end of segments) */
     void *brk_cur;

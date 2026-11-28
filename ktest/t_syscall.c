@@ -6,7 +6,8 @@
  * userland/systest exercises only the paths a shell happens to walk from ring
  * 3.  syscall_probe() runs the real dispatch table (gates, pointer
  * checks, per-syscall error codes) against caller-built arguments; the
- * only thing it skips is the int 0x80 entry plumbing, which a kernel-side
+ * only thing it skips is the ring-3 entry plumbing (`syscall` through
+ * entry_SYSCALL_64, or `int 0x80` through isr128), which a kernel-side
  * case cannot raise on itself.
  *
  * Per call: a bad pointer -- NULL, kernel, non-canonical, unmapped user,

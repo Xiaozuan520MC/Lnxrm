@@ -93,13 +93,18 @@ void send_signal(struct task *t, int sig)
 
 /* Machine code for the restorer the handler `ret`s into:
  *     mov eax, 20      ; SYS_sigreturn
- *     int 0x80
+ *     syscall
  *     ud2              ; must never fall through
- * Every user page except code is NX, so this cannot be written onto the
- * stack any more: signal_map_restorer() puts it in a page of its own,
- * mapped execute-only-enough at USER_SIGRETURN_VA when the address space
- * is created. */
-static const u8 sigreturn_code[] = {0xb8, 0x14, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x0f, 0x0b};
+ * Same nine bytes as the old `int 0x80` form -- 0F 05 is the two-byte
+ * SYSCALL opcode where CD 80 was -- so nothing downstream has to know the
+ * length changed.  The kernel takes it through entry_SYSCALL_64 like every
+ * other user entry, and rcx/r11 the instruction kills never matter: the
+ * sigreturn it performs restores the whole frame the interrupted context
+ * left behind.  Every user page except code is NX, so this cannot be
+ * written onto the stack any more: signal_map_restorer() puts it in a page
+ * of its own, mapped execute-only-enough at USER_SIGRETURN_VA when the
+ * address space is created. */
+static const u8 sigreturn_code[] = {0xb8, 0x14, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b};
 
 /* Map the sigreturn restorer into `pml4`.  Called from the execve/spawn
  * paths; fork inherits the page through dup_user_aspace().

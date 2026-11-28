@@ -2,7 +2,7 @@
 
 /* End-to-end coverage of every number in include/abi/lnxrm_syscalls.def.
  *
- * Live calls (56, numbered 0..55 with no holes), all exercised below:
+ * Live calls (57, numbered 0..56 with no holes), all exercised below:
  *    0 read      1 write     2 open      3 close     4 lseek     5 brk
  *    6 getdent   7 dup2      8 nanosleep 9 getpid   10 fork    11 execve
  *   12 exit     13 wait4    14 kill     15 uname    16 sigaction 17 sigprocmask
@@ -12,6 +12,7 @@
  *   32 fb_flip  33 sync     34 kbd_get  35 kbd_inject 36 kbd_info
  *   37 mouse_get 38 mouse_info 39 input_pop 40 input_info 41 input_wait
  *   42 mmap     43 munmap   44 mprotect 45 stat    46 gettimeofday 47 pipe
+ *   56 arch_prctl (S3.4, last -- see t_arch_prctl at the end of this file)
  *
  * The three numbers appended 2026-11-15 are deliberately NOT called here:
  * 48 reboot resets the machine on success (a self-test that worked would
@@ -1277,6 +1278,112 @@ static void t_pipe(void)
     say("pipe.rdclose2", kclose(pf[0]));
 }
 
+/* ---- arch_prctl(56): the TLS door (S3.4) ----
+ *
+ * Three separate claims, each with its own way of being wrong:
+ *   round trip  -- what SET installs is what GET reads back, off two
+ *                  DIFFERENT cells (FS straight off IA32_FS_BASE, GS off
+ *                  the shadow ring 3 sees), which only holds if each write
+ *                  landed where SWAPGS will look for it;
+ *   boundary    -- USER_MAX_VMA is where ring 3 stops and everything from
+ *                  it upwards must be refused: a base above that line is a
+ *                  read-anything primitive, and SMAP does not apply to what
+ *                  a ring-3 segment-relative load resolves to;
+ *   survival    -- a fork/wait pair and a sleep both go through switch_to()
+ *                  in both directions, so the child inheriting the parent's
+ *                  base AND the parent still finding its own afterwards is
+ *                  the proof that the per-CPU MSRs are being carried per
+ *                  task instead of being left for whoever runs next.
+ *
+ * Returns 1 only if every parent-side check held.  main() prints that as
+ * systest.done, so smoke's own "this program finished" criterion turns red
+ * when one of them did not -- this file prints no new SYSTEST_TAG.  Every
+ * individual answer is printed too, because which of them is 0 says which
+ * claim broke. */
+static int t_arch_prctl(void)
+{
+    /* Just under USER_MAX_VMA (0x7ffffffff000): the highest addresses this
+     * call accepts, so these two are legal and the boundary itself is not. */
+    const u64 fs_base = 0x7fffffffe000UL;
+    const u64 gs_base = 0x7fffffffd000UL;
+    const u64 child_fs = 0x7fffffffc000UL;
+    u64 rd = 0;
+    int ok = 1;
+    long r;
+
+    r = karch_prctl(LNXRM_ARCH_SET_FS, fs_base);
+    say("archprctl.setfs", r);
+    ok &= (r == 0);
+    r = karch_prctl(LNXRM_ARCH_GET_FS, (u64)&rd);
+    say("archprctl.getfs", r);
+    ok &= (r == 0 && rd == fs_base);
+    say("archprctl.fs", rd == fs_base);
+    ok &= (rd == fs_base);
+
+    r = karch_prctl(LNXRM_ARCH_SET_GS, gs_base);
+    say("archprctl.setgs", r);
+    ok &= (r == 0);
+    rd = 0;
+    r = karch_prctl(LNXRM_ARCH_GET_GS, (u64)&rd);
+    say("archprctl.getgs", r);
+    ok &= (r == 0 && rd == gs_base);
+    say("archprctl.gs", rd == gs_base);
+    ok &= (rd == gs_base);
+
+    /* the boundary, from both sides */
+    say("archprctl.fs.atmax",
+        karch_prctl(LNXRM_ARCH_SET_FS, 0x7ffffffff000UL) == LNXRM_EACCES);
+    ok &= (karch_prctl(LNXRM_ARCH_SET_FS, 0x7ffffffff000UL) == LNXRM_EACCES);
+    say("archprctl.fs.kernel",
+        karch_prctl(LNXRM_ARCH_SET_FS, 0xffff800000000000UL) == LNXRM_EACCES);
+    ok &= (karch_prctl(LNXRM_ARCH_SET_FS, 0xffff800000000000UL) == LNXRM_EACCES);
+    say("archprctl.gs.noncanon",
+        karch_prctl(LNXRM_ARCH_SET_GS, 0x0000800000000000UL) == LNXRM_EACCES);
+    ok &= (karch_prctl(LNXRM_ARCH_SET_GS, 0x0000800000000000UL) == LNXRM_EACCES);
+    /* an unknown code is EINVAL, and rsi must not be consulted first */
+    say("archprctl.badscode",
+        karch_prctl(0x1000, 0xffff800000000000UL) == LNXRM_EINVAL);
+    ok &= (karch_prctl(0x1000, 0xffff800000000000UL) == LNXRM_EINVAL);
+
+    /* fork/wait: the child runs with an inherited base and installs its own,
+     * which means switch_to() carried the pair out and back again.  The
+     * child's own read of the inherited value is reported through its exit
+     * status (0 = inherited, anything else = not). */
+    long pid = kfork();
+    if (pid == 0) {
+        u64 crd = 0;
+        long cr = karch_prctl(LNXRM_ARCH_GET_FS, (u64)&crd);
+        if (cr != 0 || crd != fs_base) kexit(1);      /* not inherited */
+        if (karch_prctl(LNXRM_ARCH_SET_FS, child_fs) != 0) kexit(2);
+        if (karch_prctl(LNXRM_ARCH_SET_GS, child_fs) != 0) kexit(3);
+        if (ksleep_ms(40, 0) < 0) kexit(4);           /* force a switch away */
+        rd = 0;
+        if (karch_prctl(LNXRM_ARCH_GET_FS, (u64)&rd) != 0 || rd != child_fs)
+            kexit(5);                                  /* clobbered while parked */
+        kexit(0);
+    }
+    int st = 0;
+    if (pid > 0) kwaitpid(pid, &st, 0);
+    say("archprctl.fork", pid > 0 && st == 0);
+    ok &= (pid > 0 && st == 0);
+
+    /* the parent's own bases must be exactly where it left them, across
+     * everything the child did */
+    rd = 0;
+    r = karch_prctl(LNXRM_ARCH_GET_FS, (u64)&rd);
+    say("archprctl.fork.keepfs", r == 0 && rd == fs_base);
+    ok &= (r == 0 && rd == fs_base);
+    rd = 0;
+    r = karch_prctl(LNXRM_ARCH_GET_GS, (u64)&rd);
+    say("archprctl.fork.keepgs", r == 0 && rd == gs_base);
+    ok &= (r == 0 && rd == gs_base);
+
+    /* leave both bases where every other test found them */
+    say("archprctl.clear", karch_prctl(LNXRM_ARCH_SET_FS, 0) == 0 &&
+                                karch_prctl(LNXRM_ARCH_SET_GS, 0) == 0);
+    return ok;
+}
+
 /* ---- true-colour card: one swatch per named FB_CLR_* colour plus an
  * RGB gradient.  Colours are 0x00RRGGBB (never palette indices), so a
  * screendump of this band must match the table byte for byte. ---- */
@@ -1359,7 +1466,13 @@ int main(int argc, char **argv)
     t_stat_time();
     t_pipe();
 
-    say("systest.done", 1);
+    /* S3.4 runs LAST on purpose: it sleeps and forks, both of which come
+     * back through switch_to(), and it must hand the bases back to 0 so the
+     * shell's own later calls see the same state they would have seen
+     * without this test.  The verdict goes into systest.done itself: smoke
+     * requires systest.done=1, so a failed assertion here turns that
+     * criterion red without anyone having to add a SYSTEST_TAG. */
+    say("systest.done", t_arch_prctl());
     t_fb_swatch();
 
     return 0;

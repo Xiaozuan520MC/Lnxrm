@@ -355,6 +355,14 @@ struct task *sched_create_idle(int cpu_id)
     t->con_next = NULL;
     t->parent_pid = 0; /* an idle task has no parent */
     t->parent_gen = 0;
+    /* S3.4: and no segment bases either.  This slot was claimed straight
+     * from the table rather than through task_alloc_slot(), so it may be
+     * carrying a dead occupant's -- and switch_to() installs whichever pair
+     * it finds on every switch to an idle task.  An idle never returns to
+     * ring 3, but the MSRs it parks there must still be this task's own
+     * (which is to say: none). */
+    t->user_fs = 0;
+    t->user_gs = 0;
     t->kstack = NULL;
     t->kstack_top = NULL;
     /* Same justification as BSP idle: switch_to may load this as CR3. */
@@ -517,6 +525,23 @@ static void switch_to(struct task *next)
     }
 
     this_cpu_data()->_current = next;
+    /* S3.4: the ring-3 segment bases.  IA32_FS_BASE and
+     * IA32_KERNEL_GS_BASE are per-CPU but the values they hold are per-task,
+     * so the swap belongs on this seam -- and both halves belong on the
+     * INCOMING side of swtch(), not split across it.  A task resumed from
+     * swtch() would find whichever pair whoever switched to it left there,
+     * and a brand-new one going through glue_first has never returned from a
+     * swtch at all, so a post-swtch restore would never run for it: the only
+     * ordering that covers both is "save outgoing, install incoming, then
+     * switch".  Nothing can observe the swap in between -- we are in ring 0
+     * the whole time, ring 0 never runs SWAPGS, and the interrupt stubs
+     * branch on their frame's cs rather than on "is GS stale". */
+    if (prev) {
+        prev->user_fs = rdmsr(MSR_IA32_FS_BASE);
+        prev->user_gs = rdmsr(MSR_IA32_KERNEL_GS_BASE);
+    }
+    wrmsr(MSR_IA32_FS_BASE, next->user_fs);
+    wrmsr(MSR_IA32_KERNEL_GS_BASE, next->user_gs);
     swtch((u64 *)&prev->ctx, &next->ctx.sp);
 }
 
@@ -593,6 +618,11 @@ struct task *task_alloc_slot(void)
                 task_table[i].rq_cpu = -1;
                 task_table[i].rq_next = NULL;
                 task_table[i].cpu_id = -1;
+                /* S3.4: and never the previous occupant's ring-3 segment
+                 * bases -- switch_to() reinstalls them from here on every
+                 * switch, so a recycled slot must start at "no base set". */
+                task_table[i].user_fs = 0;
+                task_table[i].user_gs = 0;
                 /* Slots are reused without being cleared, so a recycled task
                  * must not inherit the previous occupant's signal state. */
                 task_table[i].signal_pending = 0;
