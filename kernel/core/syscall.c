@@ -16,7 +16,8 @@
 #include <sys/protect.h>
 #include <sys/rtc.h>
 #include <console.h>
-#include <io.h> /* reboot(48): the reset-line outb()s */
+#include <io.h> /* outb/inb — reset line and ACPI PM1 port */
+#include <sys/acpi.h> /* acpi_pm1a_cnt() — ACPI S5 power-off */
 #include <mm/mm.h>
 #include <mm/vma.h>
 #include <framebuffer.h>
@@ -972,28 +973,64 @@ static long h_input_wait(struct intr_frame *f, u64 a3)
     return sys_input_wait((struct lnxrm_input_event *)f->rdi, (u64)f->rsi);
 }
 
-/* ---- reboot(48): flush, then reset the machine ----
+/* ---- shutdown(57): halt / power off / reset the machine ----
  *
- * The CAP_SYS_ADMIN gate lives on the dispatch ROW (GATE_ADMIN below), so
- * only root ever reaches this function -- everything else gets -EACCES
- * with the usual "[cap] denied" receipt, and lsh (which runs as root)
- * sails through.
+ * One call, three commands (values match Linux's RB_*):
+ *   LNXRM_RB_HALT      (0):  cli; hlt forever -- stop, do not reset
+ *   LNXRM_RB_REBOOT    (1):  pulse the chipset reset line -- soft reset
+ *   LNXRM_RB_POWER_OFF (2):  write SLP_TYP=5|SLP_EN to the ACPI PM1a_CNT
+ *                            port from the FADT, asking the platform to
+ *                            switch off; QEMU honours it and exits cleanly
  *
- * Two reset doors, in the order the hardware offers them: 0x64/0xFE
- * pulses the 8042 keyboard controller's reset line (QEMU and anything
- * AT-compatible answers it), then 0xCF9 = 0x06 asks the chipset for a
- * full reset (the port a box with no 8042 actually has).  If NEITHER
- * answers, the CPU stops with interrupts off rather than returning: a
- * reboot command that fell back to "carry on running" would be lying
- * about having reset anything.  No path returns on success -- the gate
- * is the only refusal a caller can ever see. */
-static long sys_reboot(void)
+ * The CAP_SYS_ADMIN gate lives on the dispatch row, so only root ever
+ * reaches here.  sys_sync() runs first so cached dirty sectors hit the
+ * disk before anything powers down.  No path returns on success -- the
+ * gate is the only refusal a caller can ever see. */
+static void machine_halt(void)
 {
-    kprintf("[sys] reboot: pid %u requested a reset\n", (unsigned)current->pid);
-    sys_sync(); /* FAT32 writes sit in blk_cache; a reset would drop them */
-    outb(0x64, 0xFE);  /* 8042: pulse the CPU reset line */
-    outb(0xCF9, 0x06); /* chipset: reset-request + full-reset bits */
+    kprintf("[sys] shutdown: halt\n");
     for (;;) __asm__ volatile("cli; hlt");
+}
+
+static void machine_power_off(void)
+{
+    kprintf("[sys] shutdown: power off\n");
+    u32 port = acpi_pm1a_cnt();
+    if (port) {
+        /* SLP_TYP = 5 (S5/soft off) at bits 10..12, SLP_EN = 1 at bit 13.
+         * The high word must be the SLPTYP value; QEMU reads this and
+         * exits with status 0 instead of resetting. */
+        u16 val = (u16)((5 << 10) | (1u << 13));
+        outw(port, val);
+        /* If the platform did not take it, nothing else to try: halt. */
+    }
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+static void machine_reset(void)
+{
+    kprintf("[sys] shutdown: reboot\n");
+    /* Two reset doors, in the order the hardware offers them: 0x64/0xFE
+     * pulses the 8042 keyboard controller's reset line (QEMU and anything
+     * AT-compatible answers it), then 0xCF9 = 0x02 asks the chipset for a
+     * soft reset (the port a box with no 8042 actually has).  If NEITHER
+     * answers, the CPU stops with interrupts off rather than returning. */
+    outb(0x64, 0xFE);
+    outb(0xCF9, 0x02);
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+static long sys_shutdown(int cmd)
+{
+    kprintf("[sys] shutdown: pid %u requested cmd %d\n", (unsigned)current->pid, cmd);
+    sys_sync(); /* FAT32 writes sit in blk_cache; powering off would drop them */
+    switch (cmd) {
+    case LNXRM_RB_HALT:    machine_halt();    break;
+    case LNXRM_RB_REBOOT:  machine_reset();   break;
+    case LNXRM_RB_POWER_OFF: machine_power_off(); break;
+    default: return LNXRM_EINVAL;
+    }
+    return LNXRM_EFAIL; /* not reached: success paths do not return */
 }
 
 /* chdir(49) / getcwd(50): what the shell's cd/pwd builtins call. */
@@ -1004,7 +1041,9 @@ static long h_getcwd(struct intr_frame *f, u64 a3)
 }
 /* reboot(48): by the time this runs the row's gate has already said yes,
  * and the machine is on its way out instead of back here. */
-static long h_reboot(struct intr_frame *f, u64 a3) { return sys_reboot(); }
+static long h_reboot(struct intr_frame *f, u64 a3) { return sys_shutdown(LNXRM_RB_REBOOT); }
+/* shutdown(57): gate already passed, just dispatch on the command in rdi. */
+static long h_shutdown(struct intr_frame *f, u64 a3) { return sys_shutdown((int)f->rdi); }
 
 /* shm_open(51) / shm_unlink(52): the name arrives as a USER address, so it
  * is copied out here exactly as open(2)/unlink(2) copy theirs -- copy_user_str
@@ -1189,6 +1228,9 @@ static const struct sysent sysents[LNXRM_SYSCALL_LAST + 1] = {
      * at -- so the only thing a "capability" would be gating is a program
      * editing its own TLS. */
     [SYS_arch_prctl] = { h_arch_prctl, 0, NULL },
+    /* 57: GATE_ADMIN.  Halting, powering off or resetting the machine is an
+     * administrative act -- root passes, a plain user answers -EACCES. */
+    [SYS_shutdown]   = { h_shutdown,   GATE_ADMIN, "shutdown" },
 };
 
 /* Look the row up, refuse what the gates refuse, then run it.  Register

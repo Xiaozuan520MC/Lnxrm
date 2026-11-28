@@ -61,7 +61,12 @@ struct sdt_hdr {
 
 static u32 s_ap_ids[MAX_CPUS]; /* enabled local APIC IDs, deduplicated */
 static u32 s_ap_count;         /* 0 = no usable MADT found */
-static u32 s_ioapic_base;
+static u32 s_ioapic_base;      /* first IOAPIC MMIO address from the MADT */
+
+/* PM1a_CNT I/O port from the FADT ("FACP" table), or 0 when unknown.
+ * Writing SLP_TYP=5 (S5) | SLP_EN here asks the platform to power off --
+ * QEMU honours it and exits cleanly instead of resetting. */
+static u32 s_pm1a_cnt;
 
 static bool sum_ok(const void *p, u32 len)
 {
@@ -256,6 +261,66 @@ static void parse_madt(const struct sdt_hdr *madt)
     }
 }
 
+/* ---- FADT ("FACP"): Fixed ACPI Description Table ----------------------- */
+
+/* Only the fields we need: header + pm1a_cnt_blk.  rev 1 keeps pm1a_cnt_blk
+ * as a u16 I/O port at offset 0x34; rev >= 2 moves it into a 12-byte GAS
+ * structure at offset 0x64 whose address field is at +8. */
+struct fadt {
+    struct sdt_hdr h;
+    /* rev 1 fields we skip: facs(0x24), dsdt(0x28), model(0x2c),
+     * hw_rev(0x2d), pmi_tmr_blk(0x2e), ... */
+    u16 pm1a_cnt_blk_v1;   /* offset 0x34, valid when h.revision == 1 */
+    u8  _pad_v1[0x64 - 0x36];
+    /* rev 2+ GAS pm1a_cnt_blk: space_id(0x64), bit_width(0x65),
+     * bit_offset(0x66), access_size(0x67), reserved(0x68..0x6a),
+     * address(0x6b..0x72) */
+    u8  gas_space_id;      /* offset 0x64 */
+    u8  _gas_pad[3];
+    u64 gas_address;       /* offset 0x6b */
+} __attribute__((packed));
+
+/* Walk XSDT/RSDT for the FADT and return its physical address, or 0. */
+static u64 find_fadt(const struct rsdp *r)
+{
+    if (r->revision >= 2 && r->xsdt && r->length >= sizeof(struct rsdp) &&
+        r->length <= 0x1000 && sum_ok(r, r->length)) {
+        if (read_table(r->xsdt, "XSDT", s_dir, sizeof(s_dir))) {
+            const struct sdt_hdr *d = (const struct sdt_hdr *)s_dir;
+            u32 n = (d->length - (u32)sizeof(struct sdt_hdr)) / 8;
+            const u64 *e = (const u64 *)(s_dir + sizeof(struct sdt_hdr));
+            for (u32 i = 0; i < n; i++)
+                if (read_table(e[i], "FACP", s_madt, sizeof(s_madt)))
+                    return e[i];
+        }
+    }
+    if (r->rsdt) {
+        if (read_table(r->rsdt, "RSDT", s_dir, sizeof(s_dir))) {
+            const struct sdt_hdr *d = (const struct sdt_hdr *)s_dir;
+            u32 n = (d->length - (u32)sizeof(struct sdt_hdr)) / 4;
+            const u32 *e = (const u32 *)(s_dir + sizeof(struct sdt_hdr));
+            for (u32 i = 0; i < n; i++)
+                if (read_table(e[i], "FACP", s_madt, sizeof(s_madt)))
+                    return e[i];
+        }
+    }
+    return 0;
+}
+
+/* Parse the copied FADT into s_pm1a_cnt.  Prefers the rev 2+ GAS address
+ * when its space is SystemIO (1), else falls back to the rev 1 port. */
+static void parse_fadt(void)
+{
+    const struct fadt *f = (const struct fadt *)s_madt;
+    if (f->gas_space_id == 1 && f->gas_address) {
+        s_pm1a_cnt = (u32)f->gas_address;
+    } else if (f->pm1a_cnt_blk_v1) {
+        s_pm1a_cnt = f->pm1a_cnt_blk_v1;
+    } else {
+        s_pm1a_cnt = 0;
+    }
+}
+
 void acpi_init(void)
 {
     const struct rsdp *r = find_rsdp();
@@ -264,15 +329,29 @@ void acpi_init(void)
         return;
     }
     u64 madt_pa = find_madt(r);
-    if (!madt_pa) {
+    if (madt_pa) {
+        parse_madt((const struct sdt_hdr *)s_madt);
+        klogf(LOG_DEBUG, "[acpi] RSDP %p rev %u, MADT @ %p: %u local APIC%s, IOAPIC @ %p\n",
+              (void *)r, r->revision, (void *)madt_pa, s_ap_count,
+              s_ap_count >= MAX_CPUS ? "s (capped)" : "s", (void *)(u64)s_ioapic_base);
+    } else {
         kprintf("[acpi] RSDP %p rev %u, no MADT — AP enumeration will probe\n",
                 (void *)r, r->revision);
-        return;
     }
-    parse_madt((const struct sdt_hdr *)s_madt);
-    klogf(LOG_DEBUG, "[acpi] RSDP %p rev %u, MADT @ %p: %u local APIC%s, IOAPIC @ %p\n",
-          (void *)r, r->revision, (void *)madt_pa, s_ap_count,
-          s_ap_count >= MAX_CPUS ? "s (capped)" : "s", (void *)(u64)s_ioapic_base);
+    /* FADT is optional: when missing or unparseable, s_pm1a_cnt stays 0
+     * and poweroff falls back to a hard halt. */
+    u64 fadt_pa = find_fadt(r);
+    if (fadt_pa) {
+        parse_fadt();
+        klogf(LOG_DEBUG, "[acpi] FADT @ %p: PM1a_CNT = %#x\n",
+              (void *)fadt_pa, s_pm1a_cnt);
+    }
+}
+
+/* Return the PM1a_CNT I/O port, or 0 when the firmware never disclosed it. */
+u32 acpi_pm1a_cnt(void)
+{
+    return s_pm1a_cnt;
 }
 
 u32 acpi_collect_ap_ids(u32 *ids, u32 max)

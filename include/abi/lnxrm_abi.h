@@ -54,7 +54,7 @@ enum lnxrm_syscall_number {
 };
 
 #define LNXRM_SYSCALL_FIRST 0
-#define LNXRM_SYSCALL_LAST  56
+#define LNXRM_SYSCALL_LAST  57
 
 /* arch_prctl(56) codes -- S3.4 TLS.  Values are Linux's own
  * (arch/x86/include/uapi/asm/prctl.h) so a ported test can compare them
@@ -73,6 +73,14 @@ enum lnxrm_syscall_number {
 #define LNXRM_ARCH_SET_FS 0x1002
 #define LNXRM_ARCH_GET_FS 0x1003
 #define LNXRM_ARCH_GET_GS 0x1004
+
+/* shutdown(57) commands.  Values match Linux's RB_* so a ported test can
+ * compare them literally, same convention as errno.  The kernel answers
+ * ENOSYS for anything it does not recognise, and the success path does not
+ * return -- the machine halts, powers off or resets instead. */
+#define LNXRM_RB_HALT    0   /* stop the CPU, do not reset or power off */
+#define LNXRM_RB_REBOOT  1   /* reset the machine (soft reset) */
+#define LNXRM_RB_POWER_OFF 2   /* ask the platform to switch off (ACPI S5) */
 
 /* mmap() protection bits (same values as Linux PROT_*, shared here so the
  * kernel's VMA bookkeeping and the user wrappers cannot drift apart). */

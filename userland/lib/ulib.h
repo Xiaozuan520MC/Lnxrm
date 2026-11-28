@@ -205,6 +205,11 @@ static inline long ksync(void)
 static inline long kreboot(void)
 { return syscall1(SYS_reboot, 0); }
 
+/* shutdown(57): halt / power off / reset.  cmd is one of LNXRM_RB_* from
+ * lnxrm_abi.h.  Gated CAP_SYS_ADMIN; the success path never returns. */
+static inline long kshutdown(int cmd)
+{ return syscall1(SYS_shutdown, (long)cmd); }
+
 /* chdir(49): move THIS task's working directory.  A shell's `cd` is a
  * builtin because of exactly this: a forked child would chdir its own
  * copy and take it along on exit, leaving the parent where it was. */

@@ -48,7 +48,7 @@ scripts/               patch_setup_jmp.py patch_bzimage.py smoke_test.py
 | `MAX_CPUS`/`NR_TASKS`/`NR_FDS` | 8/64/16 | `include/types.h` | `MAX_ORDER`/`MIN_ORDER_BITS` | 11/12（buddy 最大 4 MiB） | `pmm.c` |
 | `KSTACK_SIZE` | 32768 | `sys/sched.h` | `PMM_WINDOW_TOP` | `0x80000000`（2 GiB） | `mm/mm.h` |
 | `LNXRM_NR_SIGNALS` | 14（编号 1..13） | `lnxrm_abi.h` | `RESV_MAX`/`KHEAP_NBINS` | 8/9 | `pmm.c`/`mm.h` |
-| `LNXRM_SYSCALL_LAST` | 56（共 57 个） | `lnxrm_abi.h` | `CRED_USER_MEM_QUOTA_PAGES` | 64 MiB/4 KiB | `sys/cred.h` |
+| `LNXRM_SYSCALL_LAST` | 57（共 58 个） | `lnxrm_abi.h` | `CRED_USER_MEM_QUOTA_PAGES` | 64 MiB/4 KiB | `sys/cred.h` |
 | `LNXRM_SHM_MAX_SIZE`/`MAX_OBJECTS` | 1 GiB/64 | `sys/shm.h` | `LNXRM_SHM_NAME_MAX` | 32（含 NUL） | `sys/shm.h` |
 | `LNXRM_DIPC_MAX`/`NAME_MAX` | 8/32（含 NUL） | `sys/dipc.h` | `LNXRM_DIPC_RING_SIZE`/`PAY_SIZE` | 4096/4088（−8 B 头） | `lnxrm_abi.h`/`sys/dipc.h` |
 | `CACHE_ENTRIES`/`MAX_MOUNTS` | 64/4 | `disk.h`/`vfs.c` | `HZ`/`AP_STARTUP_TIMEOUT_MS` | 100/100 | `sys/cpu.h`/`sys/smp.h` |

@@ -55,6 +55,11 @@ u32 acpi_collect_ap_ids(u32 *ids, u32 max);
  * then uses the conventional IOAPIC_BASE. */
 u32 acpi_ioapic_base(void);
 
+/* PM1a_CNT I/O port from the FADT ("FACP" table), or 0 when unknown.
+ * Writing SLP_TYP=5 (S5) | SLP_EN here asks the platform to power off --
+ * QEMU honours it and exits cleanly instead of resetting. */
+u32 acpi_pm1a_cnt(void);
+
 #ifdef __cplusplus
 }
 #endif

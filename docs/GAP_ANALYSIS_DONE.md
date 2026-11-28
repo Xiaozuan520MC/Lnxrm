@@ -93,3 +93,5 @@
 - **2026-11-28 S3.3 系统调用出口切 `sysretq`**：GDT Option A（Linux 同形），`STAR[63:48]=0x1B`，CS `0x1B→0x2B`，`tss_load(0x30)`；出口守卫只查 `f->rip` 规范性；`isr128` 出口保持 `iretq`。
 
 - **2026-11-28 S3.4 `swapgs` 与 TLS（fs segment + `arch_prctl`，深度浅）**：`SWAPGS_IN/OUT` 宏（`cs & 3` 判，帧偏移 144）；`entry_SYSCALL_64` 无条件 `swapgs` + 两出口 `cli; swapgs`；`glue_first` 单次无条件 `swapgs`；`switch_to()` 进栈前存旧/装新 `IA32_KERNEL_GS_BASE` + `IA32_FS_BASE`；`cpu_set_gs_base()` 合成写 `IA32_GS_BASE`=per-CPU 块 + `IA32_KERNEL_GS_BASE=0`；`arch_prctl(56)`：SET_FS 写 `IA32_FS_BASE`，SET_GS 写 `IA32_KERNEL_GS_BASE`（绝不碰 `IA32_GS_BASE`），四操作门限 `USER_MAX_VMA`，未知码 `EINVAL`；`fork` 继承两段，`execve` 两段清 0。
+
+- **2026-11-28 S4.0 软重启/软关机（shutdown 57）**：`shutdown(57)`：`LNXRM_RB_HALT`（`cli;hlt` 永停）、`LNXRM_RB_REBOOT`（8042 `0xFE` + 0xCF9 `0x02` 软复位）、`LNXRM_RB_POWER_OFF`（向 FADT 披露的 ACPI PM1a_CNT 端口写 `SLP_TYP=5|SLP_EN`，QEMU 优雅退出）；`sys_sync()` 先落盘，成功路径不返回；`GATE_ADMIN`，未知命令 `EINVAL`。`/bin/reboot`（重启）、`/bin/poweroff`（断电）、`/bin/halt`（停机）三个用户命令分别对应三种命令。ACPI 扩展 `find_fadt()`/`parse_fadt()` 解析 FADT 表的 PM1a_CNT（rev 1 的 `pm1a_cnt_blk_v1` 或 rev 2+ 的 GAS address），`acpi_pm1a_cnt()` 导出端口。

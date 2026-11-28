@@ -83,6 +83,15 @@
  * only reader of IA32_KERNEL_GS_BASE, which is why ARCH_SET_GS does not
  * touch IA32_GS_BASE at all -- see h_arch_prctl().
  *
+ * shutdown took 57 (2026-11-28, S4.0): halt / power off / reset.  Arity is
+ * one -- shutdown(cmd) with cmd one of LNXRM_RB_HALT / LNXRM_RB_REBOOT /
+ * LNXRM_RB_POWER_OFF from lnxrm_abi.h.  It carries GATE_ADMIN: halting,
+ * powering off or resetting the machine is an administrative act, root
+ * passes, a plain user answers -EACCES.  The success path does not return --
+ * the machine halts, resets, or (for poweroff) asks the platform to switch
+ * off via the ACPI PM1a_CNT port read from the FADT.  sys_sync() runs first
+ * so cached dirty sectors hit the disk before anything powers down.
+ *
  * Numbers are not the whole ABI: the ARITY of a call is too.  mmap (42)
  * grew from mmap(addr, len, prot) to the six-argument Linux shape
  * mmap(addr, len, prot, flags, fd, offset) when file mappings landed
@@ -150,3 +159,4 @@ LNXRM_SYS(dipc_open, 53)
 LNXRM_SYS(dipc_recv, 54)
 LNXRM_SYS(dipc_send, 55)
 LNXRM_SYS(arch_prctl, 56)
+LNXRM_SYS(shutdown, 57)

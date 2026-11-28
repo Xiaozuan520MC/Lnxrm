@@ -2,7 +2,7 @@
 
 /* End-to-end coverage of every number in include/abi/lnxrm_syscalls.def.
  *
- * Live calls (57, numbered 0..56 with no holes), all exercised below:
+ * Live calls (58, numbered 0..57 with no holes), all exercised below:
  *    0 read      1 write     2 open      3 close     4 lseek     5 brk
  *    6 getdent   7 dup2      8 nanosleep 9 getpid   10 fork    11 execve
  *   12 exit     13 wait4    14 kill     15 uname    16 sigaction 17 sigprocmask
@@ -12,7 +12,21 @@
  *   32 fb_flip  33 sync     34 kbd_get  35 kbd_inject 36 kbd_info
  *   37 mouse_get 38 mouse_info 39 input_pop 40 input_info 41 input_wait
  *   42 mmap     43 munmap   44 mprotect 45 stat    46 gettimeofday 47 pipe
- *   56 arch_prctl (S3.4, last -- see t_arch_prctl at the end of this file)
+ *   56 arch_prctl (S3.4)   57 shutdown (S4.0 -- halt/poweroff/reboot)
+ *
+ * 56 arch_prctl runs last among the CALLABLE tests -- see t_arch_prctl at
+ * the end of this file -- because it sleeps and forks, both of which come
+ * back through switch_to(), and it must hand the bases back to 0 so the
+ * shell's own later calls see the same state they would have seen without
+ * this test.
+ *
+ * 57 shutdown is deliberately NOT called here: halt/poweroff/reboot all end
+ * the machine on success (a self-test that worked would end the test), so
+ * they cannot be exercised from inside systest itself.  shutdown(57) is
+ * hand-driven from lsh instead, and its surface (CAP_SYS_ADMIN gate,
+ * EINVAL on a bad command, sync-before-power-off) is asserted in
+ * ktest/t_syscall.c instead, where the task and gate tables are readable
+ * directly rather than inferred from a printout.
  *
  * The three numbers appended 2026-11-15 are deliberately NOT called here:
  * 48 reboot resets the machine on success (a self-test that worked would
